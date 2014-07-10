@@ -1,3 +1,18 @@
+"""Generate content addressable files.
+
+The path to each file is the hex digest of the sha1 of the file's contents.
+
+Given the hex digest, the path is split into 4 sub directories consisting of 1
+byte each, and the remaining 16 bytes are used for the file name.
+
+For example, a file with a sha1 of "abcdefabcdefabcd" would have a path of
+"ab/cd/ef/ab/cdefabcd".
+
+As for the contents of the file, each file has the sha1 of the parent file
+as the first 20 bytes, followed by randomly generated content.
+
+
+"""
 import os
 from binascii import hexlify
 from random import randint
@@ -29,6 +44,13 @@ def generate_single_file_link(parent_hash,
 
 
 if __name__ == '__main__':
+
+    # Stop when either we have 5000 files or we use more than 20mb of space.
+    #file_generator = FileGenerator(rootdir='/tmp/test',
+    #                               num_files=5000, max_data_amount=1024 * 1024 * 20,
+    #                               size_choose=Guassian(mean=1024, var=1))
+    #file_generator.generate_files()
+
     # Demo of generating the random content.
     temp_filename, sha1_hash = generate_single_file_link(
         b'\x00' * 20, file_size=4048)

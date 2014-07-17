@@ -1,6 +1,37 @@
+import os
+
 import click
 
+from caf.caf import FileGenerator
+
 __version__ = '0.0.1'
+
+
+def current_directory(ctx, param, value):
+    if value is None:
+        return os.getcwd()
+    else:
+        return value
+
+
+class FileSizeType(click.ParamType):
+    SIZE_TYPES = {
+        'kb': 1024,
+        'mb': 1024 ** 2,
+        'gb': 1024 ** 3,
+        'tb': 1024 ** 4,
+    }
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, int):
+            # A value has already been specified,
+            # assume that its an int.
+            return value
+        elif len(value) >= 2 and value[-2:].lower() in self.SIZE_TYPES:
+            multiplier = self.SIZE_TYPES[value[-2:].lower()]
+            return int(value[:-2]) * multiplier
+        else:
+            self.fail('Unknown size specifier "%s"' % value, param, ctx)
 
 
 @click.group()
@@ -9,7 +40,20 @@ def main():
 
 
 @main.command()
-def gen():
+@click.option('--directory',
+              help='The directory where files will be generated.',
+              callback=current_directory)
+@click.option('--max-files', type=int, default=100,
+              help='The maximum number of files to gnerate.')
+@click.option('--max-disk-usage',
+              help='The maximum disk space to use when generating files.')
+@click.option('--file-size', default=4096,
+              type=FileSizeType(),
+              help='The size of the files that are generated.  '
+              'Value is either in bytes or can be suffixed with '
+              'kb, mb, gb, etc.  Suffix is case insensitive (we '
+              'know what you mean).')
+def gen(directory, max_files, max_disk_usage, file_size):
     """Generate content addressable files.
 
     This command will generate a set of linked, content addressable files.
@@ -73,7 +117,12 @@ def gen():
         caf gen --file-size Type=lognormal,Mean=10MB,StdDev=1MB
 
     """
-    pass
+    #size_chooser = create_size_chooser(file_size)
+    generator = FileGenerator(directory, max_files, max_disk_usage,
+                              file_size)
+    generator.generate_files()
+
+
 
 
 if __name__ == '__main__':

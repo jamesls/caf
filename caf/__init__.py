@@ -3,6 +3,7 @@ import os
 import click
 
 from caf.caf import FileGenerator
+from caf.caf import FileVerifier
 
 __version__ = '0.0.1'
 
@@ -15,6 +16,9 @@ def current_directory(ctx, param, value):
 
 
 class FileSizeType(click.ParamType):
+    # ``name`` is used by the --help output.
+    name = 'filesize'
+
     SIZE_TYPES = {
         'kb': 1024,
         'mb': 1024 ** 2,
@@ -123,6 +127,13 @@ def gen(directory, max_files, max_disk_usage, file_size):
     generator.generate_files()
 
 
+
+@main.command()
+@click.argument('rootdir')
+def verify(rootdir):
+    click.echo("Verifying file contents in: %s" % rootdir)
+    verifier = FileVerifier(rootdir)
+    verifier.verify_files()
 
 
 if __name__ == '__main__':

@@ -129,7 +129,7 @@ def gen(directory, max_files, max_disk_usage, file_size):
 
 
 @main.command()
-@click.argument('rootdir')
+@click.argument('rootdir', default='.')
 def verify(rootdir):
     click.echo("Verifying file contents in: %s" % rootdir)
     verifier = FileVerifier(rootdir)

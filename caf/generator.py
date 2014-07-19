@@ -15,7 +15,6 @@ as the first 20 bytes, followed by randomly generated content.
 """
 import os
 import sys
-import shutil
 from binascii import hexlify
 from random import randint
 import tempfile
@@ -37,11 +36,31 @@ def cd(directory):
         os.chdir(starting)
 
 
+def file_path_to_hash(filename):
+    """Convert a sha1 file name to the original sha1.
+
+    Given a full filename such as "ab/cd/effffff...",
+    this function will convert it to the original sha1
+    string hash:  "abcdefffff"
+    """
+    # .strip('.') because a relative path may come in like
+    # './ab/cd/efff'
+    return ''.join(filename.split(os.sep)).strip('.')
+
+
 class FileGenerator(object):
-    """Generate random files."""
+    """Generate random files.
+
+    This class is written such that it's possible to have multiple processes
+    running against the same rootdir in parallel.
+
+    This is handled because the files are randomly generated, so the
+    chance of collision is extremely small.
+    """
 
     ROOT_HASH = b'\x00' * 20
     BUFFER_WRITE_SIZE = 1024 * 1024
+    ROOTS_DIR = os.path.join('.metadata', 'roots')
 
     def __init__(self, rootdir, max_files, max_disk_usage,
                  file_size, buffer_write_size=BUFFER_WRITE_SIZE,
@@ -59,30 +78,54 @@ class FileGenerator(object):
 
     def generate_files(self):
         temp_dir = self._temp_dir
-        delete_temp_dir = False
         if temp_dir is None:
-            temp_dir = tempfile.mkdtemp()
-            delete_temp_dir = True
-        try:
-            with cd(self._rootdir):
-                files_created = 0
-                file_size = self._file_size
-                disk_space_bytes_used = 0
-                sha1_hash = self.ROOT_HASH
-                while files_created < self._max_files and \
-                        disk_space_bytes_used < self._max_disk_usage:
-                    temp_filename, sha1_hash = self.generate_single_file_link(
-                        sha1_hash, file_size=file_size,
-                        buffer_size=self.BUFFER_WRITE_SIZE,
-                        temp_dir=temp_dir)
-                    ascii_hex_basename = hexlify(sha1_hash).decode('ascii')
-                    self._move_to_final_location(
-                        temp_filename, ascii_hex_basename)
-                    files_created += 1
-                    disk_space_bytes_used += file_size
-        finally:
-            if delete_temp_dir:
-                shutil.rmtree(temp_dir)
+            # Use the current woroking directory as the
+            # temp dir.
+            temp_dir = os.getcwd()
+        with cd(self._rootdir):
+            files_created = 0
+            file_size = self._file_size
+            disk_space_bytes_used = 0
+            sha1_hash = self.ROOT_HASH
+            while files_created < self._max_files and \
+                    disk_space_bytes_used < self._max_disk_usage:
+                temp_filename, sha1_hash = self.generate_single_file_link(
+                    sha1_hash, file_size=file_size,
+                    buffer_size=self.BUFFER_WRITE_SIZE,
+                    temp_dir=temp_dir)
+                ascii_hex_basename = hexlify(sha1_hash).decode('ascii')
+                self._move_to_final_location(
+                    temp_filename, ascii_hex_basename)
+                files_created += 1
+                disk_space_bytes_used += file_size
+            # Write out the root file in the special
+            # metadata/roots/ directory so we know when
+            # we validate that this file is not suppose
+            # to have anything referring to it.
+            self._write_root_sha(ascii_hex_basename)
+
+    def _write_root_sha(self, filename):
+        directory_name = os.path.join(self._rootdir, self.ROOTS_DIR)
+        if not os.path.isdir(directory_name):
+            try:
+                os.makedirs(directory_name)
+            except OSError:
+                pass
+        assert os.path.isdir(directory_name)
+        with open(os.path.join(directory_name, filename), 'w') as f:
+            pass
+        # This is the only part we have to lock.  If we have multiple roots
+        # being written out, the only way we can validate that an entire
+        # chain from root->start hasn't been completely removed (even though
+        # it's extremely unlikely) is to have a file that can be used
+        # to validate that all the root file are accounted for.
+        # TODO: Actually lock the file.
+        roots_hash = hashlib.sha1()
+        for filename in os.listdir(directory_name):
+            roots_hash.update(filename.encode('ascii'))
+        final_roots_hash = roots_hash.hexdigest()
+        with open(os.path.join(self._rootdir, '.metadata', 'all'), 'wb') as f:
+            f.write(final_roots_hash.encode('ascii'))
 
     def _move_to_final_location(self, temp_filename, ascii_hex_basename):
         # This is not exposed as a config option (yet),
@@ -122,13 +165,19 @@ class FileGenerator(object):
 
 
 class FileVerifier(object):
+    ROOTS_DIR = os.path.join('.metadata', 'roots')
+
     def __init__(self, rootdir):
         self._rootdir = rootdir
 
     def verify_files(self):
         referenced = set()
+        known_roots = os.listdir(os.path.join(self._rootdir, self.ROOTS_DIR))
         files_validated = 0
-        for root, dirnames, filenames in os.walk(self._rootdir):
+        for root, _, filenames in os.walk(self._rootdir):
+            if '.metadata' in root:
+                # We validate the metadata directory separately.
+                continue
             for filename in filenames:
                 full_path = os.path.join(root, filename)
                 self._validate_checksum(full_path)
@@ -137,15 +186,31 @@ class FileVerifier(object):
                 referenced.add(parent_full_path)
                 if parent_full_path is not None and \
                         not os.path.isfile(parent_full_path):
-                    sys.stderr.write("CORRUPTION: Parent hash not found: %s\n" % (
-                        parent_full_path))
-        self._verify_referenced_files(referenced)
+                    sys.stderr.write(
+                        "CORRUPTION: Parent hash not found: %s\n" % (
+                            parent_full_path))
+        self._verify_referenced_files(referenced, known_roots)
+        self._verify_known_roots(known_roots)
 
-    def _verify_referenced_files(self, referenced):
+    def _verify_known_roots(self, known_roots):
+        verify_hash = hashlib.sha1()
+        for root in known_roots:
+            verify_hash.update(root.encode('ascii'))
+        actual = verify_hash.hexdigest().encode('ascii')
+        with open(os.path.join(self._rootdir, '.metadata', 'all'), 'rb') as f:
+            expected = f.read()
+        if actual != expected:
+            sys.stderr.write("CORRUPTION: Root hash is not valid, roots are "
+                             "missing.\n")
+
+    def _verify_referenced_files(self, referenced, known_roots):
         for root, _, filenames in os.walk(self._rootdir):
+            if '.metadata' in root:
+                continue
             for filename in filenames:
                 full_path = os.path.join(root, filename)
-                if full_path not in referenced:
+                if full_path not in referenced and \
+                        file_path_to_hash(full_path) not in known_roots:
                     sys.stderr.write(
                         "CORRUPTION: File not referenced by any files: %s\n" %
                         (full_path))
@@ -164,7 +229,6 @@ class FileVerifier(object):
 
     def _validate_checksum(self, filename):
         sha1 = hashlib.sha1()
-        bname = os.path.basename
         expected_sha1 = ''.join(filename.split(os.sep)[-3:])
         with open(filename, 'rb') as f:
             for chunk in iter(lambda: f.read(BUFFER_READ_SIZE), b''):
@@ -173,35 +237,5 @@ class FileVerifier(object):
         if actual != expected_sha1:
             # Better error message.
             sys.stderr.write(
-                'CORRUPTION: Invalid checksum for file "%s": actual sha1 %s\n' % (
-                    filename, actual))
-
-
-# if __name__ == '__main__':
-#
-#
-#     # Demo of generating the random content.
-#     temp_filename, sha1_hash = generate_single_file_link(
-#         b'\x00' * 20, file_size=4048)
-#     final_filename = os.path.join(b'test', hexlify(sha1_hash))
-#     os.rename(temp_filename, final_filename)
-#     print("Generating:", final_filename)
-#     for _ in range(10):
-#         temp_filename, sha1_hash = generate_single_file_link(
-#             sha1_hash, file_size=4048)
-#         final_filename = os.path.join(b'test', hexlify(sha1_hash))
-#         os.rename(temp_filename, final_filename)
-#         print("Generating:", final_filename)
-#     print('\n')
-#     # Demo of verifying
-#     current_filename = final_filename
-#     while os.path.basename(current_filename) != b'0' * 40:
-#         # First verify that sha1(current_filename) == current_filename
-#         print("Verifying", current_filename)
-#         with open(current_filename, 'rb') as f:
-#             actual = hashlib.sha1(f.read()).hexdigest().encode('ascii')
-#             expected = os.path.basename(current_filename)
-#             if actual != expected:
-#                 import pdb; pdb.set_trace()
-#             f.seek(0)
-#             current_filename = os.path.join(b'test', hexlify(f.read(20)))
+                'CORRUPTION: Invalid checksum for file "%s": '
+                'actual sha1 %s\n' % (filename, actual))

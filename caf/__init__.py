@@ -2,8 +2,8 @@ import os
 
 import click
 
-from caf.caf import FileGenerator
-from caf.caf import FileVerifier
+from caf.generator import FileGenerator
+from caf.generator import FileVerifier
 
 __version__ = '0.0.1'
 

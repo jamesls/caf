@@ -31,6 +31,8 @@ class FileSizeType(click.ParamType):
             # A value has already been specified,
             # assume that its an int.
             return value
+        elif ',' in value:
+            self.fail('Shorthand syntax not yet implemented.')
         elif len(value) >= 2 and value[-2:].lower() in self.SIZE_TYPES:
             multiplier = self.SIZE_TYPES[value[-2:].lower()]
             return int(value[:-2]) * multiplier

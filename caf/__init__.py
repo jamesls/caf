@@ -136,6 +136,7 @@ def verify(rootdir):
     click.echo("Verifying file contents in: %s" % rootdir)
     verifier = FileVerifier(rootdir)
     verifier.verify_files()
+    click.echo("All files successfully verified.")
 
 
 if __name__ == '__main__':

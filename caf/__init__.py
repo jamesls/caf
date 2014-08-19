@@ -1,4 +1,6 @@
 import os
+import random
+import functools
 
 import click
 
@@ -15,6 +17,10 @@ def current_directory(ctx, param, value):
         return value
 
 
+def identity(value):
+    return lambda: value
+
+
 class FileSizeType(click.ParamType):
     # ``name`` is used by the --help output.
     name = 'filesize'
@@ -26,18 +32,61 @@ class FileSizeType(click.ParamType):
         'tb': 1024 ** 4,
     }
 
+    RANDOM_FUNCTION = {
+        'normal': lambda Mean, StdDev: abs(int(random.gauss(Mean, StdDev))),
+        'gamma': lambda Alpha, Beta: abs(int(random.gammavariate(Alpha, Beta))),
+        'lognormal': lambda Mean, StdDev: abs(int(random.lognormvariate(Mean, StdDev))),
+    }
+
     def convert(self, value, param, ctx):
         if isinstance(value, int):
             # A value has already been specified,
             # assume that its an int.
-            return value
+            return identity(value)
         elif ',' in value:
-            self.fail('Shorthand syntax not yet implemented.')
-        elif len(value) >= 2 and value[-2:].lower() in self.SIZE_TYPES:
+            return self._parse_shorthand(value)
+        elif '-' in value:
+            parts = value.split('-')
+            if not len(parts) == 2:
+                self.fail('Bad value for --filesize: %s\n\nShould be '
+                          'startsize-endsize (e.g. 1mb-5mb).' % value)
+            start = self._parse_with_size_suffix(parts[0])
+            end = self._parse_with_size_suffix(parts[1])
+            return lambda: random.randint(start, end)
+        elif self._is_size_identifier(value):
+            return identity(self._parse_with_size_suffix(value))
+        else:
+            self.fail('Unknown size specifier "%s"' % value, param, ctx)
+
+    def _is_size_identifier(self, value):
+        return len(value) >= 2 and value[-2:].lower() in self.SIZE_TYPES
+
+    def _parse_with_size_suffix(self, value):
+        if self._is_size_identifier(value):
             multiplier = self.SIZE_TYPES[value[-2:].lower()]
             return int(value[:-2]) * multiplier
         else:
-            self.fail('Unknown size specifier "%s"' % value, param, ctx)
+            return int(value)
+
+    def _parse_shorthand(self, value):
+        # Shorthand is of the form
+        # A=1,B=3,C=3
+        shorthand_dict = {}
+        for item in value.split(','):
+            k, v = item.split('=')
+            shorthand_dict[k] = v
+        if 'Type' not in shorthand_dict:
+            self.fail("Missing Type=<type> in file size specifier: %s" %
+                      value)
+        param_type = shorthand_dict.pop('Type')
+        if param_type not in self.RANDOM_FUNCTION:
+            self.fail("Unknown Type '%s', must be one of: %s" %
+                      (param_type, ','.join(self.RANDOM_FUNCTION)))
+        for key, value in shorthand_dict.items():
+            shorthand_dict[key] = self._parse_with_size_suffix(value)
+        func = functools.partial(self.RANDOM_FUNCTION[param_type],
+                                 **shorthand_dict)
+        return func
 
 
 @click.group()
@@ -112,22 +161,19 @@ def gen(directory, max_files, max_disk_usage, file_size):
 
     You can also a gamma distribution:
 
-        caf gen --file-size Type=gamma,Alpha=20MB,StdDev=1MB
-
-    As well as an exponential distribution (Mean is 1 / lambda):
-
-        caf gen --file-size Type=exponential,Mean=10MB
+        caf gen --file-size Type=gamma,Alpha=20MB,Beta=1MB
 
     And finally a lognormal distribution:
 
         caf gen --file-size Type=lognormal,Mean=10MB,StdDev=1MB
 
     """
-    #size_chooser = create_size_chooser(file_size)
+    # "file_size" is actually a no-arg function created by
+    # FileSizeType.  Is there a way in click to specify the destination?
+    file_size_chooser = file_size
     generator = FileGenerator(directory, max_files, max_disk_usage,
-                              file_size)
+                              file_size_chooser)
     generator.generate_files()
-
 
 
 @main.command()
@@ -141,4 +187,3 @@ def verify(rootdir):
 
 if __name__ == '__main__':
     main()
-

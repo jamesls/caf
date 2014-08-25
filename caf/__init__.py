@@ -39,11 +39,12 @@ class FileSizeType(click.ParamType):
     }
 
     def convert(self, value, param, ctx):
-        if isinstance(value, int):
-            # A value has already been specified,
-            # assume that its an int.
-            return identity(value)
-        elif ',' in value:
+        try:
+            v = int(value)
+            return identity(v)
+        except ValueError:
+            pass
+        if ',' in value:
             return self._parse_shorthand(value)
         elif '-' in value:
             parts = value.split('-')
@@ -100,7 +101,7 @@ def main():
               callback=current_directory)
 @click.option('--max-files', type=int, default=100,
               help='The maximum number of files to gnerate.')
-@click.option('--max-disk-usage',
+@click.option('--max-disk-usage', type=int,
               help='The maximum disk space to use when generating files.')
 @click.option('--file-size', default=4096,
               type=FileSizeType(),

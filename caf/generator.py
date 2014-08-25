@@ -156,6 +156,7 @@ class FileGenerator(object):
 
         with open(temp_filename, 'wb') as f:
             f.write(parent_hash)
+            amount_remaining -= len(parent_hash)
             while amount_remaining > 0:
                 chunk_size = min(buffer_size, amount_remaining)
                 random_data = os.urandom(chunk_size)

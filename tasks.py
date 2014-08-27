@@ -14,6 +14,12 @@ def clean():
 
 
 @task
+def build():
+    clean()
+    run("python setup.py sdist bdist_wheel")
+
+
+@task
 def publish(test=False):
     """Publish to the cheeseshop."""
-    run("python setup.py sdist upload")
+    run("twine upload dist/*")

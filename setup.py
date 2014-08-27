@@ -5,8 +5,9 @@ from setuptools.command.test import test as TestCommand
 
 
 REQUIRES = [
-    'click',
+    'click==3.2',
 ]
+
 
 class PyTest(TestCommand):
     def finalize_options(self):

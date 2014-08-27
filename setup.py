@@ -56,7 +56,7 @@ setup(
     author_email='js@jamesls.com',
     url='https://github.com/jamesls/caf',
     install_requires=REQUIRES,
-    license=read("LICENSE"),
+    license='BSD',
     zip_safe=False,
     keywords='caf',
     classifiers=[

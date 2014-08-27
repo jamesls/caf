@@ -9,7 +9,7 @@ caf
         :target: https://travis-ci.org/jamesls/caf
 
 .. image:: https://pypip.in/d/caf/badge.png
-        :target: https://crate.io/packages/caf?version=latest
+        :target: https://pypi.python.org/pypi/caf
 
 
 Create content addressable files

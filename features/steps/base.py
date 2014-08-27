@@ -48,3 +48,15 @@ def step_impl(context, total_size):
 
     assert_that(int(total_size), equal_to(disk_usage))
     assert_that(disk_usage, equal_to(int(total_size)))
+
+
+@then(u'the total number of files created should be "{num_files}"')
+def step_impl(context, num_files):
+    actual_count = 0
+    for root, _, filenames in os.walk(context.working_dir):
+        if '.metadata' in root:
+            # Don't count the metadata dir against the total
+            # number of files.
+            continue
+        actual_count += len(filenames)
+    assert_that(actual_count, equal_to(int(num_files)))

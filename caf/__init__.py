@@ -10,11 +10,32 @@ from caf.generator import FileVerifier
 __version__ = '0.0.1'
 
 
+SIZE_TYPES = {
+    'kb': 1024,
+    'mb': 1024 ** 2,
+    'gb': 1024 ** 3,
+    'tb': 1024 ** 4,
+}
+
+
 def current_directory(ctx, param, value):
     if value is None:
         return os.getcwd()
     else:
         return value
+
+
+def convert_to_bytes(ctx, param, value):
+    is_size_identifier = (
+        len(value) >= 2 and value[-2:].lower() in SIZE_TYPES)
+    if not is_size_identifier:
+        try:
+            return int(value)
+        except ValueError:
+            raise click.BadParameter("Invalid size specifier")
+    else:
+        multiplier = SIZE_TYPES[value[-2:].lower()]
+        return int(value[:-2]) * multiplier
 
 
 def identity(value):
@@ -24,13 +45,6 @@ def identity(value):
 class FileSizeType(click.ParamType):
     # ``name`` is used by the --help output.
     name = 'filesize'
-
-    SIZE_TYPES = {
-        'kb': 1024,
-        'mb': 1024 ** 2,
-        'gb': 1024 ** 3,
-        'tb': 1024 ** 4,
-    }
 
     RANDOM_FUNCTION = {
         'normal': lambda Mean, StdDev: abs(int(random.gauss(Mean, StdDev))),
@@ -60,11 +74,11 @@ class FileSizeType(click.ParamType):
             self.fail('Unknown size specifier "%s"' % value, param, ctx)
 
     def _is_size_identifier(self, value):
-        return len(value) >= 2 and value[-2:].lower() in self.SIZE_TYPES
+        return len(value) >= 2 and value[-2:].lower() in SIZE_TYPES
 
     def _parse_with_size_suffix(self, value):
         if self._is_size_identifier(value):
-            multiplier = self.SIZE_TYPES[value[-2:].lower()]
+            multiplier = SIZE_TYPES[value[-2:].lower()]
             return int(value[:-2]) * multiplier
         else:
             return int(value)
@@ -99,9 +113,9 @@ def main():
 @click.option('--directory',
               help='The directory where files will be generated.',
               callback=current_directory)
-@click.option('--max-files', type=int, default=100,
+@click.option('--max-files', type=int,
               help='The maximum number of files to gnerate.')
-@click.option('--max-disk-usage', type=int,
+@click.option('--max-disk-usage', callback=convert_to_bytes,
               help='The maximum disk space to use when generating files.')
 @click.option('--file-size', default=4096,
               type=FileSizeType(),
@@ -169,6 +183,10 @@ def gen(directory, max_files, max_disk_usage, file_size):
         caf gen --file-size Type=lognormal,Mean=10MB,StdDev=1MB
 
     """
+    if max_files is None and max_disk_usage is not None:
+        max_files = float('inf')
+    elif max_files is not None and max_disk_usage is None:
+        max_disk_usage = float('inf')
     # "file_size" is actually a no-arg function created by
     # FileSizeType.  Is there a way in click to specify the destination?
     file_size_chooser = file_size

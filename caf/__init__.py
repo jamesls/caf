@@ -5,7 +5,7 @@ import functools
 import click
 
 from caf.generator import FileGenerator
-from caf.generator import FileVerifier
+from caf.verifier import FileVerifier
 
 __version__ = '0.0.1'
 

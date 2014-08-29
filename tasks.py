@@ -23,3 +23,8 @@ def build():
 def publish(test=False):
     """Publish to the cheeseshop."""
     run("twine upload dist/*")
+
+
+@task
+def features():
+    run("cd features && behave")

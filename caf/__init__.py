@@ -26,6 +26,8 @@ def current_directory(ctx, param, value):
 
 
 def convert_to_bytes(ctx, param, value):
+    if value is None:
+        return None
     is_size_identifier = (
         len(value) >= 2 and value[-2:].lower() in SIZE_TYPES)
     if not is_size_identifier:
@@ -186,6 +188,11 @@ def gen(directory, max_files, max_disk_usage, file_size):
     if max_files is None and max_disk_usage is not None:
         max_files = float('inf')
     elif max_files is not None and max_disk_usage is None:
+        max_disk_usage = float('inf')
+    elif max_files is None and max_disk_usage is None:
+        # The default no args specified is to generate
+        # 100 files.
+        max_files = 100
         max_disk_usage = float('inf')
     # "file_size" is actually a no-arg function created by
     # FileSizeType.  Is there a way in click to specify the destination?

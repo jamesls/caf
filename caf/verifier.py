@@ -1,3 +1,4 @@
+"""Verify files generated from the caf.generator module."""
 import os
 import sys
 from binascii import hexlify

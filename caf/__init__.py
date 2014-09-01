@@ -116,7 +116,7 @@ def main():
               help='The directory where files will be generated.',
               callback=current_directory)
 @click.option('--max-files', type=int,
-              help='The maximum number of files to gnerate.')
+              help='The maximum number of files to generate.')
 @click.option('--max-disk-usage', callback=convert_to_bytes,
               help='The maximum disk space to use when generating files.')
 @click.option('--file-size', default=4096,

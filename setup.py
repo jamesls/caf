@@ -49,7 +49,7 @@ def read(fname):
 
 setup(
     name='caf',
-    version="0.0.1",
+    version=__version__,
     description='Create content addressable files',
     long_description=read("README.rst"),
     author='James Saryerwinnie',

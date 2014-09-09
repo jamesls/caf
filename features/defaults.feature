@@ -7,4 +7,4 @@ Feature: Have Reasonable Defaults
   Scenario: Generating files without any paramteres
     Given a new working directory
     When I run "caf gen"
-    Then the total number of files created should be "100"
+    Then the total number of files created should be 100

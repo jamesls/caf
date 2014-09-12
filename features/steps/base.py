@@ -1,9 +1,21 @@
 from behave import *
+import random
+import contextlib
 import os
 from subprocess import Popen, PIPE
 from hamcrest import assert_that, equal_to
 
 import tempfile
+
+
+@contextlib.contextmanager
+def cd(dirname):
+    original = os.getcwd()
+    try:
+        os.chdir(dirname)
+        yield
+    finally:
+        os.chdir(original)
 
 
 def get_all_generated_files(rootdir):
@@ -76,3 +88,39 @@ def step_impl(context, file_size):
     for full_path in get_all_generated_files(context.working_dir):
         actual_file_size = os.stat(full_path).st_size
         assert_that(int(file_size), equal_to(actual_file_size))
+
+
+@given(u'a new caf directory')
+def step_impl(context):
+    context.execute_steps(u"""
+        When I run "caf gen"
+    """)
+
+
+@then(u'the verification should succeed')
+def step_impl(context):
+    actual_rc = context.verify_command_result.rc
+    assert_that(0, equal_to(actual_rc))
+
+
+@then(u'the verification should fail')
+def step_impl(context):
+    actual_rc = context.verify_command_result.rc
+    assert_that(1, equal_to(actual_rc))
+
+
+@when(u'I run the verification process')
+def step_impl(context):
+    with cd(context.working_dir):
+        p = Popen('caf verify', shell=True,
+                  stderr=PIPE, stdout=PIPE)
+        stdout, stderr = p.communicate()
+        result = CommandResult(stdout, stderr, p.returncode)
+        context.verify_command_result = result
+
+
+@when(u'I run remove a random file')
+def step_impl(context):
+    filenames = list(get_all_generated_files(context.working_dir))
+    filename = random.choice(filenames)
+    os.remove(filename)

@@ -15,8 +15,10 @@ class FileVerifier(object):
 
     def __init__(self, rootdir):
         self._rootdir = rootdir
+        self._verification_succeeded = True
 
     def verify_files(self):
+        self._verification_succeeded = True
         referenced = set()
         known_roots = os.listdir(os.path.join(self._rootdir, self.ROOTS_DIR))
         files_validated = 0
@@ -35,8 +37,10 @@ class FileVerifier(object):
                     sys.stderr.write(
                         "CORRUPTION: Parent hash not found: %s\n" % (
                             parent_full_path))
+                    self._verification_succeeded = False
         self._verify_referenced_files(referenced, known_roots)
         self._verify_known_roots(known_roots)
+        return self._verification_succeeded
 
     def _verify_known_roots(self, known_roots):
         verify_hash = hashlib.sha1()
@@ -48,6 +52,7 @@ class FileVerifier(object):
         if actual != expected:
             sys.stderr.write("CORRUPTION: Root hash is not valid, roots are "
                              "missing.\n")
+            self._verification_succeeded = False
 
     def _verify_referenced_files(self, referenced, known_roots):
         for root, _, filenames in os.walk(self._rootdir):
@@ -60,6 +65,7 @@ class FileVerifier(object):
                     sys.stderr.write(
                         "CORRUPTION: File not referenced by any files: %s\n" %
                         (full_path))
+                    self._verification_succeeded = False
 
     def _get_parent_file(self, full_path):
         with open(full_path, 'rb') as f:
@@ -85,3 +91,4 @@ class FileVerifier(object):
             sys.stderr.write(
                 'CORRUPTION: Invalid checksum for file "%s": '
                 'actual sha1 %s\n' % (filename, actual))
+            self._verification_succeeded = False

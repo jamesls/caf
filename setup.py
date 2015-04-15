@@ -77,6 +77,6 @@ setup(
             "caf = caf:main"
         ]
     },
-    tests_require=['pytest'],
+    tests_require=['pytest==2.7.0'],
     cmdclass={'test': PyTest}
 )

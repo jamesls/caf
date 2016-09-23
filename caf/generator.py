@@ -14,6 +14,7 @@ as the first 20 bytes, followed by randomly generated content.
 
 """
 import os
+import shutil
 from binascii import hexlify
 from random import randint
 import tempfile
@@ -123,7 +124,7 @@ class FileGenerator(object):
                 pass
         assert os.path.isdir(directory_part)
         final_filename = os.path.join(directory_part, basename)
-        os.rename(temp_filename, final_filename)
+        shutil.move(temp_filename, final_filename)
 
     def generate_single_file_link(self, parent_hash, file_size,
                                   buffer_size, temp_dir):

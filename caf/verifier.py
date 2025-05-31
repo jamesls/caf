@@ -1,8 +1,9 @@
 """Verify files generated from the caf.generator module."""
 import os
 import sys
-from binascii import hexlify
 import hashlib
+from binascii import hexlify
+from typing import Iterable, Optional, Set
 
 from caf.utils import file_path_to_hash
 
@@ -13,11 +14,11 @@ BUFFER_READ_SIZE = 1024 * 1024
 class FileVerifier(object):
     ROOTS_DIR = os.path.join('.metadata', 'roots')
 
-    def __init__(self, rootdir):
+    def __init__(self, rootdir: str) -> None:
         self._rootdir = rootdir
         self._verification_succeeded = True
 
-    def verify_files(self):
+    def verify_files(self) -> bool:
         self._verification_succeeded = True
         referenced = set()
         known_roots = os.listdir(os.path.join(self._rootdir, self.ROOTS_DIR))
@@ -42,7 +43,7 @@ class FileVerifier(object):
         self._verify_known_roots(known_roots)
         return self._verification_succeeded
 
-    def _verify_known_roots(self, known_roots):
+    def _verify_known_roots(self, known_roots: Iterable[str]) -> None:
         verify_hash = hashlib.sha1()
         for root in known_roots:
             verify_hash.update(root.encode('ascii'))
@@ -54,7 +55,7 @@ class FileVerifier(object):
                              "missing.\n")
             self._verification_succeeded = False
 
-    def _verify_referenced_files(self, referenced, known_roots):
+    def _verify_referenced_files(self, referenced: Set[str], known_roots: Iterable[str]) -> None:
         for root, _, filenames in os.walk(self._rootdir):
             if '.metadata' in root:
                 continue
@@ -67,7 +68,7 @@ class FileVerifier(object):
                         (full_path))
                     self._verification_succeeded = False
 
-    def _get_parent_file(self, full_path):
+    def _get_parent_file(self, full_path: str) -> Optional[str]:
         with open(full_path, 'rb') as f:
             binary_sha1 = f.read(20)
             if binary_sha1 == b'\x00' * 20:
@@ -79,7 +80,7 @@ class FileVerifier(object):
                                 hex_sha1[2:4],
                                 hex_sha1[4:])
 
-    def _validate_checksum(self, filename):
+    def _validate_checksum(self, filename: str) -> None:
         sha1 = hashlib.sha1()
         expected_sha1 = ''.join(filename.split(os.sep)[-3:])
         with open(filename, 'rb') as f:

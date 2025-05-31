@@ -1,6 +1,7 @@
 import os
 import random
 import functools
+from typing import Callable, Optional
 
 import click
 
@@ -18,14 +19,14 @@ SIZE_TYPES = {
 }
 
 
-def current_directory(ctx, param, value):
+def current_directory(ctx: click.Context, param: click.Parameter, value: Optional[str]) -> str:
     if value is None:
         return os.getcwd()
     else:
         return value
 
 
-def convert_to_bytes(ctx, param, value):
+def convert_to_bytes(ctx: click.Context, param: click.Parameter, value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
     is_size_identifier = (
@@ -40,7 +41,7 @@ def convert_to_bytes(ctx, param, value):
         return int(value[:-2]) * multiplier
 
 
-def identity(value):
+def identity(value: int) -> Callable[[], int]:
     return lambda: value
 
 
@@ -54,7 +55,7 @@ class FileSizeType(click.ParamType):
         'lognormal': lambda Mean, StdDev: abs(int(random.lognormvariate(Mean, StdDev))),
     }
 
-    def convert(self, value, param, ctx):
+    def convert(self, value: str, param: click.Parameter | None, ctx: click.Context | None) -> Callable[[], int]:
         try:
             v = int(value)
             return identity(v)
@@ -75,17 +76,17 @@ class FileSizeType(click.ParamType):
         else:
             self.fail('Unknown size specifier "%s"' % value, param, ctx)
 
-    def _is_size_identifier(self, value):
+    def _is_size_identifier(self, value: str) -> bool:
         return len(value) >= 2 and value[-2:].lower() in SIZE_TYPES
 
-    def _parse_with_size_suffix(self, value):
+    def _parse_with_size_suffix(self, value: str) -> int:
         if self._is_size_identifier(value):
             multiplier = SIZE_TYPES[value[-2:].lower()]
             return int(value[:-2]) * multiplier
         else:
             return int(value)
 
-    def _parse_shorthand(self, value):
+    def _parse_shorthand(self, value: str) -> Callable[[], int]:
         # Shorthand is of the form
         # A=1,B=3,C=3
         shorthand_dict = {}
@@ -125,7 +126,12 @@ def main():
               'Value is either in bytes or can be suffixed with '
               'kb, mb, gb, etc.  Suffix is case insensitive (we '
               'know what you mean).')
-def gen(directory, max_files, max_disk_usage, file_size):
+def gen(
+    directory: str,
+    max_files: float | None,
+    max_disk_usage: float | None,
+    file_size: Callable[[], int],
+) -> None:
     """Generate content addressable files.
 
     This command will generate a set of linked, content addressable files.
@@ -204,7 +210,7 @@ def gen(directory, max_files, max_disk_usage, file_size):
 
 @main.command()
 @click.argument('rootdir', default='.')
-def verify(rootdir):
+def verify(rootdir: str) -> None:
     click.echo("Verifying file contents in: %s" % rootdir)
     verifier = FileVerifier(rootdir)
     verification_success = verifier.verify_files()

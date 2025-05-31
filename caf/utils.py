@@ -1,9 +1,10 @@
 """Shared utility functions."""
 import os
 from contextlib import contextmanager
+from typing import Generator
 
 
-def file_path_to_hash(filename):
+def file_path_to_hash(filename: str) -> str:
     """Convert a sha1 file name to the original sha1.
 
     Given a full filename such as "ab/cd/effffff...",
@@ -16,7 +17,7 @@ def file_path_to_hash(filename):
 
 
 @contextmanager
-def cd(directory):
+def cd(directory: str) -> Generator[None, None, None]:
     starting = os.getcwd()
     os.chdir(directory)
     try:

@@ -1,4 +1,0 @@
-{
-  "include": ["caf", "tests"],
-  "exclude": ["vendor"]
-}

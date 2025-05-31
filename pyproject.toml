@@ -32,6 +32,7 @@ dev-dependencies = [
     "pytest-cov",
     "ruff>=0.6.0",
     "pyright[nodejs]",
+    "poethepoet>=0.28.0",
 ]
 
 [project.urls]
@@ -83,3 +84,21 @@ reportMissingTypeStubs = false
 
 pythonVersion = "3.12"
 pythonPlatform = "All"
+
+[tool.poe.tasks]
+check = [
+  { cmd = "uv run ruff check ." },
+  { cmd = "uv run ruff format --diff ." },
+  { cmd = "uv run pyright" },
+]
+test = "uv run pytest tests/"
+format-code = [
+  { cmd = "uv run ruff format ." },
+]
+# Similar to check, but also auto fixes issues.
+auto-check = [
+  { cmd = "uv run ruff check --fix ." },
+  { cmd = "uv run ruff format ." },
+  { cmd = "uv run pyright" },
+]
+prcheck = ["check", "test"]

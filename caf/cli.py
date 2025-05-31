@@ -13,24 +13,27 @@ __version__ = '0.1.1'
 
 SIZE_TYPES = {
     'kb': 1024,
-    'mb': 1024 ** 2,
-    'gb': 1024 ** 3,
-    'tb': 1024 ** 4,
+    'mb': 1024**2,
+    'gb': 1024**3,
+    'tb': 1024**4,
 }
 
 
-def current_directory(ctx: click.Context, param: click.Parameter, value: Optional[str]) -> str:
+def current_directory(
+    ctx: click.Context, param: click.Parameter, value: Optional[str]
+) -> str:
     if value is None:
         return os.getcwd()
     else:
         return value
 
 
-def convert_to_bytes(ctx: click.Context, param: click.Parameter, value: Optional[str]) -> Optional[int]:
+def convert_to_bytes(
+    ctx: click.Context, param: click.Parameter, value: Optional[str]
+) -> Optional[int]:
     if value is None:
         return None
-    is_size_identifier = (
-        len(value) >= 2 and value[-2:].lower() in SIZE_TYPES)
+    is_size_identifier = len(value) >= 2 and value[-2:].lower() in SIZE_TYPES
     if not is_size_identifier:
         try:
             return int(value)
@@ -51,11 +54,20 @@ class FileSizeType(click.ParamType):
 
     RANDOM_FUNCTION = {
         'normal': lambda Mean, StdDev: abs(int(random.gauss(Mean, StdDev))),
-        'gamma': lambda Alpha, Beta: abs(int(random.gammavariate(Alpha, Beta))),
-        'lognormal': lambda Mean, StdDev: abs(int(random.lognormvariate(Mean, StdDev))),
+        'gamma': lambda Alpha, Beta: abs(
+            int(random.gammavariate(Alpha, Beta))
+        ),
+        'lognormal': lambda Mean, StdDev: abs(
+            int(random.lognormvariate(Mean, StdDev))
+        ),
     }
 
-    def convert(self, value: str, param: click.Parameter | None, ctx: click.Context | None) -> Callable[[], int]:
+    def convert(
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> Callable[[], int]:
         try:
             v = int(value)
             return identity(v)
@@ -66,8 +78,10 @@ class FileSizeType(click.ParamType):
         elif '-' in value:
             parts = value.split('-')
             if not len(parts) == 2:
-                self.fail('Bad value for --filesize: %s\n\nShould be '
-                          'startsize-endsize (e.g. 1mb-5mb).' % value)
+                self.fail(
+                    'Bad value for --filesize: %s\n\nShould be '
+                    'startsize-endsize (e.g. 1mb-5mb).' % value
+                )
             start = self._parse_with_size_suffix(parts[0])
             end = self._parse_with_size_suffix(parts[1])
             return lambda: random.randint(start, end)
@@ -94,17 +108,20 @@ class FileSizeType(click.ParamType):
             k, v = item.split('=')
             shorthand_dict[k] = v
         if 'Type' not in shorthand_dict:
-            self.fail("Missing Type=<type> in file size specifier: %s" %
-                      value)
+            self.fail("Missing Type=<type> in file size specifier: %s" % value)
         param_type = shorthand_dict.pop('Type')
         if param_type not in self.RANDOM_FUNCTION:
-            self.fail("Unknown Type '%s', must be one of: %s" %
-                      (param_type, ','.join(self.RANDOM_FUNCTION)))
+            self.fail(
+                "Unknown Type '%s', must be one of: %s"
+                % (param_type, ','.join(self.RANDOM_FUNCTION))
+            )
         for key, value in shorthand_dict.items():
             shorthand_dict[key] = self._parse_with_size_suffix(value)
-        func = functools.partial(self.RANDOM_FUNCTION[param_type],
-                                 **shorthand_dict)
+        func = functools.partial(
+            self.RANDOM_FUNCTION[param_type], **shorthand_dict
+        )
         return func
+
 
 @click.group()
 def main():
@@ -112,19 +129,28 @@ def main():
 
 
 @main.command()
-@click.option('--directory',
-              help='The directory where files will be generated.',
-              callback=current_directory)
-@click.option('--max-files', type=int,
-              help='The maximum number of files to generate.')
-@click.option('--max-disk-usage', callback=convert_to_bytes,
-              help='The maximum disk space to use when generating files.')
-@click.option('--file-size', default=4096,
-              type=FileSizeType(),
-              help='The size of the files that are generated.  '
-              'Value is either in bytes or can be suffixed with '
-              'kb, mb, gb, etc.  Suffix is case insensitive (we '
-              'know what you mean).')
+@click.option(
+    '--directory',
+    help='The directory where files will be generated.',
+    callback=current_directory,
+)
+@click.option(
+    '--max-files', type=int, help='The maximum number of files to generate.'
+)
+@click.option(
+    '--max-disk-usage',
+    callback=convert_to_bytes,
+    help='The maximum disk space to use when generating files.',
+)
+@click.option(
+    '--file-size',
+    default=4096,
+    type=FileSizeType(),
+    help='The size of the files that are generated.  '
+    'Value is either in bytes or can be suffixed with '
+    'kb, mb, gb, etc.  Suffix is case insensitive (we '
+    'know what you mean).',
+)
 def gen(
     directory: str,
     max_files: float | None,
@@ -202,8 +228,9 @@ def gen(
     # "file_size" is actually a no-arg function created by
     # FileSizeType.  Is there a way in click to specify the destination?
     file_size_chooser = file_size
-    generator = FileGenerator(directory, max_files, max_disk_usage,
-                              file_size_chooser)
+    generator = FileGenerator(
+        directory, max_files, max_disk_usage, file_size_chooser
+    )
     generator.generate_files()
 
 

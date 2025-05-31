@@ -1,4 +1,5 @@
 """Shared utility functions."""
+
 import os
 from contextlib import contextmanager
 from typing import Generator

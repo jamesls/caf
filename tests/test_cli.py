@@ -1,13 +1,9 @@
 import os
 import random
-import sys
-from pathlib import Path
 from typing import Iterable
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from click.testing import CliRunner
-from caf import main
+from caf.cli import main
 
 
 def get_all_generated_files(rootdir: str) -> Iterable[str]:
@@ -109,7 +105,9 @@ def test_max_disk_usage_bytes(tmp_path):
         '16384',
     )
     assert result.exit_code == 0, result.output
-    total_size = sum(os.path.getsize(p) for p in get_all_generated_files(tmp_path))
+    total_size = sum(
+        os.path.getsize(p) for p in get_all_generated_files(tmp_path)
+    )
     assert total_size == 16384
 
 
@@ -122,7 +120,9 @@ def test_max_disk_usage_mb(tmp_path):
         '1MB',
     )
     assert result.exit_code == 0, result.output
-    total_size = sum(os.path.getsize(p) for p in get_all_generated_files(tmp_path))
+    total_size = sum(
+        os.path.getsize(p) for p in get_all_generated_files(tmp_path)
+    )
     assert total_size == 1 * 1024 * 1024
 
 

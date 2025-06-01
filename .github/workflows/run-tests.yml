@@ -33,7 +33,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v2
         with:
-          version: "0.4.6"
+          version: "latest"
       - name: Install dependencies
         run: uv sync --all-extras --dev
       - name: Run prcheck

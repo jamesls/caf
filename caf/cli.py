@@ -4,6 +4,7 @@ import functools
 from typing import Callable, Optional
 
 import click
+from rich.console import Console
 
 from caf.generator import FileGenerator
 from caf.verifier import FileVerifier
@@ -124,6 +125,7 @@ class FileSizeType(click.ParamType):
 
 
 @click.group()
+@click.version_option(version=__version__, prog_name='caf')
 def main():
     pass
 
@@ -228,22 +230,153 @@ def gen(
     # "file_size" is actually a no-arg function created by
     # FileSizeType.  Is there a way in click to specify the destination?
     file_size_chooser = file_size
+    os.makedirs(directory, exist_ok=True)
     generator = FileGenerator(
         directory, max_files, max_disk_usage, file_size_chooser
     )
     generator.generate_files()
 
 
+@main.group()
+def dev():
+    """Development tools for testing caf."""
+    pass
+
+
+@dev.command()
+@click.argument('filepath', type=click.Path(exists=True))
+@click.option(
+    '--preset',
+    type=click.Choice(['zero', 'random']),
+    default='random',
+    help='Corruption preset: "zero" fills with zeros, '
+    '"random" fills with random bytes.',
+)
+@click.option(
+    '--start',
+    type=int,
+    default=0,
+    help='Starting byte offset for corruption.',
+)
+@click.option(
+    '--length',
+    type=int,
+    default=100,
+    help='Number of bytes to corrupt.',
+)
+@click.option(
+    '--seed',
+    type=int,
+    help='Random seed for reproducible corruption '
+    '(only applies to "random" preset).',
+)
+def corrupt_file(
+    filepath: str, preset: str, start: int, length: int, seed: Optional[int]
+) -> None:
+    """Intentionally corrupt a file for testing verification.
+
+    This command is used to test that caf correctly detects corruption.
+    It will modify the specified byte range in the file according to the
+    chosen preset.
+
+    Examples:
+
+    \b
+    # Zero out bytes 100-199 in a file
+    caf dev corrupt-file myfile.dat --preset zero --start 100 --length 100
+
+    \b
+    # Fill bytes 0-49 with random data
+    caf dev corrupt-file myfile.dat --preset random --start 0 --length 50
+
+    \b
+    # Use a seed for reproducible corruption
+    caf dev corrupt-file myfile.dat --preset random --seed 42
+    """
+    import mmap
+
+    click.echo(f"Corrupting file: {filepath}")
+    click.echo(f"Preset: {preset}")
+    click.echo(
+        f"Range: bytes {start} to {start + length - 1} ({length} bytes)"
+    )
+
+    # Get file size to validate parameters
+    file_size = os.path.getsize(filepath)
+    if start >= file_size:
+        raise click.BadParameter(
+            f"Start offset {start} is beyond file size {file_size}"
+        )
+    if start + length > file_size:
+        truncated_len = file_size - start
+        click.echo(
+            f"Warning: Corruption range extends beyond file size. "
+            f"Truncating to {truncated_len} bytes."
+        )
+        length = truncated_len
+
+    # Apply corruption
+    with open(filepath, 'r+b') as f:
+        with mmap.mmap(f.fileno(), 0) as mm:
+            if preset == 'zero':
+                # Zero out the specified range
+                mm[start : start + length] = b'\x00' * length
+                click.echo(f"Zeroed out {length} bytes")
+            elif preset == 'random':
+                # Fill with random bytes
+                if seed is not None:
+                    random.seed(seed)
+                    click.echo(f"Using random seed: {seed}")
+                random_bytes = bytes(
+                    random.randint(0, 255) for _ in range(length)
+                )
+                mm[start : start + length] = random_bytes
+                click.echo(f"Filled {length} bytes with random data")
+
+    click.echo("Corruption complete.")
+
+
 @main.command()
 @click.argument('rootdir', default='.')
-def verify(rootdir: str) -> None:
-    click.echo("Verifying file contents in: %s" % rootdir)
-    verifier = FileVerifier(rootdir)
+@click.option(
+    '--chunk-size',
+    type=int,
+    default=4096,
+    help='Chunk size in bytes for corruption analysis. Smaller values provide '
+    'more granular corruption detection but take longer. Common values: '
+    '512 (fine-grained), 4096 (4KB blocks), 65536 (64KB chunks).',
+)
+def verify(rootdir: str, chunk_size: int) -> None:
+    """Verify content addressable files and analyze corruption.
+
+    This command verifies all CAF files in the specified directory and
+    provides detailed corruption analysis if any files are corrupted.
+
+    The --chunk-size option controls the granularity of corruption detection:
+
+    \b
+    - 512 bytes: Fine-grained analysis, slower but more precise
+    - 4096 bytes: Standard 4KB block analysis (default)
+    - 65536 bytes: Fast scanning for large files
+
+    When corruption is detected, the verifier will:
+
+    \b
+    - Identify exact corrupted byte ranges
+    - Analyze corruption patterns (zero-filled, sparse, random, etc.)
+    - Provide visual corruption maps
+    - Suggest recovery strategies based on patterns
+    """
+    console = Console()
+    console.print(f"Verifying file contents in: [bold]{rootdir}[/]")
+    console.print(f"[dim]Analysis chunk size: {chunk_size:,} bytes[/]")
+    verifier = FileVerifier(rootdir, analysis_chunk_size=chunk_size)
     verification_success = verifier.verify_files()
     if verification_success:
-        click.echo("All files successfully verified.")
+        console.print("[green]✓[/] All files successfully verified.")
     else:
-        raise click.ClickException("Verification failed.")
+        console.print("[red]✗[/] Verification failed.")
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

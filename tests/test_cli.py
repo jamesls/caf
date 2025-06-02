@@ -157,3 +157,83 @@ def test_verify_failure(tmp_path):
     os.remove(random.choice(files))
     verify_result = run_verify(runner, str(tmp_path))
     assert verify_result.exit_code == 1
+
+
+def test_verify_with_directory_argument(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            'gen',
+            '--directory',
+            str(tmp_path),
+            '--max-files',
+            '2',
+            '--file-size',
+            '1024',
+        ],
+    )
+    assert result.exit_code == 0
+
+    result = runner.invoke(main, ['verify', str(tmp_path)])
+    assert result.exit_code == 0
+    assert 'successfully verified' in result.output
+
+
+def test_verify_detects_corruption(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            'gen',
+            '--directory',
+            str(tmp_path),
+            '--max-files',
+            '1',
+            '--file-size',
+            '2048',
+        ],
+    )
+    assert result.exit_code == 0
+
+    for root, _, files in os.walk(tmp_path):
+        if '.metadata' in root:
+            continue
+        if files:
+            file_path = os.path.join(root, files[0])
+            with open(file_path, 'r+b') as f:
+                f.seek(200)
+                f.write(b'\xff' * 1000)
+            break
+
+    result = runner.invoke(main, ['verify', str(tmp_path)])
+    assert result.exit_code == 1
+    assert 'CORRUPTION' in result.output
+
+
+def test_verify_chunk_size_option(tmp_path):
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            'gen',
+            '--directory',
+            str(tmp_path),
+            '--max-files',
+            '1',
+            '--file-size',
+            '2048',
+        ],
+    )
+    assert result.exit_code == 0
+
+    for chunk_size in [256, 1024, 2048]:
+        result = runner.invoke(
+            main,
+            ['verify', str(tmp_path), '--chunk-size', str(chunk_size)],
+        )
+        assert result.exit_code == 0
+        assert f'{chunk_size:,} bytes' in result.output

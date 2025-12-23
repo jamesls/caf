@@ -13,12 +13,14 @@ as the first 20 bytes, followed by randomly generated content.
 
 
 """
+
 import os
 import shutil
-from binascii import hexlify
-from random import randint
 import tempfile
 import hashlib
+from binascii import hexlify
+from random import randint
+from typing import Callable, Optional, Tuple
 
 from caf.utils import cd
 
@@ -42,21 +44,27 @@ class FileGenerator(object):
     BUFFER_WRITE_SIZE = 1024 * 1024
     ROOTS_DIR = os.path.join('.metadata', 'roots')
 
-    def __init__(self, rootdir, max_files, max_disk_usage,
-                 file_size_chooser, buffer_write_size=BUFFER_WRITE_SIZE,
-                 temp_dir=None):
+    def __init__(
+        self,
+        rootdir: str,
+        max_files: float | None,
+        max_disk_usage: float | None,
+        file_size_chooser: Callable[[], int],
+        buffer_write_size: int = BUFFER_WRITE_SIZE,
+        temp_dir: Optional[str] = None,
+    ) -> None:
         if max_files is None:
             max_files = float('inf')
         if max_disk_usage is None:
             max_disk_usage = float('inf')
         self._rootdir = rootdir
-        self._max_files = max_files
-        self._max_disk_usage = max_disk_usage
+        self._max_files: float = max_files
+        self._max_disk_usage: float = max_disk_usage
         self._file_size_chooser = file_size_chooser
         self._buffer_write_size = buffer_write_size
         self._temp_dir = temp_dir
 
-    def generate_files(self):
+    def generate_files(self) -> None:
         temp_dir = self._temp_dir
         if temp_dir is None:
             # Use the current woroking directory as the
@@ -67,16 +75,20 @@ class FileGenerator(object):
             file_size_chooser = self._file_size_chooser
             disk_space_bytes_used = 0
             sha1_hash = self.ROOT_HASH
-            while files_created < self._max_files and \
-                    disk_space_bytes_used < self._max_disk_usage:
+            ascii_hex_basename = hexlify(sha1_hash).decode("ascii")
+            while (
+                files_created < self._max_files
+                and disk_space_bytes_used < self._max_disk_usage
+            ):
                 file_size = file_size_chooser()
                 temp_filename, sha1_hash = self.generate_single_file_link(
-                    sha1_hash, file_size=file_size,
+                    sha1_hash,
+                    file_size=file_size,
                     buffer_size=self.BUFFER_WRITE_SIZE,
-                    temp_dir=temp_dir)
-                ascii_hex_basename = hexlify(sha1_hash).decode('ascii')
-                self._move_to_final_location(
-                    temp_filename, ascii_hex_basename)
+                    temp_dir=temp_dir,
+                )
+                ascii_hex_basename = hexlify(sha1_hash).decode("ascii")
+                self._move_to_final_location(temp_filename, ascii_hex_basename)
                 files_created += 1
                 disk_space_bytes_used += file_size
             # Write out the root file in the special
@@ -85,7 +97,7 @@ class FileGenerator(object):
             # to have anything referring to it.
             self._write_root_sha(ascii_hex_basename)
 
-    def _write_root_sha(self, filename):
+    def _write_root_sha(self, filename: str) -> None:
         directory_name = os.path.join(self._rootdir, self.ROOTS_DIR)
         if not os.path.isdir(directory_name):
             try:
@@ -108,14 +120,16 @@ class FileGenerator(object):
         with open(os.path.join(self._rootdir, '.metadata', 'all'), 'wb') as f:
             f.write(final_roots_hash.encode('ascii'))
 
-    def _move_to_final_location(self, temp_filename, ascii_hex_basename):
+    def _move_to_final_location(
+        self, temp_filename: str, ascii_hex_basename: str
+    ) -> None:
         # This is not exposed as a config option (yet),
         # given a full sha1 hash, this translates to:
         #
         #   ab/cd/<remaining hash>
         directory_part = os.path.join(
-            self._rootdir, ascii_hex_basename[:2],
-            ascii_hex_basename[2:4])
+            self._rootdir, ascii_hex_basename[:2], ascii_hex_basename[2:4]
+        )
         basename = ascii_hex_basename[4:]
         if not os.path.isdir(directory_part):
             try:
@@ -126,13 +140,19 @@ class FileGenerator(object):
         final_filename = os.path.join(directory_part, basename)
         shutil.move(temp_filename, final_filename)
 
-    def generate_single_file_link(self, parent_hash, file_size,
-                                  buffer_size, temp_dir):
+    def generate_single_file_link(
+        self,
+        parent_hash: bytes,
+        file_size: int,
+        buffer_size: int,
+        temp_dir: str,
+    ) -> Tuple[str, bytes]:
         sha1 = hashlib.sha1(parent_hash)
         amount_remaining = file_size
         temp_filename = os.path.join(
             temp_dir,
-            hexlify(parent_hash[:8]).decode('ascii') + str(randint(1, 100000)))
+            hexlify(parent_hash[:8]).decode('ascii') + str(randint(1, 100000)),
+        )
 
         with open(temp_filename, 'wb') as f:
             f.write(parent_hash)

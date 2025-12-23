@@ -2,16 +2,6 @@
 caf
 ===
 
-.. image:: https://badge.fury.io/py/caf.png
-    :target: http://badge.fury.io/py/caf
-
-.. image:: https://travis-ci.org/jamesls/caf.png?branch=master
-        :target: https://travis-ci.org/jamesls/caf
-
-.. image:: https://pypip.in/d/caf/badge.png
-        :target: https://pypi.python.org/pypi/caf
-
-
 Caf (content addressable files) is a CLI utility that allows you to:
 
 * Create random files using ``caf gen``

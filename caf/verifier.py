@@ -4,7 +4,7 @@ import os
 import hashlib
 import struct
 from binascii import hexlify
-from typing import Optional, Any
+from typing import Literal, Optional
 from dataclasses import dataclass
 
 from rich.console import Console
@@ -30,14 +30,101 @@ class HeaderInfo:
     reserved: bytes
 
 
+# Corruption pattern types
+
+
+@dataclass(frozen=True)
+class ZeroFilled:
+    """All bytes in the region are 0x00."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class RepeatedByte:
+    """All bytes in the region are the same value."""
+
+    byte_value: int
+
+
+@dataclass(frozen=True)
+class Sparse:
+    """Less than 10% of bytes are corrupted."""
+
+    corrupted_count: int
+
+
+@dataclass(frozen=True)
+class Aligned:
+    """Corruption aligns to common I/O boundaries."""
+
+    boundary: int
+
+
+@dataclass(frozen=True)
+class Random:
+    """Unstructured corruption with high corruption rate."""
+
+    corruption_rate: float
+
+
+@dataclass(frozen=True)
+class Truncated:
+    """File is shorter than expected."""
+
+    missing_bytes: int
+
+
+@dataclass(frozen=True)
+class ExtraBytes:
+    """File has unexpected data beyond expected length."""
+
+    extra_count: int
+
+
+CorruptionPattern = (
+    ZeroFilled
+    | RepeatedByte
+    | Sparse
+    | Aligned
+    | Random
+    | Truncated
+    | ExtraBytes
+)
+
+
 @dataclass
 class CorruptionRegion:
     """Information about a corrupted region in a file."""
 
     offset: int
     size: int
-    pattern: str
-    details: str
+    pattern: CorruptionPattern
+
+
+@dataclass
+class CorruptionReport:
+    """Detailed report of corruption found in a single file."""
+
+    file: str
+    expected_blake2b: str
+    actual_blake2b: str
+    file_size: int
+    expected_file_size: int
+    header_valid: bool
+    master_seed: str
+    total_corrupted_bytes: int
+    corruption_percentage: float
+    corrupted_regions: list[CorruptionRegion]
+    corruption_type: Literal['content', 'path_mismatch']
+
+
+@dataclass
+class VerificationResult:
+    """Result of verifying files in a CAF store."""
+
+    success: bool
+    reports: list[CorruptionReport]
 
 
 class FileVerifier(object):
@@ -49,15 +136,15 @@ class FileVerifier(object):
         self._rootdir = rootdir
         self._verification_succeeded = True
         self._analysis_chunk_size = analysis_chunk_size
-        self._corruption_reports: list[dict[str, Any]] = []
+        self._corruption_reports: list[CorruptionReport] = []
         self._console = Console()
         self._err_console = Console(stderr=True)
 
-    def verify_files(self) -> bool:
+    def verify_files(self) -> VerificationResult:
         """Verify all files in the directory."""
         self._verification_succeeded = True
         self._corruption_reports = []
-        referenced = set()
+        referenced: set[str] = set()
 
         roots_dir = os.path.join(self._rootdir, self.ROOTS_DIR)
         if not os.path.isdir(roots_dir):
@@ -65,7 +152,7 @@ class FileVerifier(object):
                 f"[red bold]ERROR:[/] {self._rootdir} is not a valid CAF "
                 f"store (missing {self.ROOTS_DIR} directory)"
             )
-            return False
+            return VerificationResult(success=False, reports=[])
 
         known_roots = os.listdir(roots_dir)
         files_validated = 0
@@ -90,7 +177,10 @@ class FileVerifier(object):
         self._verify_referenced_files(referenced, known_roots)
         self._verify_known_roots(known_roots)
         self._print_corruption_summary()
-        return self._verification_succeeded
+        return VerificationResult(
+            success=self._verification_succeeded,
+            reports=self._corruption_reports,
+        )
 
     def _validate_and_analyze_file(self, full_path: str) -> Optional[str]:
         """Validate a single file and analyze corruption if found."""
@@ -212,14 +302,13 @@ class FileVerifier(object):
                 expected_chunk = expected_stream.read(len(actual_chunk))
 
                 if actual_chunk != expected_chunk:
-                    corruption_info = self._analyze_corruption_pattern(
+                    pattern = self._analyze_corruption_pattern(
                         actual_chunk, expected_chunk
                     )
                     region = CorruptionRegion(
                         offset=offset,
                         size=len(actual_chunk),
-                        pattern=corruption_info['pattern'],
-                        details=corruption_info['details'],
+                        pattern=pattern,
                     )
                     self._append_or_merge_corruption_region(
                         corrupted_regions, region
@@ -235,8 +324,7 @@ class FileVerifier(object):
                 CorruptionRegion(
                     offset=actual_file_size,
                     size=missing_bytes,
-                    pattern='truncated',
-                    details=f'Missing {missing_bytes:,} bytes at end of file',
+                    pattern=Truncated(missing_bytes=missing_bytes),
                 ),
             )
         elif actual_file_size > expected_file_size:
@@ -246,8 +334,7 @@ class FileVerifier(object):
                 CorruptionRegion(
                     offset=expected_file_size,
                     size=extra_bytes,
-                    pattern='extra-bytes',
-                    details=f'Unexpected {extra_bytes:,} extra bytes',
+                    pattern=ExtraBytes(extra_count=extra_bytes),
                 ),
             )
 
@@ -256,18 +343,14 @@ class FileVerifier(object):
     def _append_or_merge_corruption_region(
         self, regions: list[CorruptionRegion], region: CorruptionRegion
     ) -> None:
-        """Merge contiguous regions when pattern/details match."""
+        """Merge contiguous regions when pattern matches."""
         if not regions:
             regions.append(region)
             return
 
         last = regions[-1]
         is_contiguous = last.offset + last.size == region.offset
-        if (
-            is_contiguous
-            and last.pattern == region.pattern
-            and last.details == region.details
-        ):
+        if is_contiguous and last.pattern == region.pattern:
             last.size += region.size
             return
 
@@ -275,16 +358,13 @@ class FileVerifier(object):
 
     def _analyze_corruption_pattern(
         self, actual: bytes, expected: bytes
-    ) -> dict[str, str]:
+    ) -> CorruptionPattern:
         """Analyze the pattern of corruption in a chunk."""
         if all(b == 0 for b in actual):
-            return {'pattern': 'zero-filled', 'details': 'All bytes are 0x00'}
+            return ZeroFilled()
 
         if len(set(actual)) == 1:
-            return {
-                'pattern': 'repeated-byte',
-                'details': f'All bytes are 0x{actual[0]:02x}',
-            }
+            return RepeatedByte(byte_value=actual[0])
 
         # Check for partial corruption
         min_len = min(len(actual), len(expected))
@@ -300,22 +380,13 @@ class FileVerifier(object):
         corruption_rate = len(diff_positions) / len(actual)
 
         if corruption_rate < 0.1:
-            return {
-                'pattern': 'sparse',
-                'details': f'{len(diff_positions)} bytes corrupted',
-            }
+            return Sparse(corrupted_count=len(diff_positions))
 
         # Check if corruption aligns with common boundaries
-        if offset := self._check_alignment(diff_positions):
-            return {
-                'pattern': 'aligned',
-                'details': f'Corruption aligned to {offset}-byte boundaries',
-            }
+        if boundary := self._check_alignment(diff_positions):
+            return Aligned(boundary=boundary)
 
-        return {
-            'pattern': 'random',
-            'details': f'{corruption_rate:.1%} corruption rate',
-        }
+        return Random(corruption_rate=corruption_rate)
 
     def _check_alignment(self, positions: list[int]) -> Optional[int]:
         """Check if corrupted positions align to common boundaries."""
@@ -324,6 +395,27 @@ class FileVerifier(object):
             if all(pos % boundary == 0 for pos in positions[:5]):
                 return boundary
         return None
+
+    def _format_pattern(self, pattern: CorruptionPattern) -> tuple[str, str]:
+        """Return (pattern_name, details) for display."""
+        match pattern:
+            case ZeroFilled():
+                return ('zero-filled', 'All bytes are 0x00')
+            case RepeatedByte(byte_value=v):
+                return ('repeated-byte', f'All bytes are 0x{v:02x}')
+            case Sparse(corrupted_count=n):
+                return ('sparse', f'{n} bytes corrupted')
+            case Aligned(boundary=b):
+                return (
+                    'aligned',
+                    f'Corruption aligned to {b}-byte boundaries',
+                )
+            case Random(corruption_rate=r):
+                return ('random', f'{r:.1%} corruption rate')
+            case Truncated(missing_bytes=n):
+                return ('truncated', f'Missing {n:,} bytes at end of file')
+            case ExtraBytes(extra_count=n):
+                return ('extra-bytes', f'Unexpected {n:,} extra bytes')
 
     def _generate_corruption_report(
         self,
@@ -347,29 +439,28 @@ class FileVerifier(object):
         )
 
         # Distinguish path mismatch (content valid) vs actual corruption
+        corruption_type: Literal['content', 'path_mismatch']
         if (
             total_corrupted_bytes == 0
             and actual_file_size == expected_file_size
         ):
-            corruption_type = "path_mismatch"
+            corruption_type = 'path_mismatch'
         else:
-            corruption_type = "content"
+            corruption_type = 'content'
 
-        report = {
-            'file': file_path,
-            'expected_blake2b': expected_hash,
-            'actual_blake2b': actual_hash,
-            'file_size': actual_file_size,
-            'expected_file_size': expected_file_size,
-            'analysis_file_size': analysis_file_size,
-            'header_valid': True,
-            'master_seed': hexlify(header_info.master_seed).decode('ascii'),
-            'total_corrupted_bytes': total_corrupted_bytes,
-            'corruption_percentage': corruption_percentage,
-            'corrupted_regions': corrupted_regions,
-            'analysis_chunk_size': self._analysis_chunk_size,
-            'corruption_type': corruption_type,
-        }
+        report = CorruptionReport(
+            file=file_path,
+            expected_blake2b=expected_hash,
+            actual_blake2b=actual_hash,
+            file_size=actual_file_size,
+            expected_file_size=expected_file_size,
+            header_valid=True,
+            master_seed=hexlify(header_info.master_seed).decode('ascii'),
+            total_corrupted_bytes=total_corrupted_bytes,
+            corruption_percentage=corruption_percentage,
+            corrupted_regions=corrupted_regions,
+            corruption_type=corruption_type,
+        )
 
         self._corruption_reports.append(report)
 
@@ -383,9 +474,9 @@ class FileVerifier(object):
 
         for report in self._corruption_reports:
             self._console.print()
-            self._console.print(f"[bold]File:[/] {report['file']}")
+            self._console.print(f"[bold]File:[/] {report.file}")
 
-            if report['corruption_type'] == 'path_mismatch':
+            if report.corruption_type == 'path_mismatch':
                 # Path mismatch: content is valid but stored at wrong path
                 self._console.print(
                     "[bold]Status:[/] [yellow]PATH MISMATCH[/] (content valid)"
@@ -396,12 +487,12 @@ class FileVerifier(object):
                 )
                 table.add_column("Label", style="dim")
                 table.add_column("Value")
-                table.add_row("File Size", f"{report['file_size']:,} bytes")
+                table.add_row("File Size", f"{report.file_size:,} bytes")
                 table.add_row(
-                    "Path indicates", f"[cyan]{report['expected_blake2b']}[/]"
+                    "Path indicates", f"[cyan]{report.expected_blake2b}[/]"
                 )
                 table.add_row(
-                    "Actual checksum", f"[cyan]{report['actual_blake2b']}[/]"
+                    "Actual checksum", f"[cyan]{report.actual_blake2b}[/]"
                 )
                 self._console.print(table)
 
@@ -421,48 +512,48 @@ class FileVerifier(object):
                 )
                 table.add_column("Label", style="dim")
                 table.add_column("Value")
-                table.add_row("Actual Size", f"{report['file_size']:,} bytes")
+                table.add_row("Actual Size", f"{report.file_size:,} bytes")
                 table.add_row(
                     "Header Size",
-                    f"{report['expected_file_size']:,} bytes",
+                    f"{report.expected_file_size:,} bytes",
                 )
                 table.add_row(
                     "Expected BLAKE2b",
-                    f"[cyan]{report['expected_blake2b']}[/]",
+                    f"[cyan]{report.expected_blake2b}[/]",
                 )
                 table.add_row(
-                    "Actual BLAKE2b", f"[cyan]{report['actual_blake2b']}[/]"
+                    "Actual BLAKE2b", f"[cyan]{report.actual_blake2b}[/]"
                 )
                 self._console.print(table)
 
                 self._console.print()
                 header_status = (
                     "[green]PASSED[/]"
-                    if report['header_valid']
+                    if report.header_valid
                     else "[red]FAILED[/]"
                 )
                 self._console.print(
                     f"[dim]Header Validation:[/] {header_status}"
                 )
                 self._console.print(
-                    f"[dim]Master Seed:[/] [cyan]{report['master_seed']}[/]"
+                    f"[dim]Master Seed:[/] [cyan]{report.master_seed}[/]"
                 )
 
                 self._console.print()
                 self._console.print("[bold]Corruption Analysis[/]")
-                corrupted = report['total_corrupted_bytes']
-                pct = report['corruption_percentage']
-                size = report['analysis_file_size']
+                corrupted = report.total_corrupted_bytes
+                pct = report.corruption_percentage
+                size = max(report.file_size, report.expected_file_size)
                 self._console.print(f"  [dim]Analysis size:[/] {size:,}")
                 self._console.print(
                     f"  [dim]Bytes corrupted:[/] [red]{corrupted:,}[/] "
                     f"({pct:.2f}%)"
                 )
                 self._console.print(
-                    f"  [dim]Regions:[/] {len(report['corrupted_regions'])}"
+                    f"  [dim]Regions:[/] {len(report.corrupted_regions)}"
                 )
 
-                for i, region in enumerate(report['corrupted_regions'], 1):
+                for i, region in enumerate(report.corrupted_regions, 1):
                     end_offset = region.offset + region.size
                     self._console.print()
                     self._console.print(
@@ -470,18 +561,16 @@ class FileVerifier(object):
                         f"Offset {region.offset:,}–{end_offset:,} "
                         f"({region.size:,} bytes)"
                     )
-                    self._console.print(
-                        f"    [dim]Pattern:[/] {region.pattern}"
+                    pattern_name, details = self._format_pattern(
+                        region.pattern
                     )
-                    if region.details:
-                        self._console.print(
-                            f"    [dim]Details:[/] {region.details}"
-                        )
+                    self._console.print(f"    [dim]Pattern:[/] {pattern_name}")
+                    self._console.print(f"    [dim]Details:[/] {details}")
 
                 # Generate visualization
                 self._console.print()
                 self._print_corruption_visualization(
-                    report['analysis_file_size'], report['corrupted_regions']
+                    size, report.corrupted_regions
                 )
 
         self._console.print()

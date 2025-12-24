@@ -1,7 +1,12 @@
 import os
 
 from caf.generator import FileGenerator
-from caf.verifier import FileVerifier
+from caf.verifier import (
+    FileVerifier,
+    RepeatedByte,
+    Truncated,
+    ZeroFilled,
+)
 
 
 def test_verify_files_detects_invalid_checksum(tmp_path):
@@ -19,7 +24,8 @@ def test_verify_files_detects_invalid_checksum(tmp_path):
             break
 
     verifier = FileVerifier(str(tmp_path))
-    assert not verifier.verify_files()
+    result = verifier.verify_files()
+    assert not result.success
 
 
 def test_verify_files_detects_corrupted_root_metadata(tmp_path, capsys):
@@ -32,7 +38,7 @@ def test_verify_files_detects_corrupted_root_metadata(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path))
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
     assert "Root hash is not valid" in capsys.readouterr().err
 
 
@@ -52,7 +58,7 @@ def test_verify_files_detects_invalid_file_content(tmp_path, capsys):
     result = verifier.verify_files()
 
     captured = capsys.readouterr()
-    assert not result
+    assert not result.success
     assert (
         "Invalid checksum" in captured.err
         or "Header corrupted" in captured.err
@@ -70,7 +76,7 @@ def test_verify_files_succeeds_for_clean_files(tmp_path):
 
     verifier = FileVerifier(str(tmp_path))
     result = verifier.verify_files()
-    assert result
+    assert result.success
 
 
 def test_verify_files_detects_zeroed_content(tmp_path, capsys):
@@ -94,7 +100,7 @@ def test_verify_files_detects_zeroed_content(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path))
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
 
     captured = capsys.readouterr()
     output = captured.out + captured.err
@@ -122,13 +128,21 @@ def test_verify_files_reports_truncated_file_as_corruption(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path), analysis_chunk_size=256)
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
 
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert 'CONTENT CORRUPTED' in output
     assert 'PATH MISMATCH' not in output
     assert 'truncated' in output
+
+    assert len(result.reports) == 1
+    regions = result.reports[0].corrupted_regions
+    truncated_regions = [
+        r for r in regions if isinstance(r.pattern, Truncated)
+    ]
+    assert len(truncated_regions) >= 1
+    assert truncated_regions[0].pattern.missing_bytes == 512
 
 
 def test_verify_files_with_different_chunk_sizes(tmp_path):
@@ -145,7 +159,7 @@ def test_verify_files_with_different_chunk_sizes(tmp_path):
     for chunk_size in chunk_sizes:
         verifier = FileVerifier(str(tmp_path), analysis_chunk_size=chunk_size)
         result = verifier.verify_files()
-        assert result
+        assert result.success
 
 
 def test_verify_files_detects_broken_file_chain(tmp_path):
@@ -159,7 +173,7 @@ def test_verify_files_detects_broken_file_chain(tmp_path):
 
     verifier = FileVerifier(str(tmp_path))
     result = verifier.verify_files()
-    assert result
+    assert result.success
 
     files = []
     for root, _, filenames in os.walk(tmp_path):
@@ -179,7 +193,7 @@ def test_verify_files_detects_broken_file_chain(tmp_path):
 
         verifier = FileVerifier(str(tmp_path))
         result = verifier.verify_files()
-        assert not result
+        assert not result.success
 
 
 def test_verify_files_detects_corrupted_metadata(tmp_path, capsys):
@@ -197,7 +211,7 @@ def test_verify_files_detects_corrupted_metadata(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path))
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
 
     captured = capsys.readouterr()
     assert 'Root hash is not valid' in captured.err
@@ -224,12 +238,17 @@ def test_verify_files_reports_zero_filled_corruption(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path), analysis_chunk_size=256)
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
 
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert 'zero-filled' in output
     assert 'All bytes are 0x00' in output
+
+    assert len(result.reports) == 1
+    regions = result.reports[0].corrupted_regions
+    zero_filled = [r for r in regions if isinstance(r.pattern, ZeroFilled)]
+    assert len(zero_filled) >= 1
 
 
 def test_verify_files_reports_repeated_byte_corruption(tmp_path, capsys):
@@ -253,12 +272,18 @@ def test_verify_files_reports_repeated_byte_corruption(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path), analysis_chunk_size=512)
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
 
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert 'repeated-byte' in output
     assert '0xff' in output
+
+    assert len(result.reports) == 1
+    regions = result.reports[0].corrupted_regions
+    repeated = [r for r in regions if isinstance(r.pattern, RepeatedByte)]
+    assert len(repeated) >= 1
+    assert repeated[0].pattern.byte_value == 0xFF
 
 
 def test_verify_files_generates_corruption_visualization(tmp_path, capsys):
@@ -284,7 +309,7 @@ def test_verify_files_generates_corruption_visualization(tmp_path, capsys):
 
     verifier = FileVerifier(str(tmp_path), analysis_chunk_size=256)
     result = verifier.verify_files()
-    assert not result
+    assert not result.success
 
     captured = capsys.readouterr()
     output = captured.out + captured.err

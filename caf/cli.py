@@ -371,8 +371,8 @@ def verify(rootdir: str, chunk_size: int) -> None:
     console.print(f"Verifying file contents in: [bold]{rootdir}[/]")
     console.print(f"[dim]Analysis chunk size: {chunk_size:,} bytes[/]")
     verifier = FileVerifier(rootdir, analysis_chunk_size=chunk_size)
-    verification_success = verifier.verify_files()
-    if verification_success:
+    result = verifier.verify_files()
+    if result.success:
         console.print("[green]✓[/] All files successfully verified.")
     else:
         console.print("[red]✗[/] Verification failed.")

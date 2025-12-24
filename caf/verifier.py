@@ -583,9 +583,8 @@ class FileVerifier(object):
         if file_size <= 0:
             return
 
-        # Build list of (is_corrupted, char) for each position
+        # Build corruption map
         corrupted = [False] * bar_length
-
         for region in regions:
             start_pos = int((region.offset / file_size) * bar_length)
             end_pos = int(
@@ -594,10 +593,23 @@ class FileVerifier(object):
             for i in range(max(0, start_pos), min(end_pos + 1, bar_length)):
                 corrupted[i] = True
 
-        bar = ''.join('X' if is_bad else '=' for is_bad in corrupted)
+        # Unicode characters for visualization
+        CLEAN = "━"  # U+2501 box drawing heavy horizontal
+        CORRUPT = "█"  # U+2588 full block
+
+        # Build bar with simple block rendering
+        bar_parts = []
+        for is_bad in corrupted:
+            if is_bad:
+                bar_parts.append(f"[red]{CORRUPT}[/]")
+            else:
+                bar_parts.append(f"[dim]{CLEAN}[/]")
+
+        bar = "".join(bar_parts)
+
         self._console.print("[bold]Visualization:[/]")
-        self._console.print(f"[{bar}]", markup=False)
-        self._console.print(" 0%".ljust(bar_length // 2) + "100%")
+        self._console.print(bar)
+        self._console.print(f"0%{' ' * (bar_length - 4)}100%")
 
     def _verify_referenced_files(
         self, referenced: set[str], known_roots: list[str]

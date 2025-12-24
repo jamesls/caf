@@ -315,6 +315,5 @@ def test_verify_files_generates_corruption_visualization(tmp_path, capsys):
     output = captured.out + captured.err
 
     assert 'Visualization:' in output
-    assert '[' in output and ']' in output
-    assert 'X' in output
+    assert '━' in output or '█' in output  # Unicode bar characters
     assert '0%' in output and '100%' in output

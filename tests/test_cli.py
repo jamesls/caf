@@ -159,7 +159,7 @@ def test_verify_failure(tmp_path):
     assert verify_result.exit_code == 1
 
 
-def test_verify_with_directory_argument(tmp_path):
+def test_verify_with_directory_option(tmp_path):
     runner = CliRunner()
 
     result = runner.invoke(
@@ -176,7 +176,7 @@ def test_verify_with_directory_argument(tmp_path):
     )
     assert result.exit_code == 0
 
-    result = runner.invoke(main, ['verify', str(tmp_path)])
+    result = runner.invoke(main, ['verify', '--directory', str(tmp_path)])
     assert result.exit_code == 0
     assert 'successfully verified' in result.output
 
@@ -208,7 +208,7 @@ def test_verify_detects_corruption(tmp_path):
                 f.write(b'\xff' * 1000)
             break
 
-    result = runner.invoke(main, ['verify', str(tmp_path)])
+    result = runner.invoke(main, ['verify', '--directory', str(tmp_path)])
     assert result.exit_code == 1
     assert 'CORRUPTION' in result.output
 
@@ -233,7 +233,13 @@ def test_verify_chunk_size_option(tmp_path):
     for chunk_size in [256, 1024, 2048]:
         result = runner.invoke(
             main,
-            ['verify', str(tmp_path), '--chunk-size', str(chunk_size)],
+            [
+                'verify',
+                '--directory',
+                str(tmp_path),
+                '--chunk-size',
+                str(chunk_size),
+            ],
         )
         assert result.exit_code == 0
         assert f'{chunk_size:,} bytes' in result.output

@@ -337,7 +337,11 @@ def corrupt_file(
 
 
 @main.command()
-@click.argument('rootdir', default='.')
+@click.option(
+    '--directory',
+    help='The directory to verify. Defaults to current directory.',
+    callback=current_directory,
+)
 @click.option(
     '--chunk-size',
     type=int,
@@ -346,7 +350,7 @@ def corrupt_file(
     'more granular corruption detection but take longer. Common values: '
     '512 (fine-grained), 4096 (4KB blocks), 65536 (64KB chunks).',
 )
-def verify(rootdir: str, chunk_size: int) -> None:
+def verify(directory: str, chunk_size: int) -> None:
     """Verify content addressable files and analyze corruption.
 
     This command verifies all CAF files in the specified directory and
@@ -368,9 +372,9 @@ def verify(rootdir: str, chunk_size: int) -> None:
     - Suggest recovery strategies based on patterns
     """
     console = Console()
-    console.print(f"Verifying file contents in: [bold]{rootdir}[/]")
+    console.print(f"Verifying file contents in: [bold]{directory}[/]")
     console.print(f"[dim]Analysis chunk size: {chunk_size:,} bytes[/]")
-    verifier = FileVerifier(rootdir, analysis_chunk_size=chunk_size)
+    verifier = FileVerifier(directory, analysis_chunk_size=chunk_size)
     result = verifier.verify_files()
     if result.success:
         console.print("[green]✓[/] All files successfully verified.")

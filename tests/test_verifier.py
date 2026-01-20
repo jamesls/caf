@@ -1,4 +1,5 @@
 import os
+import hashlib
 
 from caf.generator import FileGenerator
 from caf.verifier import (
@@ -43,9 +44,10 @@ def test_verify_files_detects_corrupted_root_metadata(tmp_path, capsys):
 
 
 def test_verify_files_detects_invalid_file_content(tmp_path, capsys):
-    d = tmp_path / 'aa' / 'bb' / 'cc' / 'dd'
+    hex_hash = 'aabbcc' + ('0' * 34)
+    d = tmp_path / 'aa' / 'bb' / 'cc'
     d.mkdir(parents=True)
-    path = d / 'testfile'
+    path = d / hex_hash[6:]
 
     path.write_bytes(b'\x00' * 60 + b'invalid data')
 
@@ -63,6 +65,48 @@ def test_verify_files_detects_invalid_file_content(tmp_path, capsys):
         "Invalid checksum" in captured.err
         or "Header corrupted" in captured.err
     )
+
+
+def test_verify_files_fails_for_four_level_layout(tmp_path, capsys):
+    generator = FileGenerator(
+        str(tmp_path),
+        max_files=float('inf'),
+        max_disk_usage=float('inf'),
+        file_size_chooser=lambda: 1024,
+    )
+
+    temp, file_hash = generator.generate_single_file_enhanced(
+        generator.ROOT_HASH,
+        file_size=1024,
+        buffer_size=generator.BUFFER_WRITE_SIZE,
+        temp_dir=str(tmp_path),
+    )
+    hex_hash = file_hash.hex()
+    path = (
+        tmp_path
+        / hex_hash[:2]
+        / hex_hash[2:4]
+        / hex_hash[4:6]
+        / hex_hash[6:8]
+        / hex_hash[8:]
+    )
+    path.parent.mkdir(parents=True)
+    os.rename(temp, path)
+
+    roots_dir = tmp_path / '.metadata' / 'roots'
+    roots_dir.mkdir(parents=True)
+    (roots_dir / hex_hash).touch()
+    roots_hash = hashlib.blake2b(digest_size=20)
+    for filename in sorted(os.listdir(roots_dir)):
+        roots_hash.update(filename.encode('ascii'))
+    (tmp_path / '.metadata' / 'all').write_bytes(
+        roots_hash.hexdigest().encode('ascii')
+    )
+
+    verifier = FileVerifier(str(tmp_path))
+    result = verifier.verify_files()
+    assert not result.success
+    assert 'Invalid CAF path layout' in capsys.readouterr().err
 
 
 def test_verify_files_succeeds_for_clean_files(tmp_path):

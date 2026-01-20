@@ -13,7 +13,7 @@ from rich.rule import Rule
 
 from caf.constants import BLOCK_SIZE, HEADER_SIZE, ROOT_PARENT_HASH
 from caf.content import ContentStream
-from caf.utils import file_path_to_hash
+from caf.paths import hash_to_path, parse_hash_from_path
 
 
 BUFFER_READ_SIZE = BLOCK_SIZE
@@ -184,6 +184,14 @@ class FileVerifier(object):
 
     def _validate_and_analyze_file(self, full_path: str) -> Optional[str]:
         """Validate a single file and analyze corruption if found."""
+        expected_hash = parse_hash_from_path(full_path)
+        if not expected_hash:
+            self._err_console.print(
+                f"[red bold]ERROR:[/] Invalid CAF path layout: {full_path}"
+            )
+            self._verification_succeeded = False
+            return None
+
         actual_size = os.path.getsize(full_path)
         with open(full_path, 'rb') as f:
             header = f.read(HEADER_SIZE)
@@ -208,7 +216,6 @@ class FileVerifier(object):
                 self._verification_succeeded = False
 
             # Validate BLAKE2b hash
-            expected_hash = file_path_to_hash(full_path)
             blake2b = hashlib.blake2b(digest_size=20)
             blake2b.update(header)
             while chunk := f.read(BUFFER_READ_SIZE):
@@ -242,14 +249,7 @@ class FileVerifier(object):
         if header_info.parent_hash == ROOT_PARENT_HASH:
             return None
         hex_parent = hexlify(header_info.parent_hash).decode('ascii')
-        return os.path.join(
-            self._rootdir,
-            hex_parent[:2],
-            hex_parent[2:4],
-            hex_parent[4:6],
-            hex_parent[6:8],
-            hex_parent[8:],
-        )
+        return hash_to_path(self._rootdir, hex_parent)
 
     def _validate_header(
         self, header: bytes
@@ -622,7 +622,7 @@ class FileVerifier(object):
                 full_path = os.path.join(root, filename)
                 if (
                     full_path not in referenced
-                    and file_path_to_hash(full_path) not in known_roots
+                    and parse_hash_from_path(full_path) not in known_roots
                 ):
                     self._err_console.print(
                         f"[yellow bold]ORPHAN:[/] File not referenced by "

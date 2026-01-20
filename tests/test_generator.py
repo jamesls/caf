@@ -94,3 +94,31 @@ def test_generate_files_creates_minimal_size_files(tmp_path):
 
     assert len(files) == 1
     assert os.path.getsize(files[0]) >= 60
+
+
+def test_generate_files_uses_three_level_directory_layout(tmp_path):
+    generator = FileGenerator(
+        str(tmp_path),
+        max_files=1,
+        max_disk_usage=float('inf'),
+        file_size_chooser=lambda: 1024,
+    )
+    generator.generate_files()
+
+    files = []
+    for root, _, filenames in os.walk(tmp_path):
+        if '.metadata' in root:
+            continue
+        for filename in filenames:
+            files.append(os.path.join(root, filename))
+
+    assert len(files) == 1
+    rel = os.path.relpath(files[0], str(tmp_path))
+    parts = rel.split(os.sep)
+    assert len(parts) == 4
+    for shard in parts[:3]:
+        assert len(shard) == 2
+        assert all(c in '0123456789abcdef' for c in shard)
+    basename = parts[3]
+    assert len(basename) == 34
+    assert all(c in '0123456789abcdef' for c in basename)

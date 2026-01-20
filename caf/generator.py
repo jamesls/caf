@@ -3,11 +3,11 @@
 The path to each file is the hex digest of the BLAKE2b hash of the file's
 contents.
 
-Given the hex digest, the path is split into 4 sub directories consisting of 2
+Given the hex digest, the path is split into 3 sub directories consisting of 2
 bytes each, and the remaining bytes are used for the file name.
 
 For example, a file with a BLAKE2b hash of "abcdefabcdefabcdefab" would have
-a path of "ab/cd/ef/ab/cdefabcdefab".
+a path of "ab/cd/ef/abcdefabcdefab".
 
 File format:
 - Parent Hash: 20 bytes (BLAKE2b hash of parent file)
@@ -29,6 +29,7 @@ from typing import Callable, Optional
 
 from caf.constants import BLOCK_SIZE, HEADER_SIZE, ROOT_PARENT_HASH
 from caf.content import ContentStream
+from caf.paths import hash_to_path
 from caf.utils import cd
 
 
@@ -190,15 +191,7 @@ class FileGenerator(object):
     def _move_to_final_location(
         self, temp_filename: str, ascii_hex_basename: str
     ) -> None:
-        # Split into directory structure: ab/cd/ef/ab/cdefabcdefab
-        directory_part = os.path.join(
-            self._rootdir,
-            ascii_hex_basename[:2],
-            ascii_hex_basename[2:4],
-            ascii_hex_basename[4:6],
-            ascii_hex_basename[6:8],
-        )
-        basename = ascii_hex_basename[8:]
+        final_filename = hash_to_path(self._rootdir, ascii_hex_basename)
+        directory_part = os.path.dirname(final_filename)
         self._ensure_directory(directory_part)
-        final_filename = os.path.join(directory_part, basename)
         shutil.move(temp_filename, final_filename)

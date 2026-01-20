@@ -15,7 +15,7 @@ File format:
 - File Length: 8 bytes (total file size in big-endian)
 - Header SHA3-256: 8 bytes (first 8 bytes of SHA3-256 hash of bytes 0-43)
 - Reserved: 8 bytes (set to 0 for future use)
-- Content: Generated deterministically from master seed using SHAKE-256
+- Content: Generated deterministically from master seed using SHAKE-128 XOF
 """
 
 import os

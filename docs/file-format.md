@@ -28,7 +28,7 @@ be chained together via parent references.
    |                                                               |
    +                                                               +
    |                                                               |
-   +                        Master Seed                            +
+   +                        Content Seed                           +
    |                        (16 bytes)                             |
    +                                                               +
    |                                                               |
@@ -60,7 +60,7 @@ be chained together via parent references.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 20 | Parent Hash | BLAKE2b hash of parent file (zeros for root files) |
-| 20 | 16 | Master Seed | Random seed for deterministic content generation |
+| 20 | 16 | Content Seed | Random seed for deterministic content generation |
 | 36 | 8 | File Length | Total file size including header (big-endian uint64) |
 | 44 | 8 | Header Checksum | First 8 bytes of SHA3-256(header[0:44]) |
 | 52 | 8 | Reserved | Reserved for future use (all zeros) |
@@ -73,7 +73,7 @@ The parent hash field links files together in a chain. Root files (the first
 file in a chain) use all zeros (`0x00 * 20`). Child files contain the BLAKE2b
 hash of their parent file, allowing verification of file relationships.
 
-### Master Seed
+### Content Seed
 
 A random 16-byte value that seeds the SHAKE-128 XOF for content generation.
 The same seed always produces identical content, making files fully
@@ -87,7 +87,7 @@ This includes the 60-byte header, so the minimum valid value is 60.
 ### Header Checksum
 
 Integrity check for the header fields. Computed as the first 8 bytes of the
-SHA3-256 hash of header bytes 0-43 (parent hash + master seed + file length).
+SHA3-256 hash of header bytes 0-43 (parent hash + content seed + file length).
 
 ### Reserved
 
@@ -95,13 +95,13 @@ Eight bytes reserved for future format extensions. Must be all zeros in v2.
 
 ## Content Generation
 
-Content is deterministically generated from the master seed using SHAKE-128:
+Content is deterministically generated from the content seed using SHAKE-128:
 
 ```
 domain = b"caf:content:shake128:v2:"
 
 for each block_index:
-    block_data = SHAKE128(domain + master_seed + block_index_bytes).digest(block_size)
+    block_data = SHAKE128(domain + content_seed + block_index_bytes).digest(block_size)
 ```
 
 Where `block_index_bytes` is the block index as an 8-byte big-endian integer.
@@ -135,7 +135,7 @@ A CAF file is valid if:
 1. File size >= 60 bytes
 2. File length field matches actual file size
 3. Header checksum matches SHA3-256(header[0:44])[0:8]
-4. Content matches SHAKE-128 output for the given master seed
+4. Content matches SHAKE-128 output for the given content seed
 5. Parent hash references an existing file (or is all zeros for roots)
 
 ## Constants
@@ -145,7 +145,7 @@ HEADER_SIZE = 60
 BLOCK_SIZE = 1048576  # 1MB
 BLAKE2B_DIGEST_SIZE = 20
 PARENT_HASH_SIZE = 20
-MASTER_SEED_SIZE = 16
+CONTENT_SEED_SIZE = 16
 CONTENT_DOMAIN = b"caf:content:shake128:v2:"
 ROOT_PARENT_HASH = b'\x00' * 20
 ```

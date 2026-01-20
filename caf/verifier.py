@@ -24,7 +24,7 @@ class HeaderInfo:
     """Parsed header information from a CAF file."""
 
     parent_hash: bytes
-    master_seed: bytes
+    content_seed: bytes
     file_length: int
     header_checksum: bytes
     reserved: bytes
@@ -112,7 +112,7 @@ class CorruptionReport:
     file_size: int
     expected_file_size: int
     header_valid: bool
-    master_seed: str
+    content_seed: str
     total_corrupted_bytes: int
     corruption_percentage: float
     corrupted_regions: list[CorruptionRegion]
@@ -267,7 +267,7 @@ class FileVerifier(object):
         # Parse header
         header_info = HeaderInfo(
             parent_hash=header[0:20],
-            master_seed=header[20:36],
+            content_seed=header[20:36],
             file_length=struct.unpack('>Q', header[36:44])[0],
             header_checksum=header[44:52],
             reserved=header[52:60],
@@ -287,7 +287,7 @@ class FileVerifier(object):
 
         # ContentStream uses fixed block sizes internally, so content is
         # deterministic regardless of read() call pattern.
-        expected_stream = ContentStream(header_info.master_seed)
+        expected_stream = ContentStream(header_info.content_seed)
         offset = HEADER_SIZE
 
         with open(file_path, 'rb') as f:
@@ -455,7 +455,7 @@ class FileVerifier(object):
             file_size=actual_file_size,
             expected_file_size=expected_file_size,
             header_valid=True,
-            master_seed=hexlify(header_info.master_seed).decode('ascii'),
+            content_seed=hexlify(header_info.content_seed).decode('ascii'),
             total_corrupted_bytes=total_corrupted_bytes,
             corruption_percentage=corruption_percentage,
             corrupted_regions=corrupted_regions,
@@ -536,7 +536,7 @@ class FileVerifier(object):
                     f"[dim]Header Validation:[/] {header_status}"
                 )
                 self._console.print(
-                    f"[dim]Master Seed:[/] [cyan]{report.master_seed}[/]"
+                    f"[dim]Content Seed:[/] [cyan]{report.content_seed}[/]"
                 )
 
                 self._console.print()

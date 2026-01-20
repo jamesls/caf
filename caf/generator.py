@@ -11,11 +11,11 @@ a path of "ab/cd/ef/abcdefabcdefab".
 
 File format:
 - Parent Hash: 20 bytes (BLAKE2b hash of parent file)
-- Master Seed: 16 bytes (random seed for content generation)
+- Content Seed: 16 bytes (random seed for content generation)
 - File Length: 8 bytes (total file size in big-endian)
 - Header SHA3-256: 8 bytes (first 8 bytes of SHA3-256 hash of bytes 0-43)
 - Reserved: 8 bytes (set to 0 for future use)
-- Content: Generated deterministically from master seed using SHAKE-128 XOF
+- Content: Generated deterministically from content seed using SHAKE-128 XOF
 """
 
 import os
@@ -27,7 +27,12 @@ from binascii import hexlify
 from random import randint
 from typing import Callable, Optional
 
-from caf.constants import BLOCK_SIZE, HEADER_SIZE, ROOT_PARENT_HASH
+from caf.constants import (
+    BLOCK_SIZE,
+    CONTENT_SEED_SIZE,
+    HEADER_SIZE,
+    ROOT_PARENT_HASH,
+)
 from caf.content import ContentStream
 from caf.paths import hash_to_path
 from caf.utils import cd
@@ -122,13 +127,13 @@ class FileGenerator(object):
         if file_size < HEADER_SIZE:
             file_size = HEADER_SIZE
 
-        # Generate master seed
-        master_seed = os.urandom(16)
+        # Generate content seed
+        content_seed = os.urandom(CONTENT_SEED_SIZE)
 
         # Create header
         header = bytearray(HEADER_SIZE)
         header[0:20] = parent_hash
-        header[20:36] = master_seed
+        header[20:36] = content_seed
         header[36:44] = struct.pack('>Q', file_size)
         # Calculate header checksum (SHA3-256 of first 44 bytes)
         header_checksum = hashlib.sha3_256(header[:44]).digest()[:8]
@@ -136,7 +141,7 @@ class FileGenerator(object):
         # Reserved bytes (zeros)
         header[52:60] = b'\x00' * 8
 
-        # Generate content using SHAKE-256 (streamed, constant-memory).
+        # Generate content using SHAKE-128 (streamed, constant-memory).
         content_length = file_size - HEADER_SIZE
 
         # Generate temp filename
@@ -157,7 +162,7 @@ class FileGenerator(object):
             # ContentStream internally aligns blocks so that block 0 is
             # (buffer_size - HEADER_SIZE) and subsequent blocks are
             # buffer_size, ensuring blocks 1..N start at aligned offsets.
-            stream = ContentStream(master_seed)
+            stream = ContentStream(content_seed)
             remaining = content_length
             while remaining > 0:
                 chunk_size = min(buffer_size, remaining)

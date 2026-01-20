@@ -14,7 +14,7 @@ Format Version: v2 (shake128)
 # Total size of the file header in bytes.
 # Layout:
 #   - Bytes 0-19:  Parent hash (BLAKE2b, 20 bytes)
-#   - Bytes 20-35: Master seed (random, 16 bytes)
+#   - Bytes 20-35: Content seed (random, 16 bytes)
 #   - Bytes 36-43: File length (big-endian uint64, 8 bytes)
 #   - Bytes 44-51: Header checksum (SHA3-256 truncated, 8 bytes)
 #   - Bytes 52-59: Reserved (zeros, 8 bytes)
@@ -46,5 +46,5 @@ PARENT_HASH_SIZE = 20
 # Root files use this value for their parent hash field.
 ROOT_PARENT_HASH = b'\x00' * PARENT_HASH_SIZE
 
-# Master seed size for content generation.
-MASTER_SEED_SIZE = 16
+# Content seed size for content generation.
+CONTENT_SEED_SIZE = 16

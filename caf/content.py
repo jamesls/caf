@@ -1,11 +1,12 @@
 """Deterministic content generation utilities.
 
-CAF files store a master seed in the header. File content is derived
+CAF files store a content seed in the header. File content is derived
 deterministically from that seed so verifiers can regenerate expected bytes and
 pinpoint corruption without external data.
 
 The stdlib hashlib SHAKE APIs don't support streaming output, so we implement a
-stream using fixed-size blocks derived from SHAKE-128(seed || block_index).
+stream using fixed-size blocks derived from
+SHAKE-128(content_seed || block_index).
 Block 0 is sized (BLOCK_SIZE - HEADER_SIZE) to align subsequent blocks
 to BLOCK_SIZE boundaries in the file. This improves I/O performance.
 """
@@ -18,12 +19,12 @@ from caf.constants import (
     BLOCK_SIZE,
     CONTENT_DOMAIN,
     HEADER_SIZE,
-    MASTER_SEED_SIZE,
+    CONTENT_SEED_SIZE,
 )
 
 
 class ContentStream:
-    """Generate an infinite deterministic byte stream from a master seed.
+    """Generate an infinite deterministic byte stream from a content seed.
 
     Uses SHAKE-128 XOF for fast, deterministic content generation.
     Blocks are generated at fixed sizes to ensure content is deterministic
@@ -33,11 +34,11 @@ class ContentStream:
     blocks align to BLOCK_SIZE boundaries in the file.
     """
 
-    def __init__(self, master_seed: bytes) -> None:
-        if len(master_seed) != MASTER_SEED_SIZE:
-            raise ValueError(f"master_seed must be {MASTER_SEED_SIZE} bytes")
+    def __init__(self, content_seed: bytes) -> None:
+        if len(content_seed) != CONTENT_SEED_SIZE:
+            raise ValueError(f"content_seed must be {CONTENT_SEED_SIZE} bytes")
 
-        self._master_seed = master_seed
+        self._content_seed = content_seed
         self._block_index = 0
         self._block = b""
         self._block_pos = 0
@@ -77,6 +78,6 @@ class ContentStream:
     def _generate_block(self, index: int, size: int) -> bytes:
         block_index_bytes = index.to_bytes(8, byteorder="big", signed=False)
         shake = hashlib.shake_128(
-            CONTENT_DOMAIN + self._master_seed + block_index_bytes
+            CONTENT_DOMAIN + self._content_seed + block_index_bytes
         )
         return shake.digest(size)

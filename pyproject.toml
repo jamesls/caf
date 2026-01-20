@@ -2,7 +2,7 @@
 name = "caf"
 version = "0.1.1"
 description = "Create content addressable files"
-readme = "README.rst"
+readme = "README.md"
 authors = [
     {name = "James Saryerwinnie", email = "js@jamesls.com"}
 ]

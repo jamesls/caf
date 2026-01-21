@@ -2,6 +2,7 @@ import os
 import random
 import functools
 from typing import Callable, Optional
+from importlib.metadata import version
 
 import click
 from rich.console import Console
@@ -9,7 +10,8 @@ from rich.console import Console
 from caf.generator import FileGenerator
 from caf.verifier import FileVerifier
 
-__version__ = '0.1.1'
+
+__version__ = version("caf")
 
 
 SIZE_TYPES = {

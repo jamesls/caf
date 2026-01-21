@@ -2,7 +2,7 @@
 name = "caf"
 version = "0.1.1"
 description = "Create content addressable files"
-readme = "README.rst"
+readme = "README.md"
 authors = [
     {name = "James Saryerwinnie", email = "js@jamesls.com"}
 ]
@@ -19,6 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "click",
+    "rich>=14.1.0",
 ]
 requires-python = ">=3.12"
 
@@ -26,8 +27,10 @@ requires-python = ">=3.12"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
+    "pyinstrument",
+    "ast-grep-cli",
     "pytest",
     "pytest-cov",
     "ruff>=0.6.0",
@@ -49,6 +52,16 @@ path = "caf/__init__.py"
 
 [tool.ruff]
 line-length = 79
+
+[tool.ruff.lint]
+extend-select = [
+  "C901",
+  "PLR0915",
+  "E501",
+  "UP006",
+  "UP008",
+  "SLF001",
+]
 
 [tool.ruff.format]
 quote-style = "preserve"
@@ -90,6 +103,7 @@ check = [
   { cmd = "uv run ruff check ." },
   { cmd = "uv run ruff format --diff ." },
   { cmd = "uv run pyright" },
+  { cmd = "uv run ast-grep scan ." },
 ]
 test = "uv run pytest tests/"
 format-code = [
@@ -100,5 +114,6 @@ auto-check = [
   { cmd = "uv run ruff check --fix ." },
   { cmd = "uv run ruff format ." },
   { cmd = "uv run pyright" },
+  { cmd = "uv run ast-grep scan ." },
 ]
 prcheck = ["check", "test"]

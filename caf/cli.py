@@ -1,13 +1,19 @@
 import os
 import random
 import functools
+import hashlib
+import struct
+from dataclasses import dataclass
 from typing import Callable, Optional
 from importlib.metadata import version
 
 import click
 from rich.console import Console
+from rich.text import Text
 
+from caf.constants import BLOCK_SIZE, HEADER_SIZE, ROOT_PARENT_HASH
 from caf.generator import FileGenerator
+from caf.paths import hash_to_path, parse_hash_from_path
 from caf.verifier import FileVerifier
 
 
@@ -243,6 +249,218 @@ def gen(
 def dev():
     """Development tools for testing caf."""
     pass
+
+
+def _yes_no(value: bool) -> str:
+    if value:
+        return '[green]yes[/]'
+    return '[red]no[/]'
+
+
+@dataclass(frozen=True)
+class CafHeaderDiagnostics:
+    parent_hash: bytes
+    content_seed: bytes
+    file_length: int
+    stored_header_checksum: bytes
+    calculated_header_checksum: bytes
+    reserved: bytes
+    actual_size: int
+
+    @property
+    def header_checksum_valid(self) -> bool:
+        return self.stored_header_checksum == self.calculated_header_checksum
+
+    @property
+    def reserved_valid(self) -> bool:
+        return self.reserved == (b'\x00' * 8)
+
+    @property
+    def file_length_matches(self) -> bool:
+        return self.file_length == self.actual_size
+
+    @property
+    def file_length_minimum(self) -> bool:
+        return self.file_length >= HEADER_SIZE
+
+    @property
+    def root_file(self) -> bool:
+        return self.parent_hash == ROOT_PARENT_HASH
+
+    @property
+    def basic_valid(self) -> bool:
+        return (
+            self.header_checksum_valid
+            and self.reserved_valid
+            and self.file_length_matches
+            and self.file_length_minimum
+        )
+
+
+def _load_caf_header_diagnostics(filepath: str) -> CafHeaderDiagnostics:
+    actual_size = os.path.getsize(filepath)
+    with open(filepath, 'rb') as f:
+        header = f.read(HEADER_SIZE)
+
+    if len(header) < HEADER_SIZE:
+        raise click.ClickException(
+            f'File is too small to be a CAF file: expected at least '
+            f'{HEADER_SIZE} bytes, got {len(header)}.'
+        )
+
+    parent_hash = header[0:20]
+    content_seed = header[20:36]
+    file_length = struct.unpack('>Q', header[36:44])[0]
+    stored_header_checksum = header[44:52]
+    calculated_header_checksum = hashlib.sha3_256(header[:44]).digest()[:8]
+    reserved = header[52:60]
+
+    return CafHeaderDiagnostics(
+        parent_hash=parent_hash,
+        content_seed=content_seed,
+        file_length=file_length,
+        stored_header_checksum=stored_header_checksum,
+        calculated_header_checksum=calculated_header_checksum,
+        reserved=reserved,
+        actual_size=actual_size,
+    )
+
+
+def _print_caf_header_diagnostics(
+    console: Console,
+    filepath: str,
+    diag: CafHeaderDiagnostics,
+    expected_hash: str,
+) -> None:
+    console.print('[bold]File:[/]', Text(filepath))
+    console.print(
+        f'[bold]Actual size:[/] [magenta]{diag.actual_size:,}[/] bytes'
+    )
+    if expected_hash:
+        console.print(
+            f'[bold]CAF hash (from path):[/] [cyan]{expected_hash}[/]'
+        )
+    console.print()
+    console.print(f'[bold]CAF header[/] ([dim]{HEADER_SIZE} bytes[/]):')
+    console.print(
+        f'  [dim]Parent Hash (0:20):[/] [cyan]{diag.parent_hash.hex()}[/]'
+    )
+    console.print(f'    [dim]Root:[/] {_yes_no(diag.root_file)}')
+    console.print(
+        f'  [dim]Content Seed (20:36):[/] [cyan]{diag.content_seed.hex()}[/]'
+    )
+    console.print(
+        f'  [dim]File Length (36:44):[/] [magenta]{diag.file_length:,}[/] '
+        f'bytes'
+    )
+    console.print(
+        f'    [dim]Matches actual:[/] {_yes_no(diag.file_length_matches)}'
+    )
+    console.print(
+        f'  [dim]Header Checksum (44:52):[/] '
+        f'[cyan]{diag.stored_header_checksum.hex()}[/]'
+    )
+    console.print(
+        f'    [dim]Expected:[/] '
+        f'[cyan]{diag.calculated_header_checksum.hex()}[/]'
+    )
+    console.print(f'    [dim]Valid:[/] {_yes_no(diag.header_checksum_valid)}')
+    console.print(
+        f'  [dim]Reserved (52:60):[/] [cyan]{diag.reserved.hex()}[/]'
+    )
+    console.print(f'    [dim]All zeros:[/] {_yes_no(diag.reserved_valid)}')
+    console.print()
+    console.print('[bold]Basic validation:[/]')
+    console.print(
+        f'  [dim]Header checksum valid:[/] '
+        f'{_yes_no(diag.header_checksum_valid)}'
+    )
+    console.print(
+        f'  [dim]Reserved bytes zero:[/] {_yes_no(diag.reserved_valid)}'
+    )
+    console.print(
+        f'  [dim]File length matches actual:[/] '
+        f'{_yes_no(diag.file_length_matches)}'
+    )
+    console.print(
+        f'  [dim]File length >= header size:[/] '
+        f'{_yes_no(diag.file_length_minimum)}'
+    )
+
+    if expected_hash and not diag.root_file:
+        store_root = os.path.abspath(
+            os.path.join(
+                filepath,
+                os.pardir,
+                os.pardir,
+                os.pardir,
+                os.pardir,
+            )
+        )
+        parent_path = hash_to_path(store_root, diag.parent_hash.hex())
+        console.print()
+        console.print('[bold]Parent path:[/]', Text(parent_path))
+
+
+def _calculate_blake2b_160(filepath: str) -> str:
+    blake2b = hashlib.blake2b(digest_size=20)
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(BLOCK_SIZE):
+            blake2b.update(chunk)
+    return blake2b.hexdigest()
+
+
+def _print_checksum_diagnostics(
+    console: Console,
+    expected_hash: str,
+    actual_hash: str,
+    checksum_matches: bool,
+) -> None:
+    console.print()
+    console.print('[bold]File checksum[/] ([dim]BLAKE2b-160[/]):')
+    if expected_hash:
+        console.print(
+            f'  [dim]Expected (from path):[/] [cyan]{expected_hash}[/]'
+        )
+    else:
+        console.print(
+            '  [dim]Expected (from path):[/] '
+            '[dim]<unavailable: not in CAF layout>[/]'
+        )
+    console.print(f'  [dim]Actual:[/] [cyan]{actual_hash}[/]')
+    console.print(f'  [dim]Matches:[/] {_yes_no(checksum_matches)}')
+
+
+@dev.command()
+@click.argument('filepath', type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    '--verify-checksum',
+    is_flag=True,
+    default=False,
+    help='Calculate the file BLAKE2b checksum and verify it matches the '
+    'hash implied by the CAF path layout.',
+)
+def show(filepath: str, verify_checksum: bool) -> None:
+    """Print diagnostic information about a CAF content file."""
+    console = Console()
+    expected_hash = parse_hash_from_path(filepath)
+    diag = _load_caf_header_diagnostics(filepath)
+    _print_caf_header_diagnostics(console, filepath, diag, expected_hash)
+
+    exit_code = 0
+
+    if verify_checksum:
+        actual_hash = _calculate_blake2b_160(filepath)
+        checksum_matches = bool(expected_hash) and actual_hash == expected_hash
+        _print_checksum_diagnostics(
+            console, expected_hash, actual_hash, checksum_matches
+        )
+
+        if not expected_hash or not checksum_matches or not diag.basic_valid:
+            exit_code = 1
+
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 @dev.command()

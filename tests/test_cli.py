@@ -243,3 +243,80 @@ def test_verify_chunk_size_option(tmp_path):
         )
         assert result.exit_code == 0
         assert f'{chunk_size:,} bytes' in result.output
+
+
+def test_dev_show_prints_header_info(tmp_path):
+    runner = CliRunner()
+    result = run_gen(
+        runner,
+        str(tmp_path),
+        '--max-files',
+        '1',
+        '--file-size',
+        '1024',
+    )
+    assert result.exit_code == 0, result.output
+
+    files = list(get_all_generated_files(str(tmp_path)))
+    assert len(files) == 1
+
+    result = runner.invoke(main, ['dev', 'show', files[0]])
+    assert result.exit_code == 0, result.output
+
+    output = result.output
+    assert 'CAF header' in output
+    assert 'Parent Hash' in output
+    assert 'Content Seed' in output
+    assert 'File Length' in output
+    assert 'Header Checksum' in output
+    assert 'Reserved' in output
+    assert 'File checksum' not in output
+
+
+def test_dev_show_verify_checksum_succeeds_for_clean_file(tmp_path):
+    runner = CliRunner()
+    result = run_gen(
+        runner,
+        str(tmp_path),
+        '--max-files',
+        '1',
+        '--file-size',
+        '1024',
+    )
+    assert result.exit_code == 0, result.output
+
+    files = list(get_all_generated_files(str(tmp_path)))
+    assert len(files) == 1
+
+    result = runner.invoke(
+        main, ['dev', 'show', files[0], '--verify-checksum']
+    )
+    assert result.exit_code == 0, result.output
+    assert 'File checksum (BLAKE2b-160):' in result.output
+    assert 'Matches: yes' in result.output
+
+
+def test_dev_show_verify_checksum_fails_for_corrupted_file(tmp_path):
+    runner = CliRunner()
+    result = run_gen(
+        runner,
+        str(tmp_path),
+        '--max-files',
+        '1',
+        '--file-size',
+        '1024',
+    )
+    assert result.exit_code == 0, result.output
+
+    files = list(get_all_generated_files(str(tmp_path)))
+    assert len(files) == 1
+
+    with open(files[0], 'r+b') as f:
+        f.seek(100)
+        f.write(b'\xff')
+
+    result = runner.invoke(
+        main, ['dev', 'show', files[0], '--verify-checksum']
+    )
+    assert result.exit_code == 1, result.output
+    assert 'Matches: no' in result.output

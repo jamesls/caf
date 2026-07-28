@@ -21,6 +21,12 @@ lib64
 # Installer logs
 pip-log.txt
 
+# Benchmark working data (datasets are large and disposable)
+benchmarks/.work/
+
+# Rust build output
+/target/
+
 # Unit test / coverage reports
 .coverage
 .tox

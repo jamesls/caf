@@ -46,11 +46,10 @@ TEMP_DIR = tempfile.gettempdir()
 class FileGenerator(object):
     """Generate random files with enhanced format for corruption detection.
 
-    This class is written such that it's possible to have multiple processes
-    running against the same rootdir in parallel.
-
-    This is handled because the files are randomly generated, so the
-    chance of collision is extremely small.
+    Concurrent generation runs against the same rootdir are not
+    supported: each run rewrites ``.metadata/all`` from a directory
+    listing without locking or atomic replacement, so two concurrent
+    runs can leave a stale file that fails verification.
     """
 
     ROOT_HASH = ROOT_PARENT_HASH

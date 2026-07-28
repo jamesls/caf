@@ -1,12 +1,15 @@
 import os
-import random
-from typing import Iterable
+from collections.abc import Iterator
+from pathlib import Path
 
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
+
 from caf.cli import main
 
 
-def get_all_generated_files(rootdir: str) -> Iterable[str]:
+def get_all_generated_files(
+    rootdir: str | os.PathLike[str],
+) -> Iterator[str]:
     for root, _, filenames in os.walk(rootdir):
         if '.metadata' in root:
             continue
@@ -14,20 +17,15 @@ def get_all_generated_files(rootdir: str) -> Iterable[str]:
             yield os.path.join(root, filename)
 
 
-def run_gen(runner: CliRunner, tmpdir: str, *args: str):
+def run_gen(runner: CliRunner, tmpdir: str, *args: str) -> Result:
     return runner.invoke(main, ['gen', '--directory', tmpdir, *args])
 
 
-def run_verify(runner: CliRunner, tmpdir: str):
-    cwd = os.getcwd()
-    os.chdir(tmpdir)
-    try:
-        return runner.invoke(main, ['verify'])
-    finally:
-        os.chdir(cwd)
+def run_verify(runner: CliRunner, tmpdir: str) -> Result:
+    return runner.invoke(main, ['verify', '--directory', tmpdir])
 
 
-def test_default_file_count(tmp_path):
+def test_default_file_count(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(runner, str(tmp_path))
     assert result.exit_code == 0, result.output
@@ -35,7 +33,7 @@ def test_default_file_count(tmp_path):
     assert len(files) == 100
 
 
-def test_specify_file_size_bytes(tmp_path):
+def test_specify_file_size_bytes(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -50,7 +48,7 @@ def test_specify_file_size_bytes(tmp_path):
         assert os.path.getsize(path) == 4096
 
 
-def test_specify_file_size_kb(tmp_path):
+def test_specify_file_size_kb(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -65,7 +63,7 @@ def test_specify_file_size_kb(tmp_path):
         assert os.path.getsize(path) == 16 * 1024
 
 
-def test_specify_file_size_mb(tmp_path):
+def test_specify_file_size_mb(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -80,7 +78,7 @@ def test_specify_file_size_mb(tmp_path):
         assert os.path.getsize(path) == 1 * 1024 * 1024
 
 
-def test_specify_file_size_range(tmp_path):
+def test_specify_file_size_range(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -96,7 +94,7 @@ def test_specify_file_size_range(tmp_path):
         assert 4048 <= size <= 8096
 
 
-def test_max_disk_usage_bytes(tmp_path):
+def test_max_disk_usage_bytes(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -111,7 +109,7 @@ def test_max_disk_usage_bytes(tmp_path):
     assert total_size == 16384
 
 
-def test_max_disk_usage_mb(tmp_path):
+def test_max_disk_usage_mb(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -126,7 +124,7 @@ def test_max_disk_usage_mb(tmp_path):
     assert total_size == 1 * 1024 * 1024
 
 
-def test_max_disk_usage_and_file_count(tmp_path):
+def test_max_disk_usage_and_file_count(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -141,25 +139,28 @@ def test_max_disk_usage_and_file_count(tmp_path):
     assert len(files) == 2
 
 
-def test_verify_success(tmp_path):
+def test_verify_without_directory_uses_current_directory(
+    tmp_path: Path,
+) -> None:
     runner = CliRunner()
-    result = run_gen(runner, str(tmp_path))
-    assert result.exit_code == 0, result.output
-    verify_result = run_verify(runner, str(tmp_path))
-    assert verify_result.exit_code == 0, verify_result.output
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(main, ['gen', '--max-files', '1'])
+        assert result.exit_code == 0, result.output
+        verify_result = runner.invoke(main, ['verify'])
+        assert verify_result.exit_code == 0, verify_result.output
 
 
-def test_verify_failure(tmp_path):
+def test_verify_failure(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(runner, str(tmp_path))
     assert result.exit_code == 0, result.output
     files = list(get_all_generated_files(tmp_path))
-    os.remove(random.choice(files))
+    os.remove(files[0])
     verify_result = run_verify(runner, str(tmp_path))
     assert verify_result.exit_code == 1
 
 
-def test_verify_with_directory_option(tmp_path):
+def test_verify_with_directory_option(tmp_path: Path) -> None:
     runner = CliRunner()
 
     result = runner.invoke(
@@ -181,7 +182,7 @@ def test_verify_with_directory_option(tmp_path):
     assert 'successfully verified' in result.output
 
 
-def test_verify_detects_corruption(tmp_path):
+def test_verify_detects_corruption(tmp_path: Path) -> None:
     runner = CliRunner()
 
     result = runner.invoke(
@@ -213,7 +214,7 @@ def test_verify_detects_corruption(tmp_path):
     assert 'CORRUPTION' in result.output
 
 
-def test_verify_chunk_size_option(tmp_path):
+def test_verify_chunk_size_option(tmp_path: Path) -> None:
     runner = CliRunner()
 
     result = runner.invoke(
@@ -245,7 +246,7 @@ def test_verify_chunk_size_option(tmp_path):
         assert f'{chunk_size:,} bytes' in result.output
 
 
-def test_dev_show_prints_header_info(tmp_path):
+def test_dev_show_prints_header_info(tmp_path: Path) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -273,7 +274,9 @@ def test_dev_show_prints_header_info(tmp_path):
     assert 'File checksum' not in output
 
 
-def test_dev_show_verify_checksum_succeeds_for_clean_file(tmp_path):
+def test_dev_show_verify_checksum_succeeds_for_clean_file(
+    tmp_path: Path,
+) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,
@@ -296,7 +299,9 @@ def test_dev_show_verify_checksum_succeeds_for_clean_file(tmp_path):
     assert 'Matches: yes' in result.output
 
 
-def test_dev_show_verify_checksum_fails_for_corrupted_file(tmp_path):
+def test_dev_show_verify_checksum_fails_for_corrupted_file(
+    tmp_path: Path,
+) -> None:
     runner = CliRunner()
     result = run_gen(
         runner,

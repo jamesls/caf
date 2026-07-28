@@ -1,5 +1,8 @@
-import os
 import hashlib
+import os
+from pathlib import Path
+
+import pytest
 
 from caf.generator import FileGenerator
 from caf.verifier import (
@@ -10,7 +13,7 @@ from caf.verifier import (
 )
 
 
-def test_verify_files_detects_invalid_checksum(tmp_path):
+def test_verify_files_detects_invalid_checksum(tmp_path: Path) -> None:
     gen = FileGenerator(str(tmp_path), 1, float('inf'), lambda: 1024)
     gen.generate_files()
 
@@ -29,7 +32,9 @@ def test_verify_files_detects_invalid_checksum(tmp_path):
     assert not result.success
 
 
-def test_verify_files_detects_corrupted_root_metadata(tmp_path, capsys):
+def test_verify_files_detects_corrupted_root_metadata(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     gen = FileGenerator(str(tmp_path), 1, float('inf'), lambda: 100)
     gen.generate_files()
 
@@ -43,7 +48,9 @@ def test_verify_files_detects_corrupted_root_metadata(tmp_path, capsys):
     assert "Root hash is not valid" in capsys.readouterr().err
 
 
-def test_verify_files_detects_invalid_file_content(tmp_path, capsys):
+def test_verify_files_detects_invalid_file_content(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     hex_hash = 'aabbcc' + ('0' * 34)
     d = tmp_path / 'aa' / 'bb' / 'cc'
     d.mkdir(parents=True)
@@ -67,7 +74,9 @@ def test_verify_files_detects_invalid_file_content(tmp_path, capsys):
     )
 
 
-def test_verify_files_fails_for_four_level_layout(tmp_path, capsys):
+def test_verify_files_fails_for_four_level_layout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=float('inf'),
@@ -109,7 +118,7 @@ def test_verify_files_fails_for_four_level_layout(tmp_path, capsys):
     assert 'Invalid CAF path layout' in capsys.readouterr().err
 
 
-def test_verify_files_succeeds_for_clean_files(tmp_path):
+def test_verify_files_succeeds_for_clean_files(tmp_path: Path) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=3,
@@ -123,7 +132,9 @@ def test_verify_files_succeeds_for_clean_files(tmp_path):
     assert result.success
 
 
-def test_verify_files_detects_zeroed_content(tmp_path, capsys):
+def test_verify_files_detects_zeroed_content(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=2,
@@ -151,7 +162,9 @@ def test_verify_files_detects_zeroed_content(tmp_path, capsys):
     assert 'CONTENT CORRUPTED' in output
 
 
-def test_verify_files_reports_truncated_file_as_corruption(tmp_path, capsys):
+def test_verify_files_reports_truncated_file_as_corruption(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -189,7 +202,7 @@ def test_verify_files_reports_truncated_file_as_corruption(tmp_path, capsys):
     assert truncated_regions[0].pattern.missing_bytes == 512
 
 
-def test_verify_files_with_different_chunk_sizes(tmp_path):
+def test_verify_files_with_different_chunk_sizes(tmp_path: Path) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -206,7 +219,7 @@ def test_verify_files_with_different_chunk_sizes(tmp_path):
         assert result.success
 
 
-def test_verify_files_detects_broken_file_chain(tmp_path):
+def test_verify_files_detects_broken_file_chain(tmp_path: Path) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=5,
@@ -226,21 +239,23 @@ def test_verify_files_detects_broken_file_chain(tmp_path):
         for filename in filenames:
             files.append(os.path.join(root, filename))
 
-    if len(files) > 1:
-        for file_path in files:
-            with open(file_path, 'rb') as f:
-                parent_hash = f.read(20)
+    assert len(files) > 1
+    for file_path in files:
+        with open(file_path, 'rb') as f:
+            parent_hash = f.read(20)
 
-            if parent_hash != b'\x00' * 20:
-                os.remove(file_path)
-                break
+        if parent_hash != b'\x00' * 20:
+            os.remove(file_path)
+            break
 
-        verifier = FileVerifier(str(tmp_path))
-        result = verifier.verify_files()
-        assert not result.success
+    verifier = FileVerifier(str(tmp_path))
+    result = verifier.verify_files()
+    assert not result.success
 
 
-def test_verify_files_detects_corrupted_metadata(tmp_path, capsys):
+def test_verify_files_detects_corrupted_metadata(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=2,
@@ -261,7 +276,9 @@ def test_verify_files_detects_corrupted_metadata(tmp_path, capsys):
     assert 'Root hash is not valid' in captured.err
 
 
-def test_verify_files_reports_zero_filled_corruption(tmp_path, capsys):
+def test_verify_files_reports_zero_filled_corruption(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -295,7 +312,9 @@ def test_verify_files_reports_zero_filled_corruption(tmp_path, capsys):
     assert len(zero_filled) >= 1
 
 
-def test_verify_files_reports_repeated_byte_corruption(tmp_path, capsys):
+def test_verify_files_reports_repeated_byte_corruption(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -330,7 +349,9 @@ def test_verify_files_reports_repeated_byte_corruption(tmp_path, capsys):
     assert repeated[0].pattern.byte_value == 0xFF
 
 
-def test_verify_files_generates_corruption_visualization(tmp_path, capsys):
+def test_verify_files_generates_corruption_visualization(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,

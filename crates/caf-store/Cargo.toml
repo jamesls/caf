@@ -1,0 +1,40 @@
+[package]
+name = "caf-store"
+description = "CAF store operations: generation, verification, structured reports, and concurrency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# This crate is not published independently.
+publish = false
+
+[features]
+# Mocking hooks: `Generator::new_mocked` / `Verifier::new_mocked` and the
+# `MockCtrl` in-memory filesystem and random source. Test-only surface,
+# kept out of default builds (api-design skill, "Feature-gated test
+# utilities").
+test-util = []
+
+[dependencies]
+caf-format = { workspace = true }
+getrandom = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[dev-dependencies]
+# The `examples/` binaries are applications, so they report errors with
+# anyhow like the `caf` CLI does.
+anyhow = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "store"
+harness = false
+
+[lints]
+workspace = true

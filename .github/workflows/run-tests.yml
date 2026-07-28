@@ -10,7 +10,7 @@ jobs:
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download actionlint
         run: bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
         shell: bash
@@ -25,7 +25,7 @@ jobs:
       matrix:
         python-version: ["3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         name: Set up Python ${{ matrix.python-version }}
         with:
@@ -38,5 +38,4 @@ jobs:
         run: uv sync --all-extras --dev
       - name: Run prcheck
         run: uv run poe prcheck
-
 

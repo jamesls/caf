@@ -1,0 +1,168 @@
+{
+  "description": "Golden conformance vectors for the CAF v2 file format. Implementations must reproduce every byte and digest.",
+  "constants": {
+    "header_size": 60,
+    "block_size": 1048576,
+    "block_0_size": 1048516,
+    "content_domain": "caf:content:shake128:v2:",
+    "blake2b_digest_size": 20,
+    "parent_hash_size": 20,
+    "content_seed_size": 16,
+    "root_parent_hash": "0000000000000000000000000000000000000000"
+  },
+  "file_vectors": [
+    {
+      "name": "header-only",
+      "description": "Minimum valid file: 60-byte header, zero content bytes.",
+      "parent_hash": "0000000000000000000000000000000000000000",
+      "content_seed": "85eac145eafbbe4867e1e46b53a26f88",
+      "file_length": 60,
+      "header": "000000000000000000000000000000000000000085eac145eafbbe4867e1e46b53a26f88000000000000003cdf5496c7f2e393270000000000000000",
+      "file_blake2b_160": "f46b7e6f7eee7921da61a4779774a118aac54e98",
+      "relative_path": "f4/6b/7e/6f7eee7921da61a4779774a118aac54e98",
+      "content_slices": [],
+      "file_hex": "000000000000000000000000000000000000000085eac145eafbbe4867e1e46b53a26f88000000000000003cdf5496c7f2e393270000000000000000"
+    },
+    {
+      "name": "one-content-byte",
+      "description": "Header plus a single content byte (first byte of block 0).",
+      "parent_hash": "605cb937a87b5868c431a749863b38e708e09b76",
+      "content_seed": "b42d9a6630882f79c7599ae213435f86",
+      "file_length": 61,
+      "header": "605cb937a87b5868c431a749863b38e708e09b76b42d9a6630882f79c7599ae213435f86000000000000003d135e4315715999270000000000000000",
+      "file_blake2b_160": "a9a9e399546e03e36147a8cffd2bf6415acb8b7d",
+      "relative_path": "a9/a9/e3/99546e03e36147a8cffd2bf6415acb8b7d",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "9e"
+        }
+      ],
+      "file_hex": "605cb937a87b5868c431a749863b38e708e09b76b42d9a6630882f79c7599ae213435f86000000000000003d135e43157159992700000000000000009e"
+    },
+    {
+      "name": "end-of-block-0",
+      "description": "Content exactly fills block 0; file ends at the 1 MiB boundary.",
+      "parent_hash": "007fa9db797a8dad37fae07c8322d5cc2c6821c3",
+      "content_seed": "8fce9f7df0716dd25048a8cdc2fb6812",
+      "file_length": 1048576,
+      "header": "007fa9db797a8dad37fae07c8322d5cc2c6821c38fce9f7df0716dd25048a8cdc2fb68120000000000100000c0be033807c5352e0000000000000000",
+      "file_blake2b_160": "0e8a113db72def0344e7c7ec1e43b685bf113c94",
+      "relative_path": "0e/8a/11/3db72def0344e7c7ec1e43b685bf113c94",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "2df0be6bb3db22f2ddd10d45f7a91c2faf285b53e3b5738183c2656153a037e6"
+        },
+        {
+          "file_offset": 1048544,
+          "hex": "e213c3dbf5ef1a442b942b71d1f9d25bf221b068cf035917354627326c5553e3"
+        }
+      ]
+    },
+    {
+      "name": "first-byte-of-block-1",
+      "description": "One byte past the 1 MiB boundary; first byte of block 1.",
+      "parent_hash": "0000000000000000000000000000000000000000",
+      "content_seed": "2bd6034cefdc6fbcf31e1a3fd752f09c",
+      "file_length": 1048577,
+      "header": "00000000000000000000000000000000000000002bd6034cefdc6fbcf31e1a3fd752f09c000000000010000141d92fbf276ee8730000000000000000",
+      "file_blake2b_160": "1ec1f0dab9abfacd834c32136bd51f44baa2a897",
+      "relative_path": "1e/c1/f0/dab9abfacd834c32136bd51f44baa2a897",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "1028a6b4ec7c49a3052d712883c80f04b65956e422f92fab999c2fe4130c4e9a"
+        },
+        {
+          "file_offset": 1048545,
+          "hex": "77e3177f800ac5cfb6bed1614fa655cdd2f93247f6ebb51d324411ab5be7dc58"
+        },
+        {
+          "file_offset": 1048560,
+          "hex": "cdd2f93247f6ebb51d324411ab5be7dc58"
+        }
+      ]
+    },
+    {
+      "name": "multiple-complete-blocks",
+      "description": "Content is exactly block 0 plus two full blocks (3 MiB file).",
+      "parent_hash": "d46714c31c689748002f41e7f6b64087f63cca77",
+      "content_seed": "dd8eeb6d6ba985a3f077d87df09cd49b",
+      "file_length": 3145728,
+      "header": "d46714c31c689748002f41e7f6b64087f63cca77dd8eeb6d6ba985a3f077d87df09cd49b00000000003000001ba7551b1e350c150000000000000000",
+      "file_blake2b_160": "62513b8b152f5fffac30182f7b804714c1f271bc",
+      "relative_path": "62/51/3b/8b152f5fffac30182f7b804714c1f271bc",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "c5ac78e0801210f935b1ed3d1c14a566bb4eb1f7ed4c953e6448d3d6aa3fff90"
+        },
+        {
+          "file_offset": 1048560,
+          "hex": "64795bad45347b23e4e00e551d36b037aaf07903aa9d4a703f2840688cd2cacc"
+        },
+        {
+          "file_offset": 2097136,
+          "hex": "2d6ce2eb45205fed318f285cfb8c3b23de44f7e4a88e440f266bc53279cffa9b"
+        },
+        {
+          "file_offset": 3145696,
+          "hex": "ae3895b27f4c4be64eb609b155c352260f4375219a88fd0f559ffa3138c8772d"
+        }
+      ]
+    },
+    {
+      "name": "multi-block-unaligned",
+      "description": "Multi-block file that ends mid-block.",
+      "parent_hash": "0000000000000000000000000000000000000000",
+      "content_seed": "2e64d851e976c191bf72dfafb144cf9d",
+      "file_length": 2101265,
+      "header": "00000000000000000000000000000000000000002e64d851e976c191bf72dfafb144cf9d00000000002010119f997f331d7696250000000000000000",
+      "file_blake2b_160": "d44c00ab7b93d41457d2fff1d8a344c6c6657be0",
+      "relative_path": "d4/4c/00/ab7b93d41457d2fff1d8a344c6c6657be0",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "b49d3872873a048b41b43db4fa001e5bdf58375dc5ef7e1fb1db478e62e1f038"
+        },
+        {
+          "file_offset": 1048560,
+          "hex": "0fb4c7e20db22ab3d0c4500834b7dd67ffdc240d0c8b170de1ec72e47652868d"
+        },
+        {
+          "file_offset": 2097136,
+          "hex": "bf69e9537c6c1a8424b76f7b23d01e9e90d2de6c755cc5fe7db4c198ba7c6b8e"
+        },
+        {
+          "file_offset": 2101233,
+          "hex": "35059371a3f45f80c79d23707736853ea7ee45c6b9b8379ba803d01fa276c52f"
+        }
+      ]
+    }
+  ],
+  "metadata_vectors": [
+    {
+      "name": "single-root",
+      "root_names": [
+        "8843d7f92416211de9ebb963ff4ce28125932878"
+      ],
+      "all_file_contents": "a88966ff5150101bfbd904bfeb2f89abcf4ecd32"
+    },
+    {
+      "name": "two-roots-sort-order",
+      "root_names": [
+        "fa35e192121eabf3dabf9f5ea6abdbcbc107ac3b",
+        "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+      ],
+      "all_file_contents": "155a0eca01c4a3d9c3a3b23b9af92423fc7b35bf"
+    },
+    {
+      "name": "zero-file-store",
+      "root_names": [
+        "0000000000000000000000000000000000000000"
+      ],
+      "all_file_contents": "cf2fa9f42f4a05d4a32ce694d0d97a99dd7d97c1"
+    }
+  ]
+}

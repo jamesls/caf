@@ -172,7 +172,7 @@ def gen(
     This command will generate a set of linked, content addressable files.
 
     The default behavior is to generate 100 files in the current directory.
-    Each file will be a fixed size of 4048 bytes:
+    Each file will be a fixed size of 4096 bytes:
 
         \b
         caf gen
@@ -184,9 +184,9 @@ def gen(
         \b
         caf gen --directory /tmp/files --max-files 1000 --file-size 4KB
 
-    The -m/--max-files is one of two stopping conditions.  A stopping
+    The --max-files is one of two stopping conditions.  A stopping
     condition is what indicates when this command should stop generating
-    files.  The other stopping condition is "-u/--max-disk-usage".  Either
+    files.  The other stopping condition is "--max-disk-usage".  Either
     stopping condition can be used.  If both stopping conditions are specified,
     then this command will stop generating files as soon as any stopping
     condition is met.
@@ -195,7 +195,7 @@ def gen(
     are generated, or we've used 100MB of space:
 
         \b
-        caf gen -d /tmp/files --max-files 10000 --max-disk-usage 100MB
+        caf gen --directory /tmp/files --max-files 10000 --max-disk-usage 100MB
 
     Now, in the above example the "--max-disk-usage" is actually unnecessary
     because we know that 10000 files at a file size of 4KB is going to be
@@ -217,13 +217,18 @@ def gen(
 
         caf gen --file-size Type=normal,Mean=20MB,StdDev=1MB
 
-    You can also a gamma distribution:
+    You can also use a gamma distribution.  Alpha is the shape parameter
+    and Beta is the scale parameter, so the mean file size is Alpha * Beta
+    (4MB in this example):
 
-        caf gen --file-size Type=gamma,Alpha=20MB,Beta=1MB
+        caf gen --file-size Type=gamma,Alpha=2,Beta=2MB
 
-    And finally a lognormal distribution:
+    And finally a lognormal distribution.  Note that Mean and StdDev are
+    the parameters of the underlying normal distribution (log space), not
+    byte sizes.  This example produces a median file size of e^16, which
+    is roughly 8.9MB:
 
-        caf gen --file-size Type=lognormal,Mean=10MB,StdDev=1MB
+        caf gen --file-size Type=lognormal,Mean=16,StdDev=1
 
     """
     if max_files is None and max_disk_usage is not None:
@@ -589,7 +594,6 @@ def verify(directory: str, chunk_size: int) -> None:
     - Identify exact corrupted byte ranges
     - Analyze corruption patterns (zero-filled, sparse, random, etc.)
     - Provide visual corruption maps
-    - Suggest recovery strategies based on patterns
     """
     console = Console()
     console.print(f"Verifying file contents in: [bold]{directory}[/]")

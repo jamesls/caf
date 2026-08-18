@@ -1,14 +1,23 @@
 import os
+from pathlib import Path
 
 from caf.generator import FileGenerator
 
 
-def test_filegenerator_accepts_none_for_infinite_limits(tmp_path):
-    gen = FileGenerator(str(tmp_path), None, None, lambda: 1)
-    assert gen is not None
+def generated_files(rootdir: Path) -> list[Path]:
+    return [
+        Path(root, filename)
+        for root, _, filenames in os.walk(rootdir)
+        if '.metadata' not in root
+        for filename in filenames
+    ]
 
 
-def test_generate_files_creates_metadata_directory(tmp_path):
+def test_filegenerator_constructs_with_none_limits(tmp_path: Path) -> None:
+    FileGenerator(str(tmp_path), None, None, lambda: 1)
+
+
+def test_generate_files_creates_metadata_directory(tmp_path: Path) -> None:
     gen = FileGenerator(str(tmp_path), 1, float('inf'), lambda: 100)
     gen.generate_files()
 
@@ -16,7 +25,7 @@ def test_generate_files_creates_metadata_directory(tmp_path):
     assert (tmp_path / '.metadata' / 'all').exists()
 
 
-def test_generate_files_respects_max_files_zero(tmp_path):
+def test_generate_files_respects_max_files_zero(tmp_path: Path) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=0,
@@ -25,17 +34,12 @@ def test_generate_files_respects_max_files_zero(tmp_path):
     )
     generator.generate_files()
 
-    files = []
-    for root, _, filenames in os.walk(tmp_path):
-        if '.metadata' in root:
-            continue
-        for filename in filenames:
-            files.append(os.path.join(root, filename))
-
-    assert len(files) == 0
+    assert generated_files(tmp_path) == []
 
 
-def test_generate_files_respects_disk_usage_constraint(tmp_path):
+def test_generate_files_respects_disk_usage_constraint(
+    tmp_path: Path,
+) -> None:
     target_size = 3 * 1024  # 3KB total
     generator = FileGenerator(
         str(tmp_path),
@@ -45,18 +49,12 @@ def test_generate_files_respects_disk_usage_constraint(tmp_path):
     )
     generator.generate_files()
 
-    total_size = 0
-    for root, _, filenames in os.walk(tmp_path):
-        if '.metadata' in root:
-            continue
-        for filename in filenames:
-            file_path = os.path.join(root, filename)
-            total_size += os.path.getsize(file_path)
+    total_size = sum(path.stat().st_size for path in generated_files(tmp_path))
 
     assert total_size <= target_size
 
 
-def test_generate_files_creates_large_files(tmp_path):
+def test_generate_files_creates_large_files(tmp_path: Path) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -65,18 +63,13 @@ def test_generate_files_creates_large_files(tmp_path):
     )
     generator.generate_files()
 
-    files = []
-    for root, _, filenames in os.walk(tmp_path):
-        if '.metadata' in root:
-            continue
-        for filename in filenames:
-            files.append(os.path.join(root, filename))
+    files = generated_files(tmp_path)
 
     assert len(files) == 1
-    assert os.path.getsize(files[0]) == 512 * 1024
+    assert files[0].stat().st_size == 512 * 1024
 
 
-def test_generate_files_creates_minimal_size_files(tmp_path):
+def test_generate_files_creates_minimal_size_files(tmp_path: Path) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -85,18 +78,15 @@ def test_generate_files_creates_minimal_size_files(tmp_path):
     )
     generator.generate_files()
 
-    files = []
-    for root, _, filenames in os.walk(tmp_path):
-        if '.metadata' in root:
-            continue
-        for filename in filenames:
-            files.append(os.path.join(root, filename))
+    files = generated_files(tmp_path)
 
     assert len(files) == 1
-    assert os.path.getsize(files[0]) >= 60
+    assert files[0].stat().st_size == 60
 
 
-def test_generate_files_uses_three_level_directory_layout(tmp_path):
+def test_generate_files_uses_three_level_directory_layout(
+    tmp_path: Path,
+) -> None:
     generator = FileGenerator(
         str(tmp_path),
         max_files=1,
@@ -105,16 +95,10 @@ def test_generate_files_uses_three_level_directory_layout(tmp_path):
     )
     generator.generate_files()
 
-    files = []
-    for root, _, filenames in os.walk(tmp_path):
-        if '.metadata' in root:
-            continue
-        for filename in filenames:
-            files.append(os.path.join(root, filename))
+    files = generated_files(tmp_path)
 
     assert len(files) == 1
-    rel = os.path.relpath(files[0], str(tmp_path))
-    parts = rel.split(os.sep)
+    parts = files[0].relative_to(tmp_path).parts
     assert len(parts) == 4
     for shard in parts[:3]:
         assert len(shard) == 2

@@ -1,0 +1,4 @@
+# Formatting policy: default rustfmt style, pinned to the 2024 style edition
+# so local runs and CI (`cargo fmt --all --check`) agree across toolchains.
+style_edition = "2024"
+newline_style = "Unix"

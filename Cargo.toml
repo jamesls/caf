@@ -1,0 +1,117 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/caf-format",
+    "crates/caf-store",
+    "crates/caf",
+]
+
+[workspace.package]
+# This prerelease does not change the version 2 file format.
+version = "0.3.0-alpha.0"
+edition = "2024"
+# Rust 1.85 is the minimum version that supports edition 2024. CI builds
+# with it on every supported platform.
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/jamesls/caf"
+authors = ["James Saryerwinnie <js@jamesls.com>"]
+
+[workspace.dependencies]
+caf-format = { path = "crates/caf-format" }
+caf-store = { path = "crates/caf-store" }
+
+# RustCrypto hashes implement the version 2 BLAKE2b-160, SHA3-256, and
+# SHAKE-128 algorithms. They are pure Rust and permissively licensed.
+blake2 = "0.10"
+sha3 = "0.10"
+# OS randomness supplies content seeds and temporary names. `rand` and
+# `rand_distr` implement size selection. `tempfile` creates temporary test
+# stores. All are pure Rust, MIT OR Apache-2.0,
+# MSRV <= 1.85. `rand` stays on 0.9 and `getrandom` on 0.3 (the version
+# inside `rand`): the 0.10/0.4 pair would duplicate `cpufeatures` and
+# `getrandom` in the graph, which the cargo lint policy rejects.
+getrandom = { version = "0.3", features = ["std"] }
+rand = "0.9"
+rand_distr = "0.5"
+# CLI parsing uses the `clap` derive interface. It is pure Rust, MIT OR
+# Apache-2.0, and supports Rust 1.74 or newer. Usage errors exit with
+# status 2. The 4.5 series is required because 4.6 currently publishes
+# without a matching `clap_derive`.
+clap = { version = "~4.5", features = ["derive"] }
+# Application error handling for the `caf` binary and the library
+# examples: the coding guidelines have applications pick anyhow or eyre
+# and use it consistently. Pure Rust, MIT OR Apache-2.0, no dependencies.
+anyhow = "1"
+tempfile = "3"
+criterion = "0.7"
+assert_cmd = "2"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# Lint policy: warn locally so output stays actionable; CI escalates with
+# RUSTFLAGS="-D warnings" (.github/workflows/rust.yml). Every workspace
+# member sets `[lints] workspace = true`.
+[workspace.lints.rust]
+# The workspace forbids unsafe code. Any future exception requires its
+# own review.
+unsafe_code = "forbid"
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+# Major categories
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Selected restriction lints
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# May cause issues with structured logging
+literal_string_with_formatting_args = "allow"
+
+# Debug symbols keep benchmark release profiles usable for profiling.
+[profile.bench]
+debug = 1
+
+# Golden and property tests hash megabytes of SHAKE/BLAKE2b output; keep the
+# crypto cores optimized in dev builds so `cargo test` stays fast. Conformance
+# results are identical at every opt-level.
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3
+[profile.dev.package.sha3]
+opt-level = 3

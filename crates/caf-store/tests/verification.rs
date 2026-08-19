@@ -3,8 +3,7 @@
 //! The tests assert on structured results rather than terminal output.
 //! Cases cover short reads, permission failures, truncation, extra bytes,
 //! bad paths, missing parents, missing roots, orphaned files, serial and
-//! parallel equivalence, and the iterative-walk nesting bound. Cross-
-//! implementation tests live in `tests/python_compat.rs`.
+//! parallel equivalence, and the iterative-walk nesting bound.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -1073,11 +1072,9 @@ fn parallel_worker_errors_are_structured() {
 
 #[test]
 fn reserved_byte_flip_in_a_genuine_file_is_an_invalid_header() {
-    // Flipping a reserved byte of a genuine generated
-    // file fails both implementations, but Python classifies it as
-    // PATH MISMATCH (content valid) while Rust rejects the header
-    // before hashing. The Python side is pinned by
-    // the compatibility test in tests/python_compat.rs.
+    // Flipping a reserved byte of a genuine generated file fails the
+    // legacy Python implementation as PATH MISMATCH (content valid).
+    // Rust rejects the invalid version 2 header before hashing.
     let store = tempfile::tempdir().expect("create temp store");
     generate(store.path(), 1, 1024);
     let [file] = &*data_files(store.path()) else {
@@ -1105,8 +1102,8 @@ fn reserved_byte_mid_chain_file_cascades_to_a_false_orphan() {
     // A hand-crafted mid-chain file with
     // nonzero reserved bytes fails as an invalid header, so its parent
     // link is never read and the parent is additionally reported as a
-    // false orphan. Python verifies this exact store cleanly (pinned
-    // in tests/python_compat.rs).
+    // false orphan. The legacy Python implementation accepted this
+    // malformed store because it did not validate reserved bytes.
     let store = tempfile::tempdir().expect("create temp store");
     let parent_digest = place_file(
         store.path(),

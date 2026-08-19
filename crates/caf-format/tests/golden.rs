@@ -2,8 +2,7 @@
 //!
 //! `tests/golden/vectors.json` (repository root) is the primary contract
 //! for this crate: Rust must reproduce every byte, digest, and path the
-//! Python implementation used to create the fixture. The same file
-//! pins the Python side through `tests/test_golden_vectors.py`.
+//! former Python implementation used to create the fixture.
 
 use std::io::Read;
 use std::path::Path;

@@ -1,5 +1,4 @@
-//! Verifies a store from the command line, for benchmarks and manual
-//! differential runs against the Python implementation:
+//! Verifies a store from the command line for manual library testing:
 //!
 //! ```text
 //! cargo run --release -p caf-store --example verify -- <dir> [chunk-size] [jobs]

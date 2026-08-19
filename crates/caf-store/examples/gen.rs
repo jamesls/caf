@@ -1,5 +1,4 @@
-//! Generates a store from the command line, for benchmarks and manual
-//! differential runs against the Python implementation:
+//! Generates a store from the command line for manual library testing:
 //!
 //! ```text
 //! cargo run --release -p caf-store --example gen -- <dir> <max-files> <size-spec>

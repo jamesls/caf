@@ -7,6 +7,7 @@ authors = [
     {name = "James Saryerwinnie", email = "js@jamesls.com"}
 ]
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 keywords = ["caf"]
 classifiers = [
     "Intended Audience :: Developers",

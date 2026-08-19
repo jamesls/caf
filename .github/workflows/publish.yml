@@ -144,6 +144,21 @@ jobs:
         with:
           command: sdist
           args: --out dist
+      - name: Validate sdist contents
+        # PyPI rejects an sdist when License-File names a missing archive member.
+        run: |
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          if (( ${#sdists[@]} != 1 )); then
+            echo "Expected exactly one sdist, found ${#sdists[@]}" >&2
+            exit 1
+          fi
+          root=$(tar -tzf "${sdists[0]}" | sed -n '1s|/.*||p')
+          if [ -z "$root" ]; then
+            echo "Could not determine the sdist archive root" >&2
+            exit 1
+          fi
+          tar -tzf "${sdists[0]}" "$root/LICENSE" > /dev/null
       - uses: dtolnay/rust-toolchain@stable
       - name: Install uv
         uses: astral-sh/setup-uv@v7

@@ -3,8 +3,7 @@
 //! Every test generates into a temporary store and re-validates the
 //! result with `caf-format` primitives: path layout, header fields,
 //! whole-file digests, deterministic content, chain links, chain-tip
-//! markers, and the `.metadata/all` aggregate. The Python differential
-//! complement lives in `tests/python_compat.rs`.
+//! markers, and the `.metadata/all` aggregate.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;

@@ -1,54 +1,180 @@
 name: Publish to PyPI (Trusted Publishing)
 
 on:
-  # Publish when you push a version tag with format X.Y.Z
   push:
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
   # Allow manual runs from the Actions tab
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Build distributions
+  gate:
+    name: Test and version check
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          # If you use setuptools_scm or otherwise derive version from git tags,
-          # you want full history + tags available.
-          fetch-depth: 0
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace --locked
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        # The wheel version comes from Cargo.toml, not the git tag, so a
+        # mismatched tag would silently publish the wrong version.
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "caf") | .version')
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
 
-      - uses: actions/setup-python@v5
+  # With `bindings = "bin"` each wheel is tagged py3-none-<platform>, so one
+  # wheel per platform covers all Python versions.
+  linux:
+    name: Build linux-${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
         with:
-          python-version: "3.12"
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: auto
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
           version: "0.9.2"
-          enable-cache: true
-      - name: Install dependencies
-        run: uv sync --locked --all-extras --dev
-      - name: Run prcheck
-        run: uv run poe prcheck
-
-      - name: Build sdist + wheel
-        run: uv build
-
-      - name: Upload distributions
+      - name: Test built wheel
+        run: |
+          uv tool install dist/*.whl
+          uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Run smoke test
+        run: |
+          caf --version
+          caf gen --directory "${{ runner.temp }}/caf-wheel-test" --max-files 3 --file-size 64
+          caf verify --directory "${{ runner.temp }}/caf-wheel-test"
+      - name: Upload wheel
         uses: actions/upload-artifact@v6
         with:
-          name: python-package-distributions
-          path: dist/
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+          if-no-files-found: error
+
+  musllinux:
+    name: Build musllinux-${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: musllinux_1_2
+      - name: Upload wheel
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+          if-no-files-found: error
+
+  macos:
+    name: Build macos-${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: macos-latest
+            target: aarch64
+          - runner: macos-15-intel
+            target: x86_64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.2"
+      - name: Test built wheel
+        run: |
+          uv tool install dist/*.whl
+          uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Run smoke test
+        run: |
+          caf --version
+          caf gen --directory "${{ runner.temp }}/caf-wheel-test" --max-files 3 --file-size 64
+          caf verify --directory "${{ runner.temp }}/caf-wheel-test"
+      - name: Upload wheel
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: dist
+          if-no-files-found: error
+
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.2"
+      - name: Test built sdist
+        # Installing from the sdist verifies it contains everything needed
+        # to build from source, the fallback path for platforms without a
+        # wheel (e.g. Windows, 32-bit Linux).
+        run: |
+          uv tool install dist/*.tar.gz
+          uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Run smoke test
+        run: |
+          caf --version
+          caf gen --directory "${{ runner.temp }}/caf-sdist-test" --max-files 3 --file-size 64
+          caf verify --directory "${{ runner.temp }}/caf-sdist-test"
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
           if-no-files-found: error
 
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [gate, linux, musllinux, macos, sdist]
+    # Guarding the whole job (not just the publish step) makes a manual
+    # workflow_dispatch a dry run of the full build matrix without touching
+    # PyPI or waiting on the pypi environment's protection rules.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -61,7 +187,8 @@ jobs:
       - name: Download distributions
         uses: actions/download-artifact@v6
         with:
-          name: python-package-distributions
+          pattern: wheels-*
+          merge-multiple: true
           path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

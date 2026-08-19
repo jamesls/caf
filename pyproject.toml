@@ -9,7 +9,6 @@ authors = [
 license = "Apache-2.0"
 keywords = ["caf"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Natural Language :: English",

@@ -59,6 +59,18 @@ impl TempFile {
             .expect("the file handle is open until persist")
     }
 
+    /// The open handle, shareable across threads.
+    ///
+    /// Positional writes carry their own offset and move no shared
+    /// cursor, so several writers can hold this one handle and write
+    /// disjoint ranges at once; [`TempFile::file_mut`] is the sequential
+    /// path's cursor-based view of the same file.
+    pub(crate) fn file(&self) -> &FileHandle {
+        self.file
+            .as_ref()
+            .expect("the file handle is open until persist")
+    }
+
     /// Closes the file and renames it onto `target`.
     ///
     /// The rename is atomic on the same filesystem: `target` is either

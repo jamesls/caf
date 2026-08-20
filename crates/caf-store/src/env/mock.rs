@@ -60,6 +60,10 @@ struct MockState {
     random_counter: u64,
     random_failure: Option<io::ErrorKind>,
     failures: BTreeMap<PathBuf, io::ErrorKind>,
+    /// Positional writes whose byte range covers one of these offsets
+    /// fail; see [`MockCtrl::fail_write_at`].
+    write_failures: BTreeMap<u64, io::ErrorKind>,
+    set_len_failure: Option<io::ErrorKind>,
 }
 
 #[derive(Debug)]
@@ -79,6 +83,8 @@ impl MockCtrl {
                 random_counter: 0,
                 random_failure: None,
                 failures: BTreeMap::new(),
+                write_failures: BTreeMap::new(),
+                set_len_failure: None,
             })),
         }
     }
@@ -198,11 +204,28 @@ impl MockCtrl {
         self.lock().random_failure = Some(kind);
     }
 
+    /// Makes every positional write whose byte range covers `offset`
+    /// fail with `kind`.
+    ///
+    /// Injection by offset rather than by path is what reaches a
+    /// mid-file write failure on a file the caller names itself, such as
+    /// the randomly named temporary a generation run writes through.
+    pub fn fail_write_at(&self, offset: u64, kind: io::ErrorKind) {
+        self.lock().write_failures.insert(offset, kind);
+    }
+
+    /// Makes every later file resize fail with `kind`.
+    pub fn fail_set_len(&self, kind: io::ErrorKind) {
+        self.lock().set_len_failure = Some(kind);
+    }
+
     /// Clears every injected failure, including the random source's.
     pub fn clear_failures(&self) {
         let mut state = self.lock();
         state.failures.clear();
         state.random_failure = None;
+        state.write_failures.clear();
+        state.set_len_failure = None;
     }
 
     pub(crate) fn fill_random(&self, buf: &mut [u8]) -> io::Result<()> {
@@ -269,7 +292,7 @@ impl MockCtrl {
         let state = self.lock();
         state.check_failure(path)?;
         match state.nodes.get(path) {
-            Some(Node::File(data)) => Ok(MockFile::new(Arc::clone(data), false)),
+            Some(Node::File(data)) => Ok(MockFile::new(self, path, Arc::clone(data), false)),
             Some(Node::Dir) => Err(error(io::ErrorKind::IsADirectory, path)),
             None => Err(error(io::ErrorKind::NotFound, path)),
         }
@@ -294,7 +317,7 @@ impl MockCtrl {
         state
             .nodes
             .insert(path.to_owned(), Node::File(Arc::clone(&data)));
-        Ok(MockFile::new(data, true))
+        Ok(MockFile::new(self, path, data, true))
     }
 
     pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -350,6 +373,15 @@ impl MockState {
         }
     }
 
+    /// The failure injected for a write covering `[offset, offset+len)`,
+    /// if any offset in that range has one.
+    fn write_failure_in(&self, offset: u64, len: u64) -> Option<io::ErrorKind> {
+        self.write_failures
+            .range(offset..offset.saturating_add(len))
+            .next()
+            .map(|(_offset, kind)| *kind)
+    }
+
     /// `SplitMix64` over a run-local counter: distinct, reproducible bytes
     /// with no operating-system call.
     fn next_random_byte(&mut self) -> u8 {
@@ -371,16 +403,24 @@ impl MockState {
 }
 
 /// An open handle onto one mocked file.
+///
+/// The controller and the path the handle was opened on are kept so the
+/// positional writes of parallel generation see injected failures the
+/// same way the path-keyed operations do.
 #[derive(Debug)]
 pub(crate) struct MockFile {
+    ctrl: MockCtrl,
+    path: PathBuf,
     data: Arc<Mutex<Vec<u8>>>,
     position: u64,
     writable: bool,
 }
 
 impl MockFile {
-    fn new(data: Arc<Mutex<Vec<u8>>>, writable: bool) -> Self {
+    fn new(ctrl: &MockCtrl, path: &Path, data: Arc<Mutex<Vec<u8>>>, writable: bool) -> Self {
         Self {
+            ctrl: ctrl.clone(),
+            path: path.to_owned(),
             data,
             position: 0,
             writable,
@@ -391,6 +431,61 @@ impl MockFile {
         Metadata {
             len: length_of(&self.data),
             file_type: FileType::File,
+        }
+    }
+
+    /// Resizes the file, zero-filling growth like the real call.
+    pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
+        {
+            let state = self.ctrl.lock();
+            state.check_failure(&self.path)?;
+            if let Some(kind) = state.set_len_failure {
+                return Err(io::Error::new(kind, "the mocked resize failed"));
+            }
+        }
+        self.check_writable()?;
+        let len =
+            usize::try_from(len).map_err(|_err| io::Error::from(io::ErrorKind::InvalidInput))?;
+        lock(&self.data).resize(len, 0);
+        Ok(())
+    }
+
+    /// Writes `buf` at `offset` without touching the handle's cursor.
+    ///
+    /// Takes `&self`, as the parallel writers do: the file's bytes live
+    /// behind their own lock, so disjoint ranges can be written through
+    /// one handle from several threads.
+    pub(crate) fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        {
+            let state = self.ctrl.lock();
+            state.check_failure(&self.path)?;
+            if let Some(kind) = state.write_failure_in(offset, buf.len() as u64) {
+                return Err(io::Error::new(
+                    kind,
+                    format!("the mocked write at offset {offset} failed"),
+                ));
+            }
+        }
+        self.check_writable()?;
+        let start =
+            usize::try_from(offset).map_err(|_err| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let mut data = lock(&self.data);
+        let end = start + buf.len();
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        data[start..end].copy_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn check_writable(&self) -> io::Result<()> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the mocked file is open for reading",
+            ))
         }
     }
 }
@@ -414,12 +509,7 @@ impl Read for MockFile {
 
 impl Write for MockFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.writable {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the mocked file is open for reading",
-            ));
-        }
+        self.check_writable()?;
         let mut data = lock(&self.data);
         let start = usize::try_from(self.position)
             .map_err(|_err| io::Error::from(io::ErrorKind::InvalidInput))?;

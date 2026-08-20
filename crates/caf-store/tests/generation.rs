@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read as _;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use caf_format::{
@@ -181,6 +182,33 @@ fn three_file_chain_is_structurally_valid() {
         all_file_contents(store.path()),
         report.all_digest().to_hex()
     );
+    check_store(store.path());
+}
+
+#[test]
+fn parallel_generation_produces_a_structurally_valid_store() {
+    // Eight 1 MiB blocks over four workers clears the two-blocks-per-
+    // worker threshold, so this run takes the parallel path on a real
+    // filesystem. The store it writes has to satisfy every rule a
+    // serially generated one does, down to the deterministic content.
+    let store = tempfile::tempdir().expect("create temp store");
+    let file_size = 8 * BLOCK_SIZE as u64;
+    let report = Generator::builder(store.path())
+        .max_files(2)
+        .file_sizes(SizeChooser::fixed(file_size))
+        .jobs(NonZeroUsize::new(4).expect("four workers"))
+        .build()
+        .generate()
+        .expect("generation succeeds");
+
+    assert_eq!(report.files_created(), 2);
+    assert_eq!(report.bytes_written(), 2 * file_size);
+    for path in data_files(store.path()) {
+        assert_eq!(
+            fs::metadata(&path).expect("data files exist").len(),
+            file_size,
+        );
+    }
     check_store(store.path());
 }
 

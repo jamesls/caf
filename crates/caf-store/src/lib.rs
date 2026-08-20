@@ -13,6 +13,9 @@
 //! - Bounded parallel verification ([`Verifier::jobs`]): a fixed worker
 //!   pool behind a claim window, with results collected back in sorted
 //!   file order so serial and parallel reports are identical.
+//! - Parallel generation of one file ([`GeneratorBuilder::jobs`]): block
+//!   generators, positional writers, and an ordered hasher over a fixed
+//!   buffer pool, producing byte-identical files at any worker count.
 //!
 //! Operations resolve paths from an explicit store root and never change the
 //! process working directory. Configuration uses builders; results,
@@ -52,6 +55,7 @@ mod analysis;
 mod env;
 mod generate;
 mod metadata;
+mod parallel_write;
 mod pipeline;
 mod random;
 mod size;
@@ -73,9 +77,19 @@ pub use size::{
 };
 #[doc(inline)]
 pub use verify::{
-    DEFAULT_ANALYSIS_CHUNK_SIZE, Diagnostic, MAX_ANALYSIS_CHUNK_SIZE, MAX_JOBS, Severity,
-    VerificationReport, Verifier, VerifyError,
+    DEFAULT_ANALYSIS_CHUNK_SIZE, Diagnostic, MAX_ANALYSIS_CHUNK_SIZE, Severity, VerificationReport,
+    Verifier, VerifyError,
 };
+
+use std::num::NonZeroUsize;
+
+/// Largest worker count honored by [`Verifier::jobs`] and
+/// [`GeneratorBuilder::jobs`].
+///
+/// A resource bound: each worker costs a thread and a block-sized
+/// buffer, and both operations saturate on I/O long before this many.
+/// Larger requests clamp to this value instead of failing to spawn.
+pub const MAX_JOBS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 #[cfg(test)]
 mod tests {

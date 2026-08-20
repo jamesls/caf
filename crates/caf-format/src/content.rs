@@ -5,7 +5,10 @@
 //! SHAKE-128 output over `CONTENT_DOMAIN || seed || block_index` (8-byte
 //! big-endian index), squeezed to the full block length; the SHAKE
 //! instance never spans blocks. Block 0 is shortened by the header size so
-//! later blocks start at 1 MiB-aligned file offsets.
+//! later blocks start at 1 MiB-aligned file offsets. A file's last block
+//! is squeezed only as far as the file length reaches
+//! ([`fill_block_prefix`]), which SHAKE's prefix stability makes
+//! equivalent to truncating the full block.
 
 use std::fmt::{self, Debug, Formatter};
 use std::io::{self, Read};
@@ -46,7 +49,40 @@ pub fn fill_block(seed: ContentSeed, index: u64, block: &mut [u8]) {
         "content block {index} is {} bytes",
         block_len(index),
     );
-    XofReader::read(&mut block_reader(seed, index), block);
+    fill_block_prefix(seed, index, block);
+}
+
+/// Fills `prefix` with the first `prefix.len()` bytes of the content
+/// block at `index`.
+///
+/// The last block of a file is shorter than [`block_len`]`(index)`
+/// whenever the file length is not block aligned; this is the entry
+/// point that generates it. SHAKE output is prefix-stable, so the bytes
+/// written are the ones [`ContentReader`] streams at the same file
+/// offsets. Use [`fill_block`] when the block is known to be complete.
+///
+/// # Panics
+///
+/// Panics if `prefix` is longer than [`block_len`]`(index)`: bytes past
+/// a block boundary belong to the next block's XOF, not this one's.
+///
+/// # Examples
+///
+/// ```
+/// use caf_format::{ContentSeed, fill_block_prefix};
+///
+/// let seed = ContentSeed::from_hex("b42d9a6630882f79c7599ae213435f86")?;
+/// let mut tail = [0_u8; 17];
+/// fill_block_prefix(seed, 4, &mut tail);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn fill_block_prefix(seed: ContentSeed, index: u64, prefix: &mut [u8]) {
+    assert!(
+        prefix.len() <= block_len(index),
+        "content block {index} is at most {} bytes",
+        block_len(index),
+    );
+    XofReader::read(&mut block_reader(seed, index), prefix);
 }
 
 /// Starts the SHAKE-128 XOF for one content block.
@@ -163,7 +199,7 @@ impl Debug for ContentReader {
 mod tests {
     use std::io::Read;
 
-    use super::{ContentReader, block_len, fill_block};
+    use super::{ContentReader, block_len, fill_block, fill_block_prefix};
     use crate::{BLOCK_SIZE, ContentSeed, HEADER_SIZE};
 
     fn seed() -> ContentSeed {
@@ -181,6 +217,25 @@ mod tests {
     #[should_panic(expected = "content block 0 is 1048516 bytes")]
     fn fill_block_rejects_partial_blocks() {
         fill_block(seed(), 0, &mut [0_u8; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "content block 1 is at most 1048576 bytes")]
+    fn fill_block_prefix_rejects_lengths_past_the_block() {
+        fill_block_prefix(seed(), 1, &mut vec![0_u8; BLOCK_SIZE + 1]);
+    }
+
+    /// The tail of a file is the head of its block: a short squeeze must
+    /// equal the full block truncated to the same length.
+    #[test]
+    fn prefixes_truncate_the_full_block() {
+        let mut full = vec![0_u8; block_len(1)];
+        fill_block(seed(), 1, &mut full);
+        for len in [0, 1, 4096, block_len(1)] {
+            let mut prefix = vec![0_u8; len];
+            fill_block_prefix(seed(), 1, &mut prefix);
+            assert_eq!(prefix, full[..len], "prefix of {len} bytes");
+        }
     }
 
     #[test]

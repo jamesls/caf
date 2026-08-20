@@ -182,8 +182,10 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "caf-format",
+ "caf-store",
  "criterion",
  "getrandom 0.3.4",
+ "hex",
  "proptest",
  "rand",
  "rand_distr",

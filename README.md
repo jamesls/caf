@@ -26,4 +26,14 @@ You can then verify the files are all there:
 $ caf verify
 ```
 
+Both commands take `--jobs` to spread their work over worker threads.
+Generation splits a single large file across threads, and verification
+splits the store across them.  The results are identical at any value, so
+it only changes how long the command takes:
+
+```
+$ caf gen --max-files 1 --file-size 4GB --jobs 8
+$ caf verify --jobs 8
+```
+
 The `--help` output of the `caf gen` command contains many more examples.

@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use caf_format::{
     ContentReader, ContentSeed, Digest, HEADER_SIZE, Header, block_len, fill_block,
-    hash_to_relpath, parse_hash_from_path,
+    fill_block_prefix, hash_to_relpath, parse_hash_from_path,
 };
 use proptest::prelude::*;
 
@@ -144,6 +144,27 @@ proptest! {
             reader.read_exact(&mut streamed[start..]).expect("infinite");
         }
         prop_assert_eq!(&*streamed, &REFERENCE[..streamed.len()]);
+    }
+
+    /// A file whose length is not block aligned ends in a partial block,
+    /// which the parallel writer squeezes with `fill_block_prefix`. At
+    /// every length that has to be the same bytes the sequential reader
+    /// puts at those file offsets.
+    #[test]
+    fn block_prefixes_match_the_streamed_content(
+        index in 0_u64..2,
+        len in 0_usize..=block_len(1),
+    ) {
+        let len = len.min(block_len(index));
+        let start = if index == 0 { 0 } else { block_len(0) };
+        let mut streamed = vec![0_u8; start + len];
+        ContentReader::new(reference_seed())
+            .read_exact(&mut streamed)
+            .expect("infinite");
+
+        let mut prefix = vec![0_u8; len];
+        fill_block_prefix(reference_seed(), index, &mut prefix);
+        prop_assert_eq!(&*prefix, &streamed[start..]);
     }
 
     #[test]

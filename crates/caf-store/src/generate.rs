@@ -10,6 +10,12 @@
 //! hash-derived location, and the run ends by writing the chain-tip
 //! marker and atomically replacing `.metadata/all`.
 //!
+//! The chain serializes file creation — each header embeds the previous
+//! file's digest — so parallelism lives inside a single file:
+//! [`GeneratorBuilder::jobs`] hands large files to
+//! [`parallel_write`](crate::parallel_write), which produces the same
+//! bytes and the same digest as the sequential path.
+//!
 //! Concurrent generation runs against one store and verifying while a
 //! writer is active are unsupported. A killed process can
 //! leave a temporary file in the store root or a chain without a tip
@@ -19,6 +25,7 @@ use std::backtrace::Backtrace;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read as _, Write as _};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use caf_format::{
@@ -26,14 +33,21 @@ use caf_format::{
 };
 
 use crate::env::Env;
-use crate::metadata;
 use crate::size::{SampleError, SizeChooser};
 use crate::temp::TempFile;
+use crate::{MAX_JOBS, metadata, parallel_write};
 
 /// Default size of generated files in bytes when none is configured.
 ///
 /// The CLI uses 4096 bytes by default.
 pub const DEFAULT_FILE_SIZE: u64 = 4096;
+
+/// Writer threads the parallel path uses when none is configured.
+///
+/// Writers hand filled pages to the kernel rather than doing CPU work,
+/// so the useful count is a small constant: it does not scale with the
+/// core count the way [`GeneratorBuilder::jobs`] does.
+const DEFAULT_WRITE_THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// Every file is at least its own 60-byte header; smaller requested
 /// sizes are silently clamped up.
@@ -70,6 +84,8 @@ pub struct Generator {
     max_files: Option<u64>,
     max_disk_usage: Option<u64>,
     sizes: SizeChooser,
+    jobs: NonZeroUsize,
+    write_threads: NonZeroUsize,
 }
 
 impl Generator {
@@ -132,14 +148,7 @@ impl Generator {
                 .next_size()
                 .map_err(GenerateError::size_selection)?;
             let file_size = requested.max(MIN_FILE_SIZE);
-            parent = write_file(
-                &self.env,
-                &self.root,
-                parent,
-                file_size,
-                &mut buffer,
-                &mut created_dirs,
-            )?;
+            parent = self.write_file(parent, file_size, &mut buffer, &mut created_dirs)?;
             files_created += 1;
             bytes_written = bytes_written.saturating_add(file_size);
         }
@@ -152,6 +161,49 @@ impl Generator {
             chain_tip: parent,
             all_digest,
         })
+    }
+
+    /// Writes one file: header, deterministic content, and hash-derived
+    /// placement. Returns the file's digest (the next file's parent).
+    fn write_file(
+        &self,
+        parent: Digest,
+        file_size: u64,
+        buffer: &mut [u8],
+        created_dirs: &mut HashSet<PathBuf>,
+    ) -> Result<Digest, GenerateError> {
+        let seed =
+            ContentSeed::from_bytes(self.env.random_array().map_err(GenerateError::randomness)?);
+        let header = Header::new(parent, seed, file_size)
+            .expect("file size is clamped to the header minimum");
+
+        // The temporary file lives in the store root so the final rename
+        // stays on one filesystem. The name uses the parent digest prefix;
+        // it is not part of the format contract.
+        let mut temp = TempFile::create(&self.env, &self.root, &parent.to_hex()[..16])
+            .map_err(|source| GenerateError::io("creating a temporary file", &self.root, source))?;
+
+        // Both paths produce the same bytes and the same digest; only
+        // the thread count differs.
+        let digest = if use_parallel_path(file_size, self.jobs) {
+            parallel_write::write_content(&temp, &header, self.jobs, self.write_threads)?
+        } else {
+            write_content_serial(&mut temp, &header, buffer)?
+        };
+
+        let final_path = hash_to_path(&self.root, digest);
+        let shard_dir = final_path
+            .parent()
+            .expect("hash paths always have shard directories");
+        if !created_dirs.contains(shard_dir) {
+            self.env.create_dir_all(shard_dir).map_err(|source| {
+                GenerateError::io("creating the shard directory", shard_dir, source)
+            })?;
+            created_dirs.insert(shard_dir.to_owned());
+        }
+        temp.persist(&final_path)
+            .map_err(|source| GenerateError::io("placing the content file", &final_path, source))?;
+        Ok(digest)
     }
 }
 
@@ -173,6 +225,8 @@ impl GeneratorBuilder {
                 max_files: None,
                 max_disk_usage: None,
                 sizes: SizeChooser::fixed(DEFAULT_FILE_SIZE),
+                jobs: NonZeroUsize::MIN,
+                write_threads: DEFAULT_WRITE_THREADS,
             },
         }
     }
@@ -201,6 +255,40 @@ impl GeneratorBuilder {
         self
     }
 
+    /// Generates each file's content on `count` threads (default 1,
+    /// sequential).
+    ///
+    /// The store is identical to a sequential run: every file has the
+    /// same content, digest, and path at any worker count, so this is
+    /// purely a speed setting. It applies within one file — the chain
+    /// serializes file creation, since each header embeds the previous
+    /// file's digest — so it only speeds up large files. Files with
+    /// fewer than two 1 MiB blocks per worker are written sequentially
+    /// whatever the count is.
+    ///
+    /// Peak memory grows with the worker count, a few block-sized
+    /// buffers per worker, and never with the file size. Values above
+    /// [`MAX_JOBS`] clamp to it. The CLI rejects values below one as a
+    /// usage error.
+    #[must_use]
+    pub fn jobs(mut self, count: NonZeroUsize) -> Self {
+        self.generator.jobs = count.min(MAX_JOBS);
+        self
+    }
+
+    /// Writes parallel-generated content on `count` threads (default 4).
+    ///
+    /// Writer threads submit filled blocks to the operating system and
+    /// do no CPU work, so the useful count is a small constant that does
+    /// not track the core count; [`GeneratorBuilder::jobs`] is the
+    /// setting that does. Values above [`MAX_JOBS`] clamp to it. Has no
+    /// effect on files written sequentially.
+    #[must_use]
+    pub fn write_threads(mut self, count: NonZeroUsize) -> Self {
+        self.generator.write_threads = count.min(MAX_JOBS);
+        self
+    }
+
     /// Returns the configured generator.
     #[must_use]
     pub fn build(self) -> Generator {
@@ -208,26 +296,23 @@ impl GeneratorBuilder {
     }
 }
 
-/// Writes one file: header, deterministic content, and hash-derived
-/// placement. Returns the file's digest (the next file's parent).
-fn write_file(
-    env: &Env,
-    root: &Path,
-    parent: Digest,
-    file_size: u64,
+/// Whether a file of `file_size` bytes is worth generating in parallel.
+///
+/// Below two blocks per worker the threads have nothing to divide, and
+/// the sequential path is one pass over one buffer with no coordination
+/// at all. The output is the same either way, so this is only about
+/// where the crossover sits.
+fn use_parallel_path(file_size: u64, jobs: NonZeroUsize) -> bool {
+    jobs > NonZeroUsize::MIN && parallel_write::total_blocks(file_size) >= 2 * jobs.get() as u64
+}
+
+/// Writes the header and content sequentially, hashing as it goes, and
+/// returns the file's digest.
+fn write_content_serial(
+    temp: &mut TempFile,
+    header: &Header,
     buffer: &mut [u8],
-    created_dirs: &mut HashSet<PathBuf>,
 ) -> Result<Digest, GenerateError> {
-    let seed = ContentSeed::from_bytes(env.random_array().map_err(GenerateError::randomness)?);
-    let header =
-        Header::new(parent, seed, file_size).expect("file size is clamped to the header minimum");
-
-    // The temporary file lives in the store root so the final rename
-    // stays on one filesystem. The name uses the parent digest prefix;
-    // it is not part of the format contract.
-    let mut temp = TempFile::create(env, root, &parent.to_hex()[..16])
-        .map_err(|source| GenerateError::io("creating a temporary file", root, source))?;
-
     let mut hasher = Hasher::new();
     let encoded = header.encode();
     temp.file_mut()
@@ -238,7 +323,7 @@ fn write_file(
     // One reusable block-sized buffer streams SHAKE generation, file
     // writing, and BLAKE2b hashing; the reader squeezes only the bytes
     // the file needs.
-    let mut reader = ContentReader::new(seed);
+    let mut reader = ContentReader::new(header.content_seed());
     let mut remaining = header.content_length();
     while remaining > 0 {
         let take = usize::try_from(remaining.min(BLOCK_SIZE as u64))
@@ -253,21 +338,7 @@ fn write_file(
         hasher.update(chunk);
         remaining -= take as u64;
     }
-
-    let digest = hasher.finalize();
-    let final_path = hash_to_path(root, digest);
-    let shard_dir = final_path
-        .parent()
-        .expect("hash paths always have shard directories");
-    if !created_dirs.contains(shard_dir) {
-        env.create_dir_all(shard_dir).map_err(|source| {
-            GenerateError::io("creating the shard directory", shard_dir, source)
-        })?;
-        created_dirs.insert(shard_dir.to_owned());
-    }
-    temp.persist(&final_path)
-        .map_err(|source| GenerateError::io("placing the content file", &final_path, source))?;
-    Ok(digest)
+    Ok(hasher.finalize())
 }
 
 /// Structured results of one generation run.
@@ -423,7 +494,11 @@ impl std::error::Error for GenerateError {
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerateError, GenerationReport, Generator};
+    use std::num::NonZeroUsize;
+
+    use caf_format::BLOCK_SIZE;
+
+    use super::{GenerateError, GenerationReport, Generator, MAX_JOBS, use_parallel_path};
     use crate::size::{ParseSizeError, SampleError, SizeSpecError};
 
     #[test]
@@ -454,5 +529,141 @@ mod tests {
         let generator = Generator::builder("/store").max_files(2).build();
         let debug = format!("{generator:?}");
         assert!(debug.contains("max_files: Some(2)"), "{debug}");
+    }
+
+    #[test]
+    fn worker_counts_clamp_to_the_maximum() {
+        let generator = Generator::builder("/store")
+            .jobs(NonZeroUsize::MAX)
+            .write_threads(NonZeroUsize::MAX)
+            .build();
+        assert_eq!(generator.jobs, MAX_JOBS);
+        assert_eq!(generator.write_threads, MAX_JOBS);
+    }
+
+    /// Below two blocks per worker the threads have nothing to divide,
+    /// so the file is written sequentially however high `jobs` is.
+    #[test]
+    fn the_parallel_path_needs_two_blocks_per_worker() {
+        let block = BLOCK_SIZE as u64;
+        let jobs = |count| NonZeroUsize::new(count).expect("positive");
+        assert!(!use_parallel_path(1 << 30, NonZeroUsize::MIN));
+        assert!(!use_parallel_path(7 * block, jobs(4)));
+        assert!(use_parallel_path(8 * block, jobs(4)));
+        assert!(!use_parallel_path(block + 1, jobs(2)));
+        assert!(use_parallel_path(4 * block, jobs(2)));
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod mocked_tests {
+    use std::num::NonZeroUsize;
+    use std::path::Path;
+
+    use caf_format::BLOCK_SIZE;
+
+    use crate::{Generator, SizeChooser};
+
+    fn jobs(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).expect("the tests use positive counts")
+    }
+
+    /// Eight blocks over four workers: past the dispatch threshold, so
+    /// these runs really do take the parallel path.
+    const PARALLEL_FILE_SIZE: u64 = 8 * BLOCK_SIZE as u64;
+
+    /// A store generated in parallel is the store generated serially.
+    /// The mocked random source is deterministic, so two runs draw the
+    /// same seeds and must produce the same files at the same paths.
+    #[test]
+    fn a_parallel_run_produces_the_same_store_as_a_serial_run() {
+        let store = |count| {
+            let (builder, ctrl) = Generator::builder_mocked("/store");
+            builder
+                .max_files(2)
+                .file_sizes(SizeChooser::fixed(PARALLEL_FILE_SIZE))
+                .jobs(count)
+                .build()
+                .generate()
+                .expect("mocked generation succeeds");
+            let files: Vec<(std::path::PathBuf, Vec<u8>)> = ctrl
+                .paths()
+                .into_iter()
+                .filter_map(|path| Some((path.clone(), ctrl.read_file(&path).ok()?)))
+                .collect();
+            files
+        };
+
+        let serial = store(NonZeroUsize::MIN);
+        let parallel = store(jobs(4));
+        assert_eq!(
+            serial.len(),
+            4,
+            "two data files, a marker, and the aggregate"
+        );
+        assert_eq!(
+            serial.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            parallel.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        );
+        assert!(serial == parallel, "parallel generation changed the bytes");
+    }
+
+    /// A write failure mid-file fails the run, leaves no temporary file
+    /// behind, and writes no chain-tip marker — the same surface a
+    /// killed process leaves, which `verify` already reports.
+    #[test]
+    fn a_write_failure_leaves_no_temporary_and_no_chain_tip() {
+        let (builder, ctrl) = Generator::builder_mocked("/store");
+        // Fail one block in the middle of the file, not the first.
+        ctrl.fail_write_at(3 * BLOCK_SIZE as u64, std::io::ErrorKind::PermissionDenied);
+
+        let err = builder
+            .max_files(1)
+            .file_sizes(SizeChooser::fixed(PARALLEL_FILE_SIZE))
+            .jobs(jobs(4))
+            .build()
+            .generate()
+            .expect_err("the injected write failure fails the run");
+        assert!(err.is_io());
+        assert!(
+            err.path().is_some_and(|path| path.starts_with("/store")),
+            "{err:?}",
+        );
+
+        let files: Vec<_> = ctrl
+            .paths()
+            .into_iter()
+            .filter(|path| ctrl.read_file(path).is_ok())
+            .collect();
+        assert!(
+            files.is_empty(),
+            "a file survived the failed run: {files:?}"
+        );
+        assert!(!ctrl.exists(Path::new("/store/.metadata/roots")));
+    }
+
+    /// A failed preallocation is the other pre-flight failure and has
+    /// the same outcome.
+    #[test]
+    fn a_failed_preallocation_fails_the_run() {
+        let (builder, ctrl) = Generator::builder_mocked("/store");
+        ctrl.fail_set_len(std::io::ErrorKind::StorageFull);
+        let err = builder
+            .max_files(1)
+            .file_sizes(SizeChooser::fixed(PARALLEL_FILE_SIZE))
+            .jobs(jobs(4))
+            .build()
+            .generate()
+            .expect_err("preallocation fails");
+        assert!(err.is_io());
+        let files: Vec<_> = ctrl
+            .paths()
+            .into_iter()
+            .filter(|path| ctrl.read_file(path).is_ok())
+            .collect();
+        assert!(
+            files.is_empty(),
+            "a file survived the failed run: {files:?}"
+        );
     }
 }

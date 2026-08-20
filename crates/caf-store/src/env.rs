@@ -10,7 +10,11 @@
 //!
 //! The abstraction is deliberately thin — one method per syscall the
 //! crate makes, with `std` types in the signatures — so the native path
-//! stays a direct call.
+//! stays a direct call. [`FileHandle`] carries the positional
+//! ([`write_all_at`](FileHandle::write_all_at)) and preallocating
+//! ([`set_len`](FileHandle::set_len)) operations parallel generation
+//! needs alongside the cursor-based [`Read`]/[`Write`] impls the
+//! sequential paths use.
 
 #[cfg(feature = "test-util")]
 pub(crate) mod mock;
@@ -279,6 +283,67 @@ impl FileHandle {
             Self::Native(file) => file.sync_all(),
             #[cfg(feature = "test-util")]
             Self::Mocked(_) => Ok(()),
+        }
+    }
+
+    /// Resizes the file to `len` bytes, zero-filling any growth.
+    ///
+    /// Used to preallocate a file whose size is known before its
+    /// content is written, so the filesystem can lay it out in one go
+    /// instead of extending it under every write.
+    pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
+        match self {
+            Self::Native(file) => file.set_len(len),
+            #[cfg(feature = "test-util")]
+            Self::Mocked(file) => file.set_len(len),
+        }
+    }
+
+    /// Writes all of `buf` at `offset`, independent of the file cursor.
+    ///
+    /// The offset travels with each call and no shared cursor moves, so
+    /// several threads may write disjoint ranges of one file through
+    /// one handle at the same time. Short writes are retried, as
+    /// [`Write::write_all`] does for the sequential path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error, or
+    /// [`io::ErrorKind::WriteZero`] if a write makes no progress.
+    pub(crate) fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let mut written = 0;
+        while written < buf.len() {
+            let chunk = &buf[written..];
+            let at = offset + written as u64;
+            match self.write_at(chunk, at) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "a positional write made no progress",
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    /// One positional write, which may be short.
+    ///
+    /// Unix has `pwrite`, which never touches the cursor. Windows'
+    /// `seek_write` moves the handle's cursor as a side effect, which is
+    /// harmless here: nothing reads the cursor of a file being written
+    /// positionally.
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Native(file) => std::os::unix::fs::FileExt::write_at(file, buf, offset),
+            #[cfg(windows)]
+            Self::Native(file) => std::os::windows::fs::FileExt::seek_write(file, buf, offset),
+            #[cfg(feature = "test-util")]
+            Self::Mocked(file) => file.write_at(buf, offset),
         }
     }
 }

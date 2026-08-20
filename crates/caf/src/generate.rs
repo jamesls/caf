@@ -3,8 +3,11 @@
 //! With no stopping option, exactly 100 files are generated. `--max-files`
 //! and `--max-disk-usage` are each checked before every file; the default
 //! file size is 4,096 bytes; sizes below the 60-byte header are clamped
-//! up by the library. `gen` prints nothing on success.
+//! up by the library. `--jobs` defaults to 1 and rejects values below
+//! one; it changes only how fast a large file is written, never what is
+//! written. `gen` prints nothing on success.
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -72,7 +75,18 @@ the parameters of the underlying normal distribution (log space), not
 byte sizes.  This example produces a median file size of e^16, which
 is roughly 8.9MB:
 
-    caf gen --file-size Type=lognormal,Mean=16,StdDev=1";
+    caf gen --file-size Type=lognormal,Mean=16,StdDev=1
+
+Writing one very large file is normally limited by the single core
+generating its content.  The --jobs option spreads that work over
+worker threads:
+
+    caf gen --max-files 1 --file-size 64MB --jobs 8
+
+The files produced are byte for byte identical at any --jobs value, so
+this only changes how long generation takes.  Small files are always
+generated on one thread: splitting pays off only once a file has at
+least two 1MB blocks per worker.";
 
 /// Arguments of `caf gen`. There are no short options.
 #[derive(Debug, clap::Args)]
@@ -105,6 +119,25 @@ pub struct Args {
         value_parser = parse_file_size
     )]
     file_size: SizeSpec,
+
+    /// Number of worker threads used to generate each file's content.
+    /// Defaults to 1 (serial generation); the files produced are
+    /// identical at any count. Only large files are split across
+    /// workers.
+    #[arg(
+        long,
+        value_name = "INTEGER",
+        default_value_t = NonZeroUsize::MIN,
+        value_parser = parse_positive
+    )]
+    jobs: NonZeroUsize,
+}
+
+/// Parses a worker count, rejecting values below one as usage errors.
+fn parse_positive(value: &str) -> Result<NonZeroUsize> {
+    value
+        .parse::<NonZeroUsize>()
+        .with_context(|| format!("{value:?} is not an integer of at least 1"))
 }
 
 /// Parses `--max-files`; negative values behave like zero.
@@ -165,6 +198,10 @@ fn generate(args: &Args) -> Result<()> {
         .chooser()
         .context("seeding the file size sampler")?;
 
-    builder.file_sizes(sizes).build().generate()?;
+    builder
+        .file_sizes(sizes)
+        .jobs(args.jobs)
+        .build()
+        .generate()?;
     Ok(())
 }

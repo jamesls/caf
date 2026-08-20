@@ -35,7 +35,7 @@ use caf_format::{
 use crate::analysis::{self, CorruptionReport, read_full};
 use crate::env::{DirEntry, Env};
 use crate::metadata::{ALL_FILE, METADATA_DIR, ROOTS_DIR};
-use crate::pipeline;
+use crate::{MAX_JOBS, pipeline};
 
 /// Default corruption-analysis chunk size in bytes.
 pub const DEFAULT_ANALYSIS_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
@@ -47,13 +47,6 @@ pub const DEFAULT_ANALYSIS_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(4096).un
 /// tells a reader nothing. [`Verifier::analysis_chunk_size`] clamps
 /// larger requests instead of attempting the allocation.
 pub const MAX_ANALYSIS_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
-
-/// Largest worker count honored by [`Verifier::jobs`].
-///
-/// A resource bound: each worker costs a thread and a block-sized read
-/// buffer, and verification saturates on I/O long before this many.
-/// Larger requests clamp to this value instead of failing to spawn.
-pub const MAX_JOBS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 /// Directories nested more than this many levels below the store root
 /// stop the walk with a structured error.

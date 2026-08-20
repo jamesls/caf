@@ -27,7 +27,13 @@ rand_distr = { workspace = true }
 # The `examples/` binaries are applications, so they report errors with
 # anyhow like the `caf` CLI does.
 anyhow = { workspace = true }
+# Depending on itself turns `test-util` on for this crate's own test
+# builds, so the mocked-filesystem tests (fault injection, parallel
+# writes) run under a plain `cargo test`, not only `--all-features`.
+caf-store = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
+# Decodes the golden vectors' hex payloads in tests.
+hex = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

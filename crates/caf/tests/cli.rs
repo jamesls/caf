@@ -566,6 +566,33 @@ fn verify_jobs_below_one_is_usage_error() {
 }
 
 #[test]
+fn gen_jobs_produces_a_verifiable_store() {
+    // 64MB is 64 one-megabyte blocks, well past the two-blocks-per-worker
+    // threshold, so `--jobs 8` really takes the parallel path. What it
+    // writes still has to be a valid chain.
+    let dir = tempdir();
+    let args = &["--max-files", "1", "--file-size", "64MB", "--jobs", "8"];
+    let output = generate(dir.path(), args);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(data_files(dir.path()).len(), 1);
+    assert_eq!(
+        fs::metadata(&data_files(dir.path())[0])
+            .expect("the data file exists")
+            .len(),
+        64 * 1024 * 1024,
+    );
+    assert_eq!(code(&verify(dir.path(), &[])), 0);
+}
+
+#[test]
+fn gen_jobs_below_one_is_usage_error() {
+    // `--jobs` rejects values below one as usage errors.
+    let dir = tempdir();
+    assert_eq!(code(&generate(dir.path(), &["--jobs", "0"])), 2);
+    assert_eq!(code(&generate(dir.path(), &["--jobs", "-1"])), 2);
+}
+
+#[test]
 fn verify_chunk_size_below_one_is_usage_error() {
     // `--chunk-size` rejects values below one.
     let dir = tempdir();

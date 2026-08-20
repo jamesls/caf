@@ -9,9 +9,9 @@
 //!   field, plus a raw diagnostic view ([`RawHeader`]) for tools that
 //!   display invalid headers.
 //! - The deterministic SHAKE-128 content stream ([`ContentReader`],
-//!   [`fill_block`]) with the [`CONTENT_DOMAIN`] domain, the shortened
-//!   block 0, and 1 MiB later blocks, independently derivable per block
-//!   index.
+//!   [`fill_block`], [`fill_block_prefix`]) with the [`CONTENT_DOMAIN`]
+//!   domain, the shortened block 0, and 1 MiB later blocks,
+//!   independently derivable per block index.
 //! - Whole-file digest primitives and hash-to-path / path-to-hash
 //!   conversion ([`hash_to_relpath`], [`parse_hash_from_path`]) for the
 //!   `aa/bb/cc/<34-character basename>` layout.
@@ -50,7 +50,7 @@ mod hex;
 mod path;
 mod seed;
 
-pub use content::{ContentReader, block_len, fill_block};
+pub use content::{ContentReader, block_len, fill_block, fill_block_prefix};
 pub use digest::{Digest, Hasher};
 pub use header::{Header, HeaderError, RawHeader};
 pub use hex::ParseHexError;

@@ -28,8 +28,11 @@ $ caf verify
 
 Both commands take `--jobs` to spread their work over worker threads.
 Generation splits a single large file across threads, and verification
-splits the store across them.  The results are identical at any value, so
-it only changes how long the command takes:
+uses one global worker budget across the store: it validates files in
+parallel and lends spare workers to positional reads and corruption
+analysis within large files. The ordered whole-file BLAKE2b digest remains
+single-threaded per file. The results are identical at any value, so the
+setting only changes how long the command takes:
 
 ```
 $ caf gen --max-files 1 --file-size 4GB --jobs 8

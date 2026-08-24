@@ -137,6 +137,66 @@ impl ContentReader {
         }
     }
 
+    /// Creates a content stream at the specified offset.
+    ///
+    /// The offset is content-relative: offset zero is the file byte at
+    /// [`HEADER_SIZE`], not the start of the header. Every `u64` offset
+    /// is supported without overflow. Locating it uses direct block
+    /// arithmetic, then discards at most one block's prefix; it never
+    /// advances through all preceding content.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Read;
+    ///
+    /// use caf_format::{ContentReader, ContentSeed};
+    ///
+    /// let seed = ContentSeed::from_hex("b42d9a6630882f79c7599ae213435f86")?;
+    /// let offset = 1_100_000_u64;
+    /// let mut whole = vec![0_u8; offset as usize + 32];
+    /// ContentReader::new(seed).read_exact(&mut whole)?;
+    ///
+    /// let mut from_offset = [0_u8; 32];
+    /// ContentReader::new_with_offset(seed, offset).read_exact(&mut from_offset)?;
+    /// assert_eq!(from_offset, whole[offset as usize..]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn new_with_offset(seed: ContentSeed, offset: u64) -> Self {
+        let first_len = block_len(0) as u64;
+        let (block_index, mut offset_in_block) = if offset < first_len {
+            (0, offset)
+        } else {
+            let after_first = offset - first_len;
+            (
+                1 + after_first / BLOCK_SIZE as u64,
+                after_first % BLOCK_SIZE as u64,
+            )
+        };
+
+        let mut reader = Self {
+            seed,
+            next_block_index: block_index,
+            block: None,
+            remaining_in_block: 0,
+        };
+        if offset_in_block != 0 {
+            let (block, _remaining) = reader.current_block();
+            let mut discard = [0_u8; 8192];
+            let mut discarded = 0_usize;
+            while offset_in_block > 0 {
+                let take_u64 = offset_in_block.min(8192);
+                let take = usize::try_from(take_u64).unwrap_or(discard.len());
+                XofReader::read(block, &mut discard[..take]);
+                discarded += take;
+                offset_in_block -= take_u64;
+            }
+            reader.remaining_in_block -= discarded;
+        }
+        reader
+    }
+
     /// Returns the seed this stream derives content from.
     #[must_use]
     pub fn seed(&self) -> ContentSeed {
@@ -204,6 +264,12 @@ mod tests {
 
     fn seed() -> ContentSeed {
         ContentSeed::from_bytes(*b"0123456789abcdef")
+    }
+
+    #[test]
+    fn content_reader_remains_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ContentReader>();
     }
 
     #[test]
@@ -281,5 +347,41 @@ mod tests {
             .read_to_end(&mut content)
             .unwrap();
         assert_eq!(content.len(), 1024);
+    }
+
+    #[test]
+    fn offset_reader_matches_a_slice_of_the_complete_stream() {
+        let first = block_len(0);
+        let offsets = [
+            0_u64,
+            1,
+            first as u64 - 1,
+            first as u64,
+            first as u64 + 1,
+            first as u64 + crate::BLOCK_SIZE as u64,
+            first as u64 + crate::BLOCK_SIZE as u64 + 17,
+        ];
+        let reference_len = usize::try_from(offsets.last().copied().unwrap()).unwrap() + 257;
+        let mut reference = vec![0_u8; reference_len];
+        ContentReader::new(seed())
+            .read_exact(&mut reference)
+            .unwrap();
+
+        for offset in offsets {
+            let mut actual = [0_u8; 257];
+            ContentReader::new_with_offset(seed(), offset)
+                .read_exact(&mut actual)
+                .unwrap();
+            let offset = usize::try_from(offset).unwrap();
+            assert_eq!(actual, reference[offset..offset + 257]);
+        }
+    }
+
+    #[test]
+    fn maximum_offset_is_supported_without_overflow() {
+        let mut actual = [0_u8; 1];
+        ContentReader::new_with_offset(seed(), u64::MAX)
+            .read_exact(&mut actual)
+            .unwrap();
     }
 }

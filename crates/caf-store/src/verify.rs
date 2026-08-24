@@ -7,25 +7,30 @@
 //! [`Header::parse`] implementation, which also rejects nonzero reserved
 //! bytes and file lengths below the header size.
 //!
-//! Clean files cost one sequential read: header parse, size check, and
-//! a whole-file BLAKE2b-160 pass. Expected content is regenerated for
+//! Clean files cost one complete read: header parse, size check, and a
+//! whole-file BLAKE2b-160 pass. Large-file groups may overlap positional
+//! reads with that ordered hash. Expected content is regenerated for
 //! [corruption analysis](crate::CorruptionReport) only after the digest
-//! or size check fails. Results are structured ([`VerificationReport`],
-//! [`Diagnostic`]); nothing here prints or renders.
+//! fails. Results are structured ([`VerificationReport`], [`Diagnostic`]);
+//! nothing here prints or renders.
 //!
-//! [`Verifier::jobs`] validates files on a bounded worker pipeline.
-//! Serial and parallel runs produce identical reports:
-//! per-file work is order-independent, and the [`pipeline`] collector
-//! folds results back in sorted file order before the store-level
-//! checks run.
+//! [`Verifier::jobs`] is a global verification-worker budget. Contended
+//! stores use the existing bounded file pipeline; when lanes outnumber
+//! unstarted files, spare lanes read and analyze segments within large
+//! files. Serial and parallel runs produce identical reports: per-file
+//! work is order-independent, and collectors fold results back in sorted
+//! file order before the store-level checks run.
 
 use std::backtrace::Backtrace;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use caf_format::{
     BLOCK_SIZE, Digest, HEADER_SIZE, Hasher, Header, HeaderError, hash_to_path,
@@ -35,7 +40,7 @@ use caf_format::{
 use crate::analysis::{self, CorruptionReport, read_full};
 use crate::env::{DirEntry, Env};
 use crate::metadata::{ALL_FILE, METADATA_DIR, ROOTS_DIR};
-use crate::{MAX_JOBS, pipeline};
+use crate::{MAX_JOBS, parallel_verify, pipeline};
 
 /// Default corruption-analysis chunk size in bytes.
 pub const DEFAULT_ANALYSIS_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
@@ -132,15 +137,17 @@ impl Verifier {
         self
     }
 
-    /// Validates files on `count` worker threads (default 1, serial).
+    /// Sets the store-wide verification worker limit.
     ///
-    /// The report is identical to a serial run: per-file validation is
-    /// order-independent, results are folded back in sorted file order
-    /// and store-level checks run after every file.
-    /// Peak memory grows with the worker count (one block-sized read
-    /// buffer per worker), never with the number of files queued. Values
-    /// above [`MAX_JOBS`] clamp to it. The CLI rejects values below one
-    /// as a usage error.
+    /// The default is one worker, which runs serially. Different files run
+    /// concurrently. When the worker budget exceeds
+    /// the remaining file count, large files receive spare workers for
+    /// positional reads and corruption analysis. The report is identical
+    /// to a serial run: results are folded back in sorted file order and
+    /// store-level checks run after every file. Peak memory grows with the
+    /// worker count, never with file size or the number of queued files.
+    /// Values above [`MAX_JOBS`] clamp to it. The CLI rejects values below
+    /// one as a usage error.
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.jobs = count.min(MAX_JOBS);
@@ -185,14 +192,15 @@ impl Verifier {
         let files = collect_data_files(&self.env, &self.root)?;
         let files_checked = files.len() as u64;
         let mut checks = StoreChecks::new(files.len());
+        let analysis_memory = analysis::AnalysisMemory::new();
 
         if self.jobs == NonZeroUsize::MIN {
             let mut buffer = vec![0_u8; BLOCK_SIZE];
             for path in files {
-                checks.absorb(self.validate_file(path, &mut buffer)?);
+                checks.absorb(self.validate_file(path, 1, &mut buffer, &analysis_memory)?);
             }
         } else {
-            self.validate_files_parallel(&files, &mut checks)?;
+            self.validate_files_parallel(&files, &mut checks, &analysis_memory)?;
         }
 
         let mut diagnostics = checks.into_diagnostics(&marker_set);
@@ -210,28 +218,131 @@ impl Verifier {
         })
     }
 
-    /// Validates `files` on [`Verifier::jobs`] worker threads, folding
-    /// outcomes into `checks` in sorted file order.
+    /// Runs the contended file pipeline, then lends all lanes across the
+    /// final set of fewer-than-`jobs` files. The prefix keeps persistent
+    /// worker buffers and performs no metadata planning, preserving the
+    /// small-file path; tail outcomes are still folded in path order.
     fn validate_files_parallel(
         &self,
         files: &[PathBuf],
         checks: &mut StoreChecks,
+        analysis_memory: &analysis::AnalysisMemory,
+    ) -> Result<(), VerifyError> {
+        let jobs = self.jobs.get();
+        let contended = parallel_verify::contended_prefix_len(files.len(), jobs);
+
+        if contended > 0 {
+            self.validate_contended_files(&files[..contended], checks, analysis_memory)?;
+        }
+        self.validate_tail_files(&files[contended..], checks, analysis_memory)
+    }
+
+    /// The existing file-level regime: fixed workers, no length planning,
+    /// and four claims of run-ahead per requested job.
+    fn validate_contended_files(
+        &self,
+        files: &[PathBuf],
+        checks: &mut StoreChecks,
+        analysis_memory: &analysis::AnalysisMemory,
     ) -> Result<(), VerifyError> {
         pipeline::run(
             files.len(),
             self.jobs,
             || {
                 let mut buffer = vec![0_u8; BLOCK_SIZE];
-                move |index: usize| self.validate_file(files[index].clone(), &mut buffer)
+                move |index: usize| {
+                    self.validate_file(files[index].clone(), 1, &mut buffer, analysis_memory)
+                }
             },
             |outcome| checks.absorb(outcome),
         )
     }
 
+    /// Plans and runs the remaining files when the free lanes outnumber
+    /// them. Planning metadata failures deliberately give that path width
+    /// one and are retried by normal validation, preserving its existing
+    /// open/metadata error and sorted-error behavior.
+    fn validate_tail_files(
+        &self,
+        files: &[PathBuf],
+        checks: &mut StoreChecks,
+        analysis_memory: &analysis::AnalysisMemory,
+    ) -> Result<(), VerifyError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let lengths: Vec<u64> = files
+            .iter()
+            .map(|path| self.env.metadata(path).map_or(0, crate::env::Metadata::len))
+            .collect();
+        let widths = parallel_verify::allocate_widths(&lengths, self.jobs.get());
+        let mut start_order: Vec<usize> = (0..files.len()).collect();
+        start_order.sort_unstable_by(|&left, &right| {
+            lengths[right]
+                .cmp(&lengths[left])
+                .then_with(|| left.cmp(&right))
+        });
+
+        let (sender, receiver) = mpsc::channel();
+        let (mut outcomes, panic_payload) = thread::scope(|scope| {
+            for index in start_order {
+                let sender = sender.clone();
+                let path = files[index].clone();
+                let width = widths[index];
+                scope.spawn(move || {
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let mut buffer = Vec::new();
+                        self.validate_file(path, width, &mut buffer, analysis_memory)
+                    }));
+                    let message = match result {
+                        Ok(result) => TailMessage::Outcome { index, result },
+                        Err(payload) => TailMessage::Panic(payload),
+                    };
+                    let _ignored = sender.send(message);
+                });
+            }
+            drop(sender);
+
+            let mut outcomes = BTreeMap::new();
+            let mut panic_payload = None;
+            for message in receiver {
+                match message {
+                    TailMessage::Outcome { index, result } => {
+                        outcomes.insert(index, result);
+                    }
+                    TailMessage::Panic(payload) => {
+                        if panic_payload.is_none() {
+                            panic_payload = Some(payload);
+                        }
+                    }
+                }
+            }
+            (outcomes, panic_payload)
+        });
+
+        if let Some(payload) = panic_payload {
+            panic::resume_unwind(payload);
+        }
+        for index in 0..files.len() {
+            checks.absorb(
+                outcomes
+                    .remove(&index)
+                    .expect("every tail group returns an outcome unless it panics")?,
+            );
+        }
+        Ok(())
+    }
+
     /// Validates one data file and returns everything it contributes to
     /// the report. Self-contained per file, so serial and parallel runs
     /// produce identical outcomes.
-    fn validate_file(&self, path: PathBuf, buffer: &mut [u8]) -> Result<FileOutcome, VerifyError> {
+    fn validate_file(
+        &self,
+        path: PathBuf,
+        width: usize,
+        buffer: &mut Vec<u8>,
+        analysis_memory: &analysis::AnalysisMemory,
+    ) -> Result<FileOutcome, VerifyError> {
         let mut diagnostics = Vec::new();
         let Ok(digest_from_path) = parse_hash_from_path(&path) else {
             diagnostics.push(Diagnostic::InvalidPathLayout { path: path.clone() });
@@ -283,16 +394,35 @@ impl Verifier {
             });
         }
 
-        // The clean fast path: one sequential read through BLAKE2b-160.
-        let actual_digest = hash_whole_file(&mut file, &header_bytes[..header_len], buffer)
-            .map_err(|source| VerifyError::io("reading a data file", &path, source))?;
+        // Reapply the cap to the opened file's size. Planning metadata
+        // normally matches it, but this keeps a failed/stale planning
+        // read from ever creating more lanes than the crossover allows.
+        let width = width.min(parallel_verify::width_cap(actual_size));
+        let parallel = width >= 2;
+        let actual_digest = if parallel {
+            parallel_verify::hash_file(&file, &header_bytes[..header_len], actual_size, width)
+        } else {
+            if buffer.is_empty() {
+                buffer.resize(BLOCK_SIZE, 0);
+            }
+            hash_whole_file(&mut file, &header_bytes[..header_len], buffer)
+        }
+        .map_err(|source| VerifyError::io("reading a data file", &path, source))?;
 
         if actual_digest != digest_from_path {
-            let regions =
+            let regions = if parallel {
+                analysis::analyze_parallel(
+                    &file,
+                    &header,
+                    actual_size,
+                    self.analysis_chunk_size,
+                    width,
+                    analysis_memory,
+                )
+            } else {
                 analysis::analyze(&mut file, &header, actual_size, self.analysis_chunk_size)
-                    .map_err(|source| {
-                        VerifyError::io("analyzing a corrupted file", &path, source)
-                    })?;
+            }
+            .map_err(|source| VerifyError::io("analyzing a corrupted file", &path, source))?;
             diagnostics.push(Diagnostic::DigestMismatch {
                 report: CorruptionReport {
                     path: path.clone(),
@@ -382,6 +512,14 @@ impl Verifier {
         }
         Ok(())
     }
+}
+
+enum TailMessage {
+    Outcome {
+        index: usize,
+        result: Result<FileOutcome, VerifyError>,
+    },
+    Panic(Box<dyn std::any::Any + Send>),
 }
 
 /// What one data file contributed to the store-level checks.

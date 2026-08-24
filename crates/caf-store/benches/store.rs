@@ -11,12 +11,13 @@
 //!   full-scale numbers come from `examples/verify.rs`.
 //! - `verify/1000x4KiB-jobsN`: the parallel pipeline over the
 //!   same store at several worker counts.
-//! - `verify/8x8MiB`: clean sequential verification byte throughput.
-//! - `verify/8x8MiB-jobsN` — parallel byte throughput (one worker per
-//!   file at most; the store has eight files).
-//! - `verify/corrupt-8MiB` — the corruption-analysis path (SHAKE
-//!   regeneration plus chunk comparison at the default 4,096-byte
-//!   analysis chunk size).
+//! - `verify/1x64MiB-jobsN`: one clean large file, exercising positional
+//!   readers feeding one ordered digest.
+//! - `verify/5x32MiB-jobsN`: spare-lane allocation across a small set of
+//!   equal large files.
+//! - `verify/corrupt-{start,middle,end}-32MiB-jobsN` — the
+//!   corruption-analysis path (SHAKE regeneration plus chunk comparison
+//!   at the default 4,096-byte analysis chunk size).
 //!
 //! Each generation iteration writes into a fresh temporary store on the
 //! same filesystem; teardown happens outside the timed section.
@@ -29,7 +30,7 @@
 )]
 
 use std::hint::black_box;
-use std::io::{Seek as _, SeekFrom, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroUsize;
 
 use caf_store::{Generator, SizeChooser, SizeSpec, Verifier};
@@ -81,6 +82,7 @@ fn generation(c: &mut Criterion) {
 fn verification(c: &mut Criterion) {
     let mut group = c.benchmark_group("verify");
     group.sample_size(10);
+    let worker_counts = verification_worker_counts();
 
     let small = tempfile::tempdir().expect("create temp store");
     Generator::builder(small.path())
@@ -112,27 +114,18 @@ fn verification(c: &mut Criterion) {
         });
     }
 
-    let large = tempfile::tempdir().expect("create temp store");
-    Generator::builder(large.path())
-        .max_files(8)
-        .file_sizes(SizeChooser::fixed(8 * 1024 * 1024))
+    let one_large = tempfile::tempdir().expect("create temp store");
+    Generator::builder(one_large.path())
+        .max_files(1)
+        .file_sizes(SizeChooser::fixed(64 * 1024 * 1024))
         .build()
         .generate()
         .expect("generation succeeds");
-    group.throughput(Throughput::Bytes(8 * 8 * 1024 * 1024));
-    group.bench_function("8x8MiB", |b| {
-        b.iter(|| {
-            let report = Verifier::new(large.path())
-                .verify()
-                .expect("verification runs");
-            assert!(report.success());
-            black_box(report)
-        });
-    });
-    for jobs in [2, 4] {
-        group.bench_function(format!("8x8MiB-jobs{jobs}"), |b| {
+    group.throughput(Throughput::Bytes(64 * 1024 * 1024));
+    for &jobs in &worker_counts {
+        group.bench_function(format!("1x64MiB-jobs{jobs}"), |b| {
             b.iter(|| {
-                let report = Verifier::new(large.path())
+                let report = Verifier::new(one_large.path())
                     .jobs(NonZeroUsize::new(jobs).expect("the bench worker counts are positive"))
                     .verify()
                     .expect("verification runs");
@@ -142,34 +135,68 @@ fn verification(c: &mut Criterion) {
         });
     }
 
-    // One 8 MiB file with a corrupted byte in every megabyte: measures
-    // the analysis path (full SHAKE regeneration plus chunked
-    // comparison) at the default 4,096-byte analysis chunk size.
-    let corrupt = tempfile::tempdir().expect("create temp store");
-    Generator::builder(corrupt.path())
-        .max_files(1)
-        .file_sizes(SizeChooser::fixed(8 * 1024 * 1024))
+    let five_large = tempfile::tempdir().expect("create temp store");
+    Generator::builder(five_large.path())
+        .max_files(5)
+        .file_sizes(SizeChooser::fixed(32 * 1024 * 1024))
         .build()
         .generate()
         .expect("generation succeeds");
-    corrupt_every_mebibyte(corrupt.path());
-    group.throughput(Throughput::Bytes(8 * 1024 * 1024));
-    group.bench_function("corrupt-8MiB", |b| {
-        b.iter(|| {
-            let report = Verifier::new(corrupt.path())
-                .verify()
-                .expect("verification runs");
-            assert!(!report.success());
-            black_box(report)
+    group.throughput(Throughput::Bytes(5 * 32 * 1024 * 1024));
+    for &jobs in &worker_counts {
+        group.bench_function(format!("5x32MiB-jobs{jobs}"), |b| {
+            b.iter(|| {
+                let report = Verifier::new(five_large.path())
+                    .jobs(NonZeroUsize::new(jobs).expect("the bench worker counts are positive"))
+                    .verify()
+                    .expect("verification runs");
+                assert!(report.success());
+                black_box(report)
+            });
         });
-    });
+    }
+
+    // Damage near the start, middle, and end all trigger a full digest
+    // followed by expected-content regeneration. Keeping them separate
+    // catches any accidental dependence on the mismatch's position.
+    group.throughput(Throughput::Bytes(32 * 1024 * 1024));
+    for (position, offset) in [
+        ("start", 512 * 1024_u64),
+        ("middle", 16 * 1024 * 1024_u64),
+        ("end", 32 * 1024 * 1024_u64 - 512 * 1024),
+    ] {
+        let corrupt = corrupted_store(offset);
+        for &jobs in &worker_counts {
+            group.bench_function(format!("corrupt-{position}-32MiB-jobs{jobs}"), |b| {
+                b.iter(|| {
+                    let report = Verifier::new(corrupt.path())
+                        .jobs(
+                            NonZeroUsize::new(jobs).expect("the bench worker counts are positive"),
+                        )
+                        .verify()
+                        .expect("verification runs");
+                    assert!(!report.success());
+                    black_box(report)
+                });
+            });
+        }
+    }
 
     group.finish();
 }
 
-/// Flips one byte at every 1 MiB boundary (offset by half a block so
-/// block 0's shortened length does not matter) of the store's only file.
-fn corrupt_every_mebibyte(store: &std::path::Path) {
+fn verification_worker_counts() -> Vec<usize> {
+    let mut counts = vec![1, 2, 4, 8, 16];
+    if let Ok(logical) = std::thread::available_parallelism() {
+        counts.push(logical.get().min(caf_store::MAX_JOBS.get()));
+    }
+    counts.sort_unstable();
+    counts.dedup();
+    counts
+}
+
+/// Builds a 32 MiB one-file store and flips one byte at `offset`.
+fn corrupted_store(offset: u64) -> tempfile::TempDir {
     fn find_file(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("store directories are readable") {
             let path = entry.expect("directory entries are readable").path();
@@ -183,20 +210,31 @@ fn corrupt_every_mebibyte(store: &std::path::Path) {
             }
         }
     }
+
+    let store = tempfile::tempdir().expect("create temp store");
+    Generator::builder(store.path())
+        .max_files(1)
+        .file_sizes(SizeChooser::fixed(32 * 1024 * 1024))
+        .build()
+        .generate()
+        .expect("generation succeeds");
     let mut files = Vec::new();
-    find_file(store, &mut files);
+    find_file(store.path(), &mut files);
     let [path] = &*files else {
         panic!("expected exactly one data file");
     };
     let mut file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(path)
         .expect("data files are writable");
-    for mib in 0..8_u64 {
-        file.seek(SeekFrom::Start(mib * 1024 * 1024 + 512 * 1024))
-            .expect("seek succeeds");
-        file.write_all(&[0xFF]).expect("write succeeds");
-    }
+    file.seek(SeekFrom::Start(offset)).expect("seek succeeds");
+    let mut byte = [0_u8];
+    file.read_exact(&mut byte).expect("the byte is readable");
+    byte[0] ^= 0xFF;
+    file.seek(SeekFrom::Start(offset)).expect("seek succeeds");
+    file.write_all(&byte).expect("write succeeds");
+    store
 }
 
 fn size_selection(c: &mut Criterion) {

@@ -8,10 +8,11 @@
 //! modeled; nothing in generation or verification depends on them beyond
 //! the symlink rules of the walk, which a mocked store never exercises.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use super::{DirEntry, FileType, Metadata};
 
@@ -63,7 +64,23 @@ struct MockState {
     /// Positional writes whose byte range covers one of these offsets
     /// fail; see [`MockCtrl::fail_write_at`].
     write_failures: BTreeMap<u64, io::ErrorKind>,
+    /// Positional reads whose requested byte range covers one of these
+    /// offsets fail; see [`MockCtrl::fail_read_at`].
+    read_failures: BTreeMap<u64, io::ErrorKind>,
+    /// Positional reads covering one of these offsets pause before they
+    /// complete, allowing tests to scramble segment completion order.
+    read_delays: BTreeMap<u64, Duration>,
+    /// Positional reads covering one of these offsets panic.
+    read_panics: BTreeSet<u64>,
+    /// One-shot behavior for the next positional reads.
+    read_actions: VecDeque<ReadAction>,
     set_len_failure: Option<io::ErrorKind>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReadAction {
+    Interrupt,
+    Limit(usize),
 }
 
 #[derive(Debug)]
@@ -84,6 +101,10 @@ impl MockCtrl {
                 random_failure: None,
                 failures: BTreeMap::new(),
                 write_failures: BTreeMap::new(),
+                read_failures: BTreeMap::new(),
+                read_delays: BTreeMap::new(),
+                read_panics: BTreeSet::new(),
+                read_actions: VecDeque::new(),
                 set_len_failure: None,
             })),
         }
@@ -214,6 +235,38 @@ impl MockCtrl {
         self.lock().write_failures.insert(offset, kind);
     }
 
+    /// Fails positional reads covering `offset` with `kind`.
+    pub fn fail_read_at(&self, offset: u64, kind: io::ErrorKind) {
+        self.lock().read_failures.insert(offset, kind);
+    }
+
+    /// Delays positional reads covering `offset` by `duration`.
+    pub fn delay_read_at(&self, offset: u64, duration: Duration) {
+        self.lock().read_delays.insert(offset, duration);
+    }
+
+    /// Panics during positional reads covering `offset`.
+    ///
+    /// This exercises worker-panic cancellation and propagation.
+    pub fn panic_read_at(&self, offset: u64) {
+        self.lock().read_panics.insert(offset);
+    }
+
+    /// Makes the next positional read return an interrupted error.
+    ///
+    /// [`super::FileHandle::read_full_at`] retries it, which lets tests
+    /// exercise the platform-independent retry contract.
+    pub fn interrupt_next_read_at(&self) {
+        self.lock().read_actions.push_back(ReadAction::Interrupt);
+    }
+
+    /// Limits the next positional read to at most `bytes`.
+    ///
+    /// This simulates a successful short read. A zero limit simulates EOF.
+    pub fn limit_next_read_at(&self, bytes: usize) {
+        self.lock().read_actions.push_back(ReadAction::Limit(bytes));
+    }
+
     /// Makes every later file resize fail with `kind`.
     pub fn fail_set_len(&self, kind: io::ErrorKind) {
         self.lock().set_len_failure = Some(kind);
@@ -225,6 +278,10 @@ impl MockCtrl {
         state.failures.clear();
         state.random_failure = None;
         state.write_failures.clear();
+        state.read_failures.clear();
+        state.read_delays.clear();
+        state.read_panics.clear();
+        state.read_actions.clear();
         state.set_len_failure = None;
     }
 
@@ -382,6 +439,29 @@ impl MockState {
             .map(|(_offset, kind)| *kind)
     }
 
+    /// The failure injected for a read requesting
+    /// `[offset, offset+len)`, if any offset in that range has one.
+    fn read_failure_in(&self, offset: u64, len: u64) -> Option<io::ErrorKind> {
+        self.read_failures
+            .range(offset..offset.saturating_add(len))
+            .next()
+            .map(|(_offset, kind)| *kind)
+    }
+
+    fn read_delay_in(&self, offset: u64, len: u64) -> Option<Duration> {
+        self.read_delays
+            .range(offset..offset.saturating_add(len))
+            .next()
+            .map(|(_offset, duration)| *duration)
+    }
+
+    fn read_panics_in(&self, offset: u64, len: u64) -> bool {
+        self.read_panics
+            .range(offset..offset.saturating_add(len))
+            .next()
+            .is_some()
+    }
+
     /// `SplitMix64` over a run-local counter: distinct, reproducible bytes
     /// with no operating-system call.
     fn next_random_byte(&mut self) -> u8 {
@@ -414,6 +494,13 @@ pub(crate) struct MockFile {
     data: Arc<Mutex<Vec<u8>>>,
     position: u64,
     writable: bool,
+    activity: Mutex<IoActivity>,
+}
+
+#[derive(Debug, Default)]
+struct IoActivity {
+    cursor: bool,
+    positional: usize,
 }
 
 impl MockFile {
@@ -424,6 +511,7 @@ impl MockFile {
             data,
             position: 0,
             writable,
+            activity: Mutex::new(IoActivity::default()),
         }
     }
 
@@ -456,6 +544,7 @@ impl MockFile {
     /// behind their own lock, so disjoint ranges can be written through
     /// one handle from several threads.
     pub(crate) fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        let _activity = ActivityGuard::positional(&self.activity);
         {
             let state = self.ctrl.lock();
             state.check_failure(&self.path)?;
@@ -478,6 +567,50 @@ impl MockFile {
         Ok(buf.len())
     }
 
+    /// Reads `buf` at `offset` without changing the cursor.
+    pub(crate) fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let _activity = ActivityGuard::positional(&self.activity);
+        let (limit, failure, panics, delay) = {
+            let mut state = self.ctrl.lock();
+            state.check_failure(&self.path)?;
+            let failure = state.read_failure_in(offset, buf.len() as u64);
+            let panics = state.read_panics_in(offset, buf.len() as u64);
+            let delay = state.read_delay_in(offset, buf.len() as u64);
+            let limit = match state.read_actions.pop_front() {
+                Some(ReadAction::Interrupt) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the mocked positional read was interrupted",
+                    ));
+                }
+                Some(ReadAction::Limit(bytes)) => bytes,
+                None => usize::MAX,
+            };
+            (limit, failure, panics, delay)
+        };
+        if let Some(duration) = delay {
+            std::thread::sleep(duration);
+        }
+        assert!(!panics, "the mocked positional read panicked");
+        if let Some(kind) = failure {
+            return Err(io::Error::new(
+                kind,
+                format!("the mocked read at offset {offset} failed"),
+            ));
+        }
+
+        let data = lock(&self.data);
+        let Ok(start) = usize::try_from(offset) else {
+            return Ok(0);
+        };
+        if start >= data.len() || limit == 0 {
+            return Ok(0);
+        }
+        let take = buf.len().min(data.len() - start).min(limit);
+        buf[..take].copy_from_slice(&data[start..start + take]);
+        Ok(take)
+    }
+
     fn check_writable(&self) -> io::Result<()> {
         if self.writable {
             Ok(())
@@ -492,6 +625,7 @@ impl MockFile {
 
 impl Read for MockFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let _activity = ActivityGuard::cursor(&self.activity);
         let data = lock(&self.data);
         let Ok(start) = usize::try_from(self.position) else {
             return Ok(0);
@@ -509,6 +643,7 @@ impl Read for MockFile {
 
 impl Write for MockFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _activity = ActivityGuard::cursor(&self.activity);
         self.check_writable()?;
         let mut data = lock(&self.data);
         let start = usize::try_from(self.position)
@@ -533,6 +668,7 @@ impl Write for MockFile {
 
 impl Seek for MockFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let _activity = ActivityGuard::cursor(&self.activity);
         let length = length_of(&self.data);
         let (base, offset) = match pos {
             SeekFrom::Start(absolute) => {
@@ -547,6 +683,57 @@ impl Seek for MockFile {
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         self.position = target;
         Ok(target)
+    }
+}
+
+/// Asserts that cursor-based and positional operations never overlap on
+/// one mocked handle. Multiple positional readers are intentionally
+/// allowed; the Windows implementation moves the cursor, so the
+/// verifier must complete cursor I/O before starting them.
+struct ActivityGuard<'a> {
+    activity: &'a Mutex<IoActivity>,
+    cursor: bool,
+}
+
+impl<'a> ActivityGuard<'a> {
+    fn cursor(activity: &'a Mutex<IoActivity>) -> Self {
+        let mut state = activity.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            state.positional, 0,
+            "cursor-based and positional file I/O overlapped"
+        );
+        assert!(!state.cursor, "cursor-based file I/O overlapped itself");
+        state.cursor = true;
+        drop(state);
+        Self {
+            activity,
+            cursor: true,
+        }
+    }
+
+    fn positional(activity: &'a Mutex<IoActivity>) -> Self {
+        let mut state = activity.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !state.cursor,
+            "cursor-based and positional file I/O overlapped"
+        );
+        state.positional += 1;
+        drop(state);
+        Self {
+            activity,
+            cursor: false,
+        }
+    }
+}
+
+impl Drop for ActivityGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.activity.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cursor {
+            state.cursor = false;
+        } else {
+            state.positional -= 1;
+        }
     }
 }
 

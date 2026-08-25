@@ -4,15 +4,16 @@
 //! `.metadata` directory that is a direct child of the store root is
 //! skipped. Directory symlinks are not followed, while file symlinks are.
 //! Header validation uses the shared
-//! [`Header::parse`] implementation, which also rejects nonzero reserved
-//! bytes and file lengths below the header size.
+//! [`Header::parse`] implementation, which validates version dispatch,
+//! the format-specific checksum and descriptor, and the minimum length.
 //!
 //! Clean files cost one complete read: header parse, size check, and a
-//! whole-file BLAKE2b-160 pass. Large-file groups may overlap positional
-//! reads with that ordered hash. Expected content is regenerated for
-//! [corruption analysis](crate::CorruptionReport) only after the digest
-//! fails. Results are structured ([`VerificationReport`], [`Diagnostic`]);
-//! nothing here prints or renders.
+//! version-specific identity pass. CAF v2 uses ordered BLAKE2b-160; CAF v3
+//! computes physical-block Merkle leaves and checks canonical content in the
+//! same pass. Expected v2 content is regenerated for
+//! [corruption analysis](crate::CorruptionReport) only after its digest fails.
+//! Results are structured ([`VerificationReport`], [`Diagnostic`]); nothing
+//! here prints or renders.
 //!
 //! [`Verifier::jobs`] is a global verification-worker budget. Contended
 //! stores use the existing bounded file pipeline; when lanes outnumber
@@ -22,7 +23,7 @@
 //! file order before the store-level checks run.
 
 use std::backtrace::Backtrace;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read};
@@ -33,12 +34,12 @@ use std::sync::mpsc;
 use std::thread;
 
 use caf_format::{
-    BLOCK_SIZE, Digest, HEADER_SIZE, Hasher, Header, HeaderError, hash_to_path,
-    parse_hash_from_path,
+    BLOCK_SIZE, Digest, Format, HEADER_SIZE, Hasher, Header, HeaderError, MetadataDigest,
+    MetadataHasher, hash_to_path, parse_hash_from_path,
 };
 
 use crate::analysis::{self, CorruptionReport, read_full};
-use crate::env::{DirEntry, Env};
+use crate::env::{DirEntry, Env, FileHandle};
 use crate::metadata::{ALL_FILE, METADATA_DIR, ROOTS_DIR};
 use crate::{MAX_JOBS, parallel_verify, pipeline};
 
@@ -145,9 +146,10 @@ impl Verifier {
     /// positional reads and corruption analysis. The report is identical
     /// to a serial run: results are folded back in sorted file order and
     /// store-level checks run after every file. Peak memory grows with the
-    /// worker count, never with file size or the number of queued files.
-    /// Values above [`MAX_JOBS`] clamp to it. The CLI rejects values below
-    /// one as a usage error.
+    /// worker count and, for v3, with the transient 32-byte Merkle leaf
+    /// stored for each 1 MiB file block. It does not grow with the number
+    /// of queued files. Values above [`MAX_JOBS`] clamp to it. The CLI
+    /// rejects values below one as a usage error.
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.jobs = count.min(MAX_JOBS);
@@ -195,15 +197,15 @@ impl Verifier {
         let analysis_memory = analysis::AnalysisMemory::new();
 
         if self.jobs == NonZeroUsize::MIN {
-            let mut buffer = vec![0_u8; BLOCK_SIZE];
+            let mut scratch = parallel_verify::ScanBuffers::new();
             for path in files {
-                checks.absorb(self.validate_file(path, 1, &mut buffer, &analysis_memory)?);
+                checks.absorb(self.validate_file(path, 1, &mut scratch, &analysis_memory)?);
             }
         } else {
             self.validate_files_parallel(&files, &mut checks, &analysis_memory)?;
         }
 
-        let mut diagnostics = checks.into_diagnostics(&marker_set);
+        let mut diagnostics = checks.into_diagnostics(&marker_set, &self.root);
         self.check_roots_aggregate(root_markers, &mut diagnostics)?;
 
         Ok(VerificationReport {
@@ -249,9 +251,9 @@ impl Verifier {
             files.len(),
             self.jobs,
             || {
-                let mut buffer = vec![0_u8; BLOCK_SIZE];
+                let mut scratch = parallel_verify::ScanBuffers::new();
                 move |index: usize| {
-                    self.validate_file(files[index].clone(), 1, &mut buffer, analysis_memory)
+                    self.validate_file(files[index].clone(), 1, &mut scratch, analysis_memory)
                 }
             },
             |outcome| checks.absorb(outcome),
@@ -291,8 +293,8 @@ impl Verifier {
                 let width = widths[index];
                 scope.spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mut buffer = Vec::new();
-                        self.validate_file(path, width, &mut buffer, analysis_memory)
+                        let mut scratch = parallel_verify::ScanBuffers::new();
+                        self.validate_file(path, width, &mut scratch, analysis_memory)
                     }));
                     let message = match result {
                         Ok(result) => TailMessage::Outcome { index, result },
@@ -340,7 +342,7 @@ impl Verifier {
         &self,
         path: PathBuf,
         width: usize,
-        buffer: &mut Vec<u8>,
+        scratch: &mut parallel_verify::ScanBuffers,
         analysis_memory: &analysis::AnalysisMemory,
     ) -> Result<FileOutcome, VerifyError> {
         let mut diagnostics = Vec::new();
@@ -351,6 +353,7 @@ impl Verifier {
                     path,
                     digest: None,
                     parent: None,
+                    format: None,
                 },
                 diagnostics,
             });
@@ -380,6 +383,7 @@ impl Verifier {
                         path,
                         digest: Some(digest_from_path),
                         parent: None,
+                        format: None,
                     },
                     diagnostics,
                 });
@@ -398,34 +402,30 @@ impl Verifier {
         // normally matches it, but this keeps a failed/stale planning
         // read from ever creating more lanes than the crossover allows.
         let width = width.min(parallel_verify::width_cap(actual_size));
-        let parallel = width >= 2;
-        let actual_digest = if parallel {
-            parallel_verify::hash_file(&file, &header_bytes[..header_len], actual_size, width)
-        } else {
-            if buffer.is_empty() {
-                buffer.resize(BLOCK_SIZE, 0);
-            }
-            hash_whole_file(&mut file, &header_bytes[..header_len], buffer)
-        }
+        let (actual_digest, content_matches) = hash_validated_file(
+            &mut file,
+            &header,
+            &header_bytes[..header_len],
+            actual_size,
+            width,
+            scratch,
+        )
         .map_err(|source| VerifyError::io("reading a data file", &path, source))?;
 
-        if actual_digest != digest_from_path {
-            let regions = if parallel {
-                analysis::analyze_parallel(
-                    &file,
-                    &header,
-                    actual_size,
-                    self.analysis_chunk_size,
-                    width,
-                    analysis_memory,
-                )
-            } else {
-                analysis::analyze(&mut file, &header, actual_size, self.analysis_chunk_size)
-            }
+        if actual_digest != digest_from_path || !content_matches {
+            let regions = analyze_mismatch(
+                &mut file,
+                &header,
+                actual_size,
+                self.analysis_chunk_size,
+                width,
+                analysis_memory,
+            )
             .map_err(|source| VerifyError::io("analyzing a corrupted file", &path, source))?;
             diagnostics.push(Diagnostic::DigestMismatch {
                 report: CorruptionReport {
                     path: path.clone(),
+                    format: header.format(),
                     expected: digest_from_path,
                     actual: actual_digest,
                     actual_size,
@@ -449,6 +449,7 @@ impl Verifier {
                 path,
                 digest: Some(digest_from_path),
                 parent,
+                format: Some(header.format()),
             },
             diagnostics,
         })
@@ -493,7 +494,7 @@ impl Verifier {
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Result<(), VerifyError> {
         root_markers.sort_unstable();
-        let mut hasher = Hasher::new();
+        let mut hasher = MetadataHasher::new();
         for name in &root_markers {
             hasher.update(name.as_encoded_bytes());
         }
@@ -514,6 +515,52 @@ impl Verifier {
     }
 }
 
+/// Computes the version-specific identity and strict-content result.
+fn hash_validated_file(
+    file: &mut FileHandle,
+    header: &Header,
+    header_bytes: &[u8],
+    actual_size: u64,
+    width: usize,
+    scratch: &mut parallel_verify::ScanBuffers,
+) -> io::Result<(Digest, bool)> {
+    match header.format() {
+        Format::V2 => {
+            let digest = if width >= 2 {
+                parallel_verify::hash_file(file, header_bytes, actual_size, width)
+            } else {
+                // A previous v3 file may have left the block buffer
+                // shorter; whole-file reads want the full block.
+                if scratch.block.len() < BLOCK_SIZE {
+                    scratch.block.resize(BLOCK_SIZE, 0);
+                }
+                hash_whole_file(file, header_bytes, &mut scratch.block)
+            }?;
+            Ok((digest, true))
+        }
+        Format::V3 => {
+            let result =
+                parallel_verify::hash_v3_file(file, header, actual_size, width.max(1), scratch)?;
+            Ok((result.digest, result.content_matches))
+        }
+    }
+}
+
+fn analyze_mismatch(
+    file: &mut FileHandle,
+    header: &Header,
+    actual_size: u64,
+    chunk_size: NonZeroUsize,
+    width: usize,
+    memory: &analysis::AnalysisMemory,
+) -> io::Result<Vec<analysis::CorruptionRegion>> {
+    if width >= 2 {
+        analysis::analyze_parallel(file, header, actual_size, chunk_size, width, memory)
+    } else {
+        analysis::analyze(file, header, actual_size, chunk_size)
+    }
+}
+
 enum TailMessage {
     Outcome {
         index: usize,
@@ -529,6 +576,8 @@ struct FileRecord {
     digest: Option<Digest>,
     /// The parent link from a validated non-root header.
     parent: Option<Digest>,
+    /// Parsed format of this file, absent when its header is invalid.
+    format: Option<Format>,
 }
 
 /// Everything one file's validation contributes to the report: its
@@ -541,37 +590,47 @@ struct FileOutcome {
 /// Folds per-file outcomes, absorbed in sorted file order, into the
 /// store-level state shared by the serial and parallel paths.
 struct StoreChecks {
-    diagnostics: Vec<Diagnostic>,
     referenced: HashSet<Digest>,
-    records: Vec<FileRecord>,
+    outcomes: Vec<FileOutcome>,
 }
 
 impl StoreChecks {
     fn new(file_count: usize) -> Self {
         Self {
-            diagnostics: Vec::new(),
             referenced: HashSet::new(),
-            records: Vec::with_capacity(file_count),
+            outcomes: Vec::with_capacity(file_count),
         }
     }
 
     /// Absorbs one file's outcome; call in sorted file order.
     fn absorb(&mut self, outcome: FileOutcome) {
-        self.diagnostics.extend(outcome.diagnostics);
         if let Some(parent) = outcome.record.parent {
             self.referenced.insert(parent);
         }
-        self.records.push(outcome.record);
+        self.outcomes.push(outcome);
     }
 
-    /// Runs the orphan check and returns the accumulated diagnostics.
+    /// Runs the store-level checks and returns all diagnostics.
     ///
-    /// A file is orphaned when nothing references it and it is not a
-    /// chain tip. Files outside the layout have no digest and are
-    /// always orphans. Marker names are compared as exact lowercase hex.
-    fn into_diagnostics(self, marker_set: &HashSet<&OsString>) -> Vec<Diagnostic> {
-        let mut diagnostics = self.diagnostics;
-        for record in self.records {
+    /// Each file's chain-format finding joins its own diagnostics, so
+    /// per-file findings stay in sorted path order; orphan findings
+    /// follow in the same order. A file is orphaned when nothing
+    /// references it and it is not a chain tip. Files outside the
+    /// layout have no digest and are always orphans. Marker names are
+    /// compared as exact lowercase hex.
+    fn into_diagnostics(
+        mut self,
+        marker_set: &HashSet<&OsString>,
+        store_root: &Path,
+    ) -> Vec<Diagnostic> {
+        let chain_findings = self.chain_format_findings(store_root);
+        let mut diagnostics = Vec::new();
+        for (outcome, finding) in self.outcomes.iter_mut().zip(chain_findings) {
+            diagnostics.append(&mut outcome.diagnostics);
+            diagnostics.extend(finding);
+        }
+        for outcome in self.outcomes {
+            let record = outcome.record;
             let is_referenced = match record.digest {
                 Some(digest) => {
                     self.referenced.contains(&digest)
@@ -584,6 +643,37 @@ impl StoreChecks {
             }
         }
         diagnostics
+    }
+
+    /// Computes each file's cross-version parent finding, index-aligned
+    /// with the outcomes.
+    ///
+    /// The parent's format comes from the record whose path is the
+    /// linked digest's canonical store path — the same file the
+    /// missing-parent check resolves — so another accepted path that
+    /// decodes to the same digest can never stand in for the parent.
+    fn chain_format_findings(&self, store_root: &Path) -> Vec<Option<Diagnostic>> {
+        let formats: HashMap<&Path, Format> = self
+            .outcomes
+            .iter()
+            .filter_map(|outcome| Some((outcome.record.path.as_path(), outcome.record.format?)))
+            .collect();
+        self.outcomes
+            .iter()
+            .map(|outcome| {
+                let record = &outcome.record;
+                let (parent, child_format) = (record.parent?, record.format?);
+                let parent_path = hash_to_path(store_root, parent);
+                let parent_format = *formats.get(parent_path.as_path())?;
+                (child_format != parent_format).then(|| Diagnostic::ChainFormatMismatch {
+                    path: record.path.clone(),
+                    parent,
+                    parent_path,
+                    child_format,
+                    parent_format,
+                })
+            })
+            .collect()
     }
 }
 
@@ -713,8 +803,8 @@ pub enum Diagnostic {
         path: PathBuf,
     },
     /// The 60-byte header failed validation; the file cannot be
-    /// checked further (severity `CORRUPTION`). Includes nonzero
-    /// reserved bytes and file lengths below the header size.
+    /// checked further (severity `CORRUPTION`). Includes unknown or
+    /// unsupported descriptors and file lengths below the header size.
     InvalidHeader {
         /// The offending file.
         path: PathBuf,
@@ -731,8 +821,9 @@ pub enum Diagnostic {
         /// The size on disk.
         actual: u64,
     },
-    /// The whole-file digest does not match the path (severity
-    /// `CORRUPTION`); carries the full corruption analysis.
+    /// The version-specific file identity does not match the path, or v3
+    /// content is noncanonical (severity `CORRUPTION`); carries the full
+    /// corruption analysis.
     DigestMismatch {
         /// The corruption analysis for the file.
         report: CorruptionReport,
@@ -746,6 +837,21 @@ pub enum Diagnostic {
         parent: Digest,
         /// Where the parent would live in this store.
         parent_path: PathBuf,
+    },
+    /// A child and its resolved parent use different CAF versions
+    /// (severity `ERROR`). Stores may contain both versions, but one
+    /// chain must be homogeneous.
+    ChainFormatMismatch {
+        /// The child file containing the invalid link.
+        path: PathBuf,
+        /// The parent identifier stored in the child header.
+        parent: Digest,
+        /// The resolved parent path.
+        parent_path: PathBuf,
+        /// Format parsed from the child header.
+        child_format: Format,
+        /// Format parsed from the parent header.
+        parent_format: Format,
     },
     /// No file references this file and it is not a chain tip
     /// (severity `ORPHAN`).
@@ -761,7 +867,7 @@ pub enum Diagnostic {
         /// The bytes stored in the aggregate file.
         stored: Vec<u8>,
         /// The digest recomputed from the marker names.
-        computed: Digest,
+        computed: MetadataDigest,
     },
 }
 
@@ -770,7 +876,7 @@ impl Diagnostic {
     #[must_use]
     pub fn severity(&self) -> Severity {
         match self {
-            Self::InvalidPathLayout { .. } => Severity::Error,
+            Self::InvalidPathLayout { .. } | Self::ChainFormatMismatch { .. } => Severity::Error,
             Self::InvalidHeader { .. }
             | Self::SizeMismatch { .. }
             | Self::DigestMismatch { .. }
@@ -788,6 +894,7 @@ impl Diagnostic {
             | Self::InvalidHeader { path, .. }
             | Self::SizeMismatch { path, .. }
             | Self::MissingParent { path, .. }
+            | Self::ChainFormatMismatch { path, .. }
             | Self::OrphanedFile { path }
             | Self::RootsMismatch { path, .. } => path,
             Self::DigestMismatch { report } => report.path(),

@@ -1,12 +1,13 @@
 //! Corruption analysis: regeneration, pattern classification, merging.
 //!
-//! When a file's whole-file digest does not match its path, the verifier
-//! regenerates the expected content from the header's seed and compares
-//! it in `analysis_chunk_size` chunks. Differing chunks become
-//! [`CorruptionRegion`]s, contiguous regions with an identical pattern
+//! When a file's identity does not match its path, or v3 content is not
+//! canonical, the verifier regenerates the expected content from the
+//! header's seed and compares it in `analysis_chunk_size` chunks. Differing
+//! chunks become [`CorruptionRegion`]s, contiguous regions with an identical pattern
 //! merge, and size deltas append `truncated` / `extra-bytes` regions.
-//! The clean verification path never runs any of this: expected content
-//! is regenerated only after a digest or size failure.
+//! The v2 clean path never runs any of this; v3 verification performs its
+//! canonical-content comparison while computing Merkle leaves and retains
+//! only whether a mismatch occurred.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
@@ -16,7 +17,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use caf_format::{ContentReader, ContentSeed, Digest, HEADER_SIZE, Header};
+use caf_format::{ContentReader, ContentSeed, Digest, Format, HEADER_SIZE, Header};
 
 use crate::env::FileHandle;
 
@@ -249,6 +250,7 @@ pub enum CorruptionClass {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CorruptionReport {
     pub(crate) path: PathBuf,
+    pub(crate) format: Format,
     pub(crate) expected: Digest,
     pub(crate) actual: Digest,
     pub(crate) actual_size: u64,
@@ -264,7 +266,13 @@ impl CorruptionReport {
         &self.path
     }
 
-    /// Returns the digest the path claims (the expected BLAKE2b-160).
+    /// Returns the CAF format parsed from the file header.
+    #[must_use]
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// Returns the file ID the path claims.
     #[must_use]
     pub fn expected_digest(&self) -> Digest {
         self.expected
@@ -357,7 +365,8 @@ pub(crate) fn analyze(
         .min(chunk_size.get());
 
     source.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
-    let mut expected_stream = ContentReader::new(header.content_seed());
+    let mut expected_stream =
+        ContentReader::new_with_format(header.content_seed(), header.format());
     let mut actual_chunk = vec![0_u8; chunk_size];
     let mut expected_chunk = vec![0_u8; chunk_size];
     let mut regions: Vec<CorruptionRegion> = Vec::new();
@@ -427,6 +436,7 @@ pub(crate) fn analyze_parallel(
 
     let plan = AnalysisPlan {
         source,
+        format: header.format(),
         seed: header.content_seed(),
         compare_len,
         chunk_size: chunk_size.get(),
@@ -464,6 +474,7 @@ fn analysis_lane_count(width: usize, task_len: usize, total_tasks: u64) -> usize
 #[derive(Clone, Copy)]
 struct AnalysisPlan<'file> {
     source: &'file FileHandle,
+    format: Format,
     seed: ContentSeed,
     compare_len: u64,
     chunk_size: usize,
@@ -696,7 +707,7 @@ fn analyze_task(
         let got = plan.source.read_full_at(&mut actual, file_offset)?;
         actual.truncate(got);
         let mut expected = vec![0_u8; got];
-        ContentReader::new_with_offset(plan.seed, content_offset)
+        ContentReader::new_with_offset_and_format(plan.seed, content_offset, plan.format)
             .read_exact(&mut expected)
             .expect("the content stream is infinite and never fails");
 
@@ -907,7 +918,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use caf_format::{ContentReader, ContentSeed, Digest, HEADER_SIZE, Header};
+    use caf_format::{ContentReader, ContentSeed, Digest, Format, HEADER_SIZE, Header};
 
     use super::{
         ANALYSIS_MEMORY_BYTES, AnalysisClaim, AnalysisGate, AnalysisMemory, CorruptionClass,
@@ -1193,6 +1204,7 @@ mod tests {
     fn report_classifies_path_mismatch_and_content() {
         let path_mismatch = CorruptionReport {
             path: "store/aa".into(),
+            format: Format::V2,
             expected: Digest::ZERO,
             actual: Digest::compute(b"x"),
             actual_size: 1024,
@@ -1206,6 +1218,7 @@ mod tests {
 
         let content = CorruptionReport {
             path: "store/aa".into(),
+            format: Format::V2,
             expected: Digest::ZERO,
             actual: Digest::compute(b"x"),
             actual_size: 1024,
@@ -1228,6 +1241,7 @@ mod tests {
         // only the truncated region, and the class must be content.
         let report = CorruptionReport {
             path: "store/aa".into(),
+            format: Format::V2,
             expected: Digest::ZERO,
             actual: Digest::compute(b"x"),
             actual_size: 512,

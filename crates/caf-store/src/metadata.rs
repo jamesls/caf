@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::Path;
 
-use caf_format::{Digest, Hasher};
+use caf_format::{Digest, MetadataDigest, MetadataHasher};
 
 use crate::env::Env;
 use crate::generate::GenerateError;
@@ -48,7 +48,7 @@ pub(crate) fn write_chain_tip(
 ///
 /// Marker names are sorted byte-wise. Generated names are ASCII hex, so
 /// this is also their lexical order.
-pub(crate) fn update_all(env: &Env, store_root: &Path) -> Result<Digest, GenerateError> {
+pub(crate) fn update_all(env: &Env, store_root: &Path) -> Result<MetadataDigest, GenerateError> {
     let metadata_dir = store_root.join(METADATA_DIR);
     let roots_dir = metadata_dir.join(ROOTS_DIR);
 
@@ -61,7 +61,7 @@ pub(crate) fn update_all(env: &Env, store_root: &Path) -> Result<Digest, Generat
         .collect();
     names.sort_unstable();
 
-    let mut hasher = Hasher::new();
+    let mut hasher = MetadataHasher::new();
     for name in &names {
         hasher.update(name.as_encoded_bytes());
     }

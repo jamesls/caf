@@ -15,8 +15,9 @@
 //!   readers within large files, with results collected back in sorted
 //!   file and byte order so serial and parallel reports are identical.
 //! - Parallel generation of one file ([`GeneratorBuilder::jobs`]): block
-//!   generators, positional writers, and an ordered hasher over a fixed
-//!   buffer pool, producing byte-identical files at any worker count.
+//!   generators and positional writers over a fixed buffer pool, plus the
+//!   v2 ordered hasher or v3 indexed Merkle leaves, producing byte-identical
+//!   files at any worker count.
 //!
 //! Operations resolve paths from an explicit store root and never change the
 //! process working directory. Configuration uses builders; results,

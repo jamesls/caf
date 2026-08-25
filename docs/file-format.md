@@ -1,151 +1,275 @@
-# CAF File Format Specification
+# CAF file format specification
 
-This document describes the structure of Content Addressable Files (CAF) v2 format.
+CAF supports two on-disk formats. Version 2 identifies a file with a
+BLAKE2b-160 digest over its complete byte stream. Version 3 identifies the same
+60-byte-header and 1 MiB-block layout with a CAF-defined BLAKE3 Merkle tree.
+Both versions generate deterministic content with SHAKE-128.
 
-## Overview
+All byte ranges in this document are half-open. `uint64_be(x)` means an
+unsigned 64-bit big-endian encoding, `byte(x)` means one byte, and `||` means
+byte-string concatenation.
 
-CAF files are deterministically generated content files designed for storage system
-testing and validation. Each file consists of a 60-byte header followed by
-SHAKE-128 generated content. Files are identified by their BLAKE2b hash and can
-be chained together via parent references.
+## Shared file layout
 
-## File Structure
+Every CAF file begins with this 60-byte header:
 
-```
-    0                   1                   2                   3
-    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                                                               |
-   +                                                               +
-   |                                                               |
-   +                        Parent Hash                            +
-   |                        (20 bytes)                             |
-   +                                                               +
-   |                                                               |
-   +                                                               +
-   |                                                               |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                                                               |
-   +                                                               +
-   |                                                               |
-   +                        Content Seed                           +
-   |                        (16 bytes)                             |
-   +                                                               +
-   |                                                               |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                                                               |
-   +                     File Length (uint64 BE)                   +
-   |                                                               |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                                                               |
-   +                       Header Checksum                         +
-   |                  (first 8 bytes of SHA3-256)                  |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                                                               |
-   +                         Reserved                              +
-   |                        (8 bytes)                              |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                                                               |
-   +                                                               +
-   |                                                               |
-   +                         Content                               +
-   |                  (file_length - 60 bytes)                     |
-   +                                                               +
-   |                           ...                                 |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Offset | Size | Field | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 20 | Parent file ID | Parent's v2 digest or v3 file ID; all zero for the first file in a chain |
+| 20 | 16 | Content seed | Seed for deterministic SHAKE-128 content |
+| 36 | 8 | File length | Total file length, including the header, as a big-endian `u64` |
+| 44 | 8 | Header checksum | Version-specific truncated SHA3-256 checksum |
+| 52 | 8 | Format descriptor | Eight zero bytes for v2; the strict v3 descriptor for v3 |
+
+The minimum valid file length is 60 bytes. A verifier also requires the
+declared file length to match the stored file size.
+
+The parent field links files into a chain. The first file has an all-zero
+parent. Every later file contains its parent's 20-byte identity.
+
+## Version dispatch and header checksums
+
+A reader must have all 60 header bytes before it can identify a format. It
+dispatches from bytes 52-59 before checking the checksum because the versions
+cover different header bytes:
+
+1. Eight zero bytes select v2.
+2. Marker bytes 52-55 equal to `43 41 46 03` in hexadecimal, or `b"CAF\x03"`,
+   select a v3 candidate.
+3. Every other value is an unknown format.
+
+The first four v3 bytes select v3 checksum coverage even when the remaining
+descriptor bytes are unsupported. After dispatch, the reader compares the
+stored checksum with the first eight bytes of the applicable SHA3-256 digest:
+
+```text
+v2_checksum = SHA3-256(header[0:44])[0:8]
+
+v3_checksum = SHA3-256(
+    header[0:44] || header[52:60]
+)[0:8]
 ```
 
-## Header Fields
+The checksum field at bytes 44-51 is excluded from both inputs. The v2
+descriptor must remain all zero. The v3 checksum covers the descriptor.
 
-| Offset | Size | Field | Description |
-|--------|------|-------|-------------|
-| 0 | 20 | Parent Hash | BLAKE2b hash of parent file (zeros for root files) |
-| 20 | 16 | Content Seed | Random seed for deterministic content generation |
-| 36 | 8 | File Length | Total file size including header (big-endian uint64) |
-| 44 | 8 | Header Checksum | First 8 bytes of SHA3-256(header[0:44]) |
-| 52 | 8 | Reserved | Reserved for future use (all zeros) |
+## Strict v3 descriptor
 
-**Total Header Size: 60 bytes**
+A v3 header is valid only when bytes 52-59 have these exact values:
 
-### Parent Hash
+| Offset | Size | Field | Required value |
+| ---: | ---: | --- | --- |
+| 52 | 4 | Format marker | `43 41 46 03` (`b"CAF\x03"`) |
+| 56 | 1 | File-ID scheme | `1`, CAF-Merkle-BLAKE3-160 |
+| 57 | 1 | Content scheme | `1`, indexed SHAKE-128 |
+| 58 | 1 | Physical-block log2 size | `20`, for `1 << 20` bytes |
+| 59 | 1 | Flags | `0` |
 
-The parent hash field links files together in a chain. Root files (the first
-file in a chain) use all zeros (`0x00 * 20`). Child files contain the BLAKE2b
-hash of their parent file, allowing verification of file relationships.
+The complete descriptor is `43 41 46 03 01 01 14 00` in hexadecimal. A
+reader rejects any other scheme, block-size value, or flag after the v3
+checksum passes.
 
-### Content Seed
+## Deterministic content
 
-A random 16-byte value that seeds the SHAKE-128 XOF for content generation.
-The same seed always produces identical content, making files fully
-deterministic and verifiable.
+CAF divides each file into physical blocks of 1,048,576 bytes (`2^20`, or
+1 MiB). Physical block 0 starts with the 60-byte header and has room for
+1,048,516 generated content bytes. Each later physical block contains up to
+1,048,576 generated bytes. The final block may be shorter.
 
-### File Length
+Each physical block's content is independently derived. Version-specific
+domain strings ensure that the same seed produces different v2 and v3 bytes:
 
-The total file size in bytes, stored as an unsigned 64-bit big-endian integer.
-This includes the 60-byte header, so the minimum valid value is 60.
+```text
+CONTENT_DOMAIN_V2 = b"caf:content:shake128:v2:"
+CONTENT_DOMAIN_V3 = b"caf:content:shake128:v3:"
 
-### Header Checksum
-
-Integrity check for the header fields. Computed as the first 8 bytes of the
-SHA3-256 hash of header bytes 0-43 (parent hash + content seed + file length).
-
-### Reserved
-
-Eight bytes reserved for future format extensions. Must be all zeros in v2.
-
-## Content Generation
-
-Content is deterministically generated from the content seed using SHAKE-128:
-
-```
-domain = b"caf:content:shake128:v2:"
-
-for each block_index:
-    block_data = SHAKE128(domain + content_seed + block_index_bytes).digest(block_size)
+content_block(version, i) = SHAKE128(
+    CONTENT_DOMAIN_version
+    || content_seed
+    || uint64_be(i)
+)
 ```
 
-Where `block_index_bytes` is the block index as an 8-byte big-endian integer.
+The SHAKE-128 XOF is squeezed for the number of content bytes needed in that
+physical block. A partial final block uses the corresponding prefix. Index
+zero generates the bytes after the header in physical block 0; index one
+generates the content in physical block 1.
 
-### Block Alignment
+## Version 2 file identity
 
-Content is generated in blocks for efficient streaming:
+Version 2 uses BLAKE2b parameterized for a 20-byte output. It hashes the
+complete file in byte order, including the header:
 
-- **Block 0**: 1,048,516 bytes (1MB - 60 bytes header)
-- **Blocks 1+**: 1,048,576 bytes (1MB)
-
-This ensures blocks 1 and onwards start at 1MB-aligned file offsets for
-optimal I/O performance.
-
-## File Identification
-
-Files are identified by their BLAKE2b hash (20-byte digest) computed over
-the entire file contents (header + content). The hex-encoded hash serves as
-the filename in the content-addressable storage structure:
-
-```
-{root}/{hash[0:2]}/{hash[2:4]}/{hash[4:6]}/{hash[6:]}
+```text
+v2_file_id = BLAKE2b-160(file[0:L])
 ```
 
-Example: hash `abcdef0123456789abcdef0123456789abcdef01` is stored at `ab/cd/ef/0123456789abcdef0123456789abcdef01`
+The result is the file's 20-byte identity, the value stored in a child's
+parent field, and the 40-character hexadecimal name used by the store.
 
-## Validation
+## Version 3 file identity
 
-A CAF file is valid if:
+Version 3 uses an explicitly defined Merkle tree over physical file blocks.
+It does not use `BLAKE3(file_bytes)`. Leaf and internal hashes remain 32 bytes;
+only the final file ID is truncated to 20 bytes.
 
-1. File size >= 60 bytes
-2. File length field matches actual file size
-3. Header checksum matches SHA3-256(header[0:44])[0:8]
-4. Content matches SHAKE-128 output for the given content seed
-5. Parent hash references an existing file (or is all zeros for roots)
+Define:
 
-## Constants
+```text
+B = 1,048,576
+L = total file length
+N = ceil(L / B)
+H(x) = the 32-byte unkeyed BLAKE3 digest of x
 
-```python
-HEADER_SIZE = 60
-BLOCK_SIZE = 1048576  # 1MB
-BLAKE2B_DIGEST_SIZE = 20
-PARENT_HASH_SIZE = 20
-CONTENT_SEED_SIZE = 16
-CONTENT_DOMAIN = b"caf:content:shake128:v2:"
-ROOT_PARENT_HASH = b'\x00' * 20
+F[i] = file[i * B : min((i + 1) * B, L)]
 ```
+
+Because a CAF file is at least 60 bytes, `N` is at least one. `F[0]` includes
+the header.
+
+### Leaf hashes
+
+Each leaf binds its physical block index, actual block length, and bytes:
+
+```text
+LEAF_DOMAIN = b"caf:file:leaf:blake3:v3\0"
+
+V[0][i] = H(
+    LEAF_DOMAIN
+    || uint64_be(i)
+    || uint64_be(len(F[i]))
+    || F[i]
+)
+```
+
+### Internal nodes
+
+Leaves form level zero. Starting at level one, pair adjacent hashes from the
+previous level in order. For parent index `j`, hash two children as follows:
+
+```text
+NODE_DOMAIN = b"caf:file:node:blake3:v3\0"
+
+V[level][j] = H(
+    NODE_DOMAIN
+    || uint64_be(level)
+    || uint64_be(j)
+    || byte(2)
+    || V[level - 1][2 * j]
+    || V[level - 1][2 * j + 1]
+)
+```
+
+If the level ends with one unpaired hash, create a one-child node:
+
+```text
+V[level][j] = H(
+    NODE_DOMAIN
+    || uint64_be(level)
+    || uint64_be(j)
+    || byte(1)
+    || V[level - 1][2 * j]
+)
+```
+
+Do not duplicate or promote an unpaired hash. Repeat the reduction until one
+32-byte tree hash `T` remains. If the file has one leaf, `T` is that leaf and
+no internal node is created.
+
+### Final file ID
+
+The final hash binds the physical block size, total file length, leaf count,
+and tree hash:
+
+```text
+ROOT_DOMAIN = b"caf:file:root:blake3:v3\0"
+
+full_root = H(
+    ROOT_DOMAIN
+    || uint64_be(B)
+    || uint64_be(L)
+    || uint64_be(N)
+    || T
+)
+
+v3_file_id = full_root[0:20]
+```
+
+The 20-byte result is called CAF-Merkle-BLAKE3-160. It is the file identity,
+the value stored in a child's parent field, and the hexadecimal name used by
+the store. Merkle leaves and internal nodes are transient. CAF does not store
+them in a trailer or sidecar.
+
+## Store paths
+
+Both formats encode their 20-byte identity as 40 lowercase hexadecimal
+characters and use the same three-level sharding:
+
+```text
+{store}/{id[0:2]}/{id[2:4]}/{id[4:6]}/{id[6:40]}
+```
+
+For example, ID `abcdef0123456789abcdef0123456789abcdef01` is stored at:
+
+```text
+ab/cd/ef/0123456789abcdef0123456789abcdef01
+```
+
+The path does not identify the file's format. A verifier reads the header to
+choose the identity algorithm.
+
+## Chains and mixed-version stores
+
+`caf gen` writes v3 by default. `caf gen --format v2` writes a v2 chain, and
+`caf gen --format v3` selects v3 explicitly. Each generation run starts a new
+chain with an all-zero parent and uses one format for every file in that
+chain.
+
+A store may contain separate v2 and v3 chains. `caf verify` dispatches each
+file from its header, but it rejects a parent-child link whose files have
+different versions. Chains are therefore homogeneous even in a mixed-version
+store.
+
+## Store metadata
+
+The metadata layout and aggregate algorithm are identical for v2 and v3:
+
+```text
+.metadata/
+    roots/
+        <40-character chain-tip ID>
+    all
+```
+
+Each file under `.metadata/roots` is an empty marker named after a chain tip.
+The marker name has the same form for either version and does not identify a
+format.
+
+To compute `.metadata/all`, sort the marker filenames byte-wise, concatenate
+their ASCII bytes without separators, and compute BLAKE2b-160 over the result:
+
+```text
+all_digest = BLAKE2b-160(
+    marker_name_0 || marker_name_1 || ... || marker_name_n
+)
+```
+
+The `.metadata/all` file contains the aggregate's 40 lowercase hexadecimal
+characters with no newline. Version 3 does not add a metadata version file,
+Merkle manifest, leaf table, or sidecar.
+
+## Validation requirements
+
+A CAF data file is valid when all applicable checks pass:
+
+1. At least 60 bytes are available for the header.
+2. Bytes 52-59 dispatch to v2 or v3.
+3. The version-specific header checksum matches.
+4. A v3 descriptor uses every required scheme and flag value.
+5. The declared file length is at least 60 and equals the stored file size.
+6. The content matches the version's indexed SHAKE-128 output.
+7. The path identity matches the v2 whole-file digest or v3 Merkle file ID.
+8. A nonzero parent identifies an existing file of the same CAF version.
+
+Store verification also checks chain-tip markers, unreferenced files, and the
+unchanged `.metadata/all` aggregate.

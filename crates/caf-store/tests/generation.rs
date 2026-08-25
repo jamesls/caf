@@ -2,7 +2,7 @@
 //!
 //! Every test generates into a temporary store and re-validates the
 //! result with `caf-format` primitives: path layout, header fields,
-//! whole-file digests, deterministic content, chain links, chain-tip
+//! version-specific file identities, deterministic content, chain links, chain-tip
 //! markers, and the `.metadata/all` aggregate.
 
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use caf_format::{
-    BLOCK_SIZE, ContentReader, Digest, HEADER_SIZE, Hasher, Header, parse_hash_from_path,
+    BLOCK_SIZE, ContentReader, Digest, FileId, Format, HEADER_SIZE, Hasher, Header,
+    parse_hash_from_path, v3_file_id_from_bytes,
 };
 use caf_store::{Generator, SizeChooser, SizeSpec};
 
@@ -111,15 +112,19 @@ fn check_store(root: &Path) {
             "{}: header length must match the file",
             path.display(),
         );
+        let actual_id = match header.format() {
+            Format::V2 => Digest::compute(&bytes),
+            Format::V3 => Digest::from_bytes(v3_file_id_from_bytes(&bytes).into_inner()),
+        };
         assert_eq!(
-            Digest::compute(&bytes),
+            actual_id,
             digest,
-            "{}: whole-file digest must match the path",
-            path.display(),
+            "{}: file ID must match the path",
+            path.display()
         );
 
         let mut expected = vec![0_u8; bytes.len() - HEADER_SIZE];
-        ContentReader::new(header.content_seed())
+        ContentReader::new_with_format(header.content_seed(), header.format())
             .read_exact(&mut expected)
             .expect("the content stream is infinite");
         assert_eq!(
@@ -173,7 +178,16 @@ fn three_file_chain_is_structurally_valid() {
 
     assert_eq!(report.files_created(), 3);
     assert_eq!(report.bytes_written(), 3 * 1024);
+    assert_eq!(report.format(), Format::V3);
+    assert!(report.chain_tip_file_id().is_some());
     assert_eq!(data_files(store.path()).len(), 3);
+    for path in data_files(store.path()) {
+        let bytes = fs::read(path).expect("generated files are readable");
+        assert_eq!(
+            Header::parse(bytes).expect("valid header").format(),
+            Format::V3
+        );
+    }
     assert_eq!(
         chain_tip_markers(store.path()),
         vec![report.chain_tip().to_hex()]
@@ -182,6 +196,30 @@ fn three_file_chain_is_structurally_valid() {
         all_file_contents(store.path()),
         report.all_digest().to_hex()
     );
+    check_store(store.path());
+}
+
+#[test]
+fn explicit_v2_generation_remains_available() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let report = Generator::builder(store.path())
+        .format(Format::V2)
+        .max_files(2)
+        .file_sizes(SizeChooser::fixed(1024))
+        .build()
+        .generate()
+        .expect("v2 generation succeeds");
+
+    assert_eq!(report.format(), Format::V2);
+    assert_eq!(report.chain_tip_file_id(), None);
+
+    for path in data_files(store.path()) {
+        let bytes = fs::read(path).expect("generated files are readable");
+        assert_eq!(
+            Header::parse(bytes).expect("valid header").format(),
+            Format::V2
+        );
+    }
     check_store(store.path());
 }
 
@@ -225,7 +263,9 @@ fn zero_files_writes_the_zero_chain_tip() {
 
     assert_eq!(report.files_created(), 0);
     assert_eq!(report.bytes_written(), 0);
+    assert_eq!(report.format(), Format::V3);
     assert_eq!(report.chain_tip(), Digest::ZERO);
+    assert_eq!(report.chain_tip_file_id(), Some(FileId::ZERO));
     assert!(data_files(store.path()).is_empty());
     assert_eq!(chain_tip_markers(store.path()), vec!["0".repeat(40)]);
 

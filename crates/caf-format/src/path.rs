@@ -1,6 +1,7 @@
-//! Mapping between digests and sharded on-disk store paths.
+//! Mapping between file identities and sharded on-disk store paths.
 //!
-//! CAF stores a file under the lowercase hex form of its digest, split
+//! CAF stores a file under the lowercase hex form of its v2 digest or v3
+//! file ID, split
 //! into three two-character shard directories and a 34-character basename:
 //! `aa/bb/cc/<34-character basename>`. Parsing is case-insensitive and
 //! rejects any path with a `.metadata` component. Generation always writes
@@ -14,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::digest::Digest;
 use crate::hex::{self, ParseHexError};
+use crate::merkle::FileId;
 
 /// Number of two-character shard directories in a store path.
 const SHARD_LEVELS: usize = 3;
@@ -49,10 +51,20 @@ const METADATA_DIR: &str = ".metadata";
 /// ```
 #[must_use]
 pub fn hash_to_relpath(digest: Digest) -> PathBuf {
+    identity_to_relpath(digest.as_bytes())
+}
+
+/// Returns the store-relative path for a CAF v3 `file_id`.
+#[must_use]
+pub fn file_id_to_relpath(file_id: FileId) -> PathBuf {
+    identity_to_relpath(file_id.as_bytes())
+}
+
+fn identity_to_relpath(identity: &[u8; Digest::SIZE]) -> PathBuf {
     // Generation and verification call this once per file, so the hex
     // form goes to the stack and only the returned path allocates.
     let mut buffer = [0_u8; DIGEST_CHARS];
-    let hex = hex::encode_into(digest.as_bytes(), &mut buffer);
+    let hex = hex::encode_into(identity, &mut buffer);
     let mut path = PathBuf::with_capacity(hex.len() + SHARD_LEVELS);
     let mut rest = hex;
     for _ in 0..SHARD_LEVELS {
@@ -68,6 +80,12 @@ pub fn hash_to_relpath(digest: Digest) -> PathBuf {
 #[must_use]
 pub fn hash_to_path(root: impl AsRef<Path>, digest: Digest) -> PathBuf {
     root.as_ref().join(hash_to_relpath(digest))
+}
+
+/// Returns the full path for a CAF v3 `file_id` under a store `root`.
+#[must_use]
+pub fn file_id_to_path(root: impl AsRef<Path>, file_id: FileId) -> PathBuf {
+    root.as_ref().join(file_id_to_relpath(file_id))
 }
 
 /// Extracts the digest from an on-disk path with the CAF layout.
@@ -100,6 +118,23 @@ pub fn hash_to_path(root: impl AsRef<Path>, digest: Digest) -> PathBuf {
 /// # Ok::<(), caf_format::ParsePathError>(())
 /// ```
 pub fn parse_hash_from_path(path: impl AsRef<Path>) -> Result<Digest, ParsePathError> {
+    parse_identity_from_path(path).map(Digest::from_bytes)
+}
+
+/// Extracts a CAF v3 file ID from an on-disk path with the CAF layout.
+///
+/// This applies the same version-agnostic path validation as
+/// [`parse_hash_from_path`] while keeping the result distinct from a v2
+/// `BLAKE2b` digest.
+///
+/// # Errors
+///
+/// Returns [`ParsePathError`] when the path does not have the CAF layout.
+pub fn parse_file_id_from_path(path: impl AsRef<Path>) -> Result<FileId, ParsePathError> {
+    parse_identity_from_path(path).map(FileId::from_bytes)
+}
+
+fn parse_identity_from_path(path: impl AsRef<Path>) -> Result<[u8; Digest::SIZE], ParsePathError> {
     // Only the last four components decide the layout, so the walk keeps
     // a rolling window of them instead of collecting the whole path.
     let mut window = [OsStr::new(""); SHARD_LEVELS + 1];
@@ -136,7 +171,7 @@ pub fn parse_hash_from_path(path: impl AsRef<Path>) -> Result<Digest, ParsePathE
         slot.copy_from_slice(&decode_component::<SHARD_BYTES>(shard, index)?);
     }
     tail.copy_from_slice(&decode_component::<BASENAME_BYTES>(basename, SHARD_LEVELS)?);
-    Ok(Digest::from_bytes(bytes))
+    Ok(bytes)
 }
 
 /// Decodes the component at layout position `index` as the `N` bytes its
@@ -150,10 +185,10 @@ fn decode_component<const N: usize>(part: &OsStr, index: usize) -> Result<[u8; N
     })
 }
 
-/// Error parsing a store path into a [`Digest`].
+/// Error parsing a store path into a v2 [`Digest`] or v3 [`FileId`].
 ///
-/// Produced by [`parse_hash_from_path`]. The `is_*` methods identify the
-/// failed check; for a malformed shard or basename,
+/// Produced by [`parse_hash_from_path`] and [`parse_file_id_from_path`]. The
+/// `is_*` methods identify the failed check; for a malformed shard or basename,
 /// [`ParsePathError::component_index`] locates it and
 /// [`ParsePathError::hex_error`] says whether its length or its
 /// characters were wrong.
@@ -162,8 +197,8 @@ pub struct ParsePathError {
     inner: Box<ParsePathErrorInner>,
 }
 
-/// Boxed so `Result<Digest, ParsePathError>` stays small on the success
-/// path; a rejected component carries its own hex error.
+/// Boxed so successful path parsing stays small; a rejected component carries
+/// its own hex error.
 #[derive(Debug)]
 struct ParsePathErrorInner {
     kind: ParsePathErrorKind,
@@ -286,8 +321,11 @@ fn write_component(f: &mut Formatter<'_>, index: usize) -> fmt::Result {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{SHARD_LEVELS, hash_to_path, hash_to_relpath, parse_hash_from_path};
-    use crate::Digest;
+    use super::{
+        SHARD_LEVELS, file_id_to_path, file_id_to_relpath, hash_to_path, hash_to_relpath,
+        parse_file_id_from_path, parse_hash_from_path,
+    };
+    use crate::{Digest, FileId};
 
     const HEX: &str = "f46b7e6f7eee7921da61a4779774a118aac54e98";
 
@@ -323,6 +361,20 @@ mod tests {
         assert_eq!(
             parse_hash_from_path(hash_to_path("/some/store", digest())).unwrap(),
             digest(),
+        );
+    }
+
+    #[test]
+    fn v3_file_id_paths_round_trip_without_a_digest_conversion() {
+        let file_id = FileId::from_hex(HEX).unwrap();
+        assert_eq!(file_id_to_relpath(file_id), hash_to_relpath(digest()));
+        assert_eq!(
+            file_id_to_path("/some/store", file_id),
+            hash_to_path("/some/store", digest()),
+        );
+        assert_eq!(
+            parse_file_id_from_path(file_id_to_relpath(file_id)).unwrap(),
+            file_id,
         );
     }
 

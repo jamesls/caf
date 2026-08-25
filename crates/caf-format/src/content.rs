@@ -2,11 +2,11 @@
 //!
 //! File content is derived from the header's content seed so verifiers can
 //! regenerate expected bytes without external data. Each block is the
-//! SHAKE-128 output over `CONTENT_DOMAIN || seed || block_index` (8-byte
-//! big-endian index), squeezed to the full block length; the SHAKE
+//! SHAKE-128 output over a version-specific domain, the seed, and the block
+//! index (8-byte big-endian), squeezed to the full block length; the SHAKE
 //! instance never spans blocks. Block 0 is shortened by the header size so
-//! later blocks start at 1 MiB-aligned file offsets. A file's last block
-//! is squeezed only as far as the file length reaches
+//! later blocks start at 1 MiB-aligned file offsets. A file's last block is
+//! squeezed only as far as the file length reaches
 //! ([`fill_block_prefix`]), which SHAKE's prefix stability makes
 //! equivalent to truncating the full block.
 
@@ -17,7 +17,7 @@ use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::{Shake128, Shake128Reader};
 
 use crate::seed::ContentSeed;
-use crate::{BLOCK_SIZE, CONTENT_DOMAIN, HEADER_SIZE};
+use crate::{BLOCK_SIZE, CONTENT_DOMAIN_V2, CONTENT_DOMAIN_V3, Format, HEADER_SIZE};
 
 /// Returns the content length in bytes of the block at `index`.
 ///
@@ -43,13 +43,22 @@ pub fn block_len(index: u64) -> usize {
 /// Panics if `block.len()` is not exactly [`block_len`]`(index)`: a
 /// partial block would not be the version 2 content stream.
 pub fn fill_block(seed: ContentSeed, index: u64, block: &mut [u8]) {
+    fill_block_with_format(Format::V2, seed, index, block);
+}
+
+/// Fills a complete content block using the selected format's domain.
+///
+/// # Panics
+///
+/// Panics if `block.len()` is not exactly [`block_len`]`(index)`.
+pub fn fill_block_with_format(format: Format, seed: ContentSeed, index: u64, block: &mut [u8]) {
     assert_eq!(
         block.len(),
         block_len(index),
         "content block {index} is {} bytes",
         block_len(index),
     );
-    fill_block_prefix(seed, index, block);
+    fill_block_prefix_with_format(format, seed, index, block);
 }
 
 /// Fills `prefix` with the first `prefix.len()` bytes of the content
@@ -77,12 +86,26 @@ pub fn fill_block(seed: ContentSeed, index: u64, block: &mut [u8]) {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn fill_block_prefix(seed: ContentSeed, index: u64, prefix: &mut [u8]) {
+    fill_block_prefix_with_format(Format::V2, seed, index, prefix);
+}
+
+/// Fills a content-block prefix using the selected format's domain.
+///
+/// # Panics
+///
+/// Panics if `prefix` is longer than [`block_len`]`(index)`.
+pub fn fill_block_prefix_with_format(
+    format: Format,
+    seed: ContentSeed,
+    index: u64,
+    prefix: &mut [u8],
+) {
     assert!(
         prefix.len() <= block_len(index),
         "content block {index} is at most {} bytes",
         block_len(index),
     );
-    XofReader::read(&mut block_reader(seed, index), prefix);
+    XofReader::read(&mut block_reader(format, seed, index), prefix);
 }
 
 /// Starts the SHAKE-128 XOF for one content block.
@@ -90,9 +113,13 @@ pub fn fill_block_prefix(seed: ContentSeed, index: u64, prefix: &mut [u8]) {
 /// SHAKE output is prefix-stable: squeezing a block incrementally yields
 /// the same bytes as squeezing it at full length, so readers may consume
 /// only the prefix a short file needs.
-fn block_reader(seed: ContentSeed, index: u64) -> Shake128Reader {
+fn block_reader(format: Format, seed: ContentSeed, index: u64) -> Shake128Reader {
     let mut shake = Shake128::default();
-    shake.update(CONTENT_DOMAIN);
+    let domain = match format {
+        Format::V2 => CONTENT_DOMAIN_V2,
+        Format::V3 => CONTENT_DOMAIN_V3,
+    };
+    shake.update(domain);
     shake.update(seed.as_bytes());
     shake.update(&index.to_be_bytes());
     shake.finalize_xof()
@@ -118,6 +145,7 @@ fn block_reader(seed: ContentSeed, index: u64) -> Shake128Reader {
 /// ```
 pub struct ContentReader {
     seed: ContentSeed,
+    format: Format,
     next_block_index: u64,
     /// XOF for the block currently being squeezed, if any.
     block: Option<Shake128Reader>,
@@ -129,8 +157,15 @@ impl ContentReader {
     /// Creates a stream positioned at the first content byte.
     #[must_use]
     pub fn new(seed: ContentSeed) -> Self {
+        Self::new_with_format(seed, Format::V2)
+    }
+
+    /// Creates a stream for `format` at the first content byte.
+    #[must_use]
+    pub fn new_with_format(seed: ContentSeed, format: Format) -> Self {
         Self {
             seed,
+            format,
             next_block_index: 0,
             block: None,
             remaining_in_block: 0,
@@ -164,6 +199,14 @@ impl ContentReader {
     /// ```
     #[must_use]
     pub fn new_with_offset(seed: ContentSeed, offset: u64) -> Self {
+        Self::new_with_offset_and_format(seed, offset, Format::V2)
+    }
+
+    /// Creates a format-specific content stream at the specified offset.
+    ///
+    /// The offset is content-relative and every `u64` offset is supported.
+    #[must_use]
+    pub fn new_with_offset_and_format(seed: ContentSeed, offset: u64, format: Format) -> Self {
         let first_len = block_len(0) as u64;
         let (block_index, mut offset_in_block) = if offset < first_len {
             (0, offset)
@@ -177,6 +220,7 @@ impl ContentReader {
 
         let mut reader = Self {
             seed,
+            format,
             next_block_index: block_index,
             block: None,
             remaining_in_block: 0,
@@ -203,6 +247,12 @@ impl ContentReader {
         self.seed
     }
 
+    /// Returns the CAF format whose content domain this stream uses.
+    #[must_use]
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
     /// Fills `buf` with the next bytes of the stream.
     ///
     /// The stream is infinite and never fails, so `buf` is always filled
@@ -225,7 +275,7 @@ impl ContentReader {
     fn current_block(&mut self) -> (&mut Shake128Reader, usize) {
         if self.remaining_in_block == 0 {
             let index = self.next_block_index;
-            self.block = Some(block_reader(self.seed, index));
+            self.block = Some(block_reader(self.format, self.seed, index));
             self.remaining_in_block = block_len(index);
             self.next_block_index += 1;
         }
@@ -249,6 +299,7 @@ impl Debug for ContentReader {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ContentReader")
             .field("seed", &self.seed)
+            .field("format", &self.format)
             .field("next_block_index", &self.next_block_index)
             .field("remaining_in_block", &self.remaining_in_block)
             .finish_non_exhaustive()
@@ -259,8 +310,11 @@ impl Debug for ContentReader {
 mod tests {
     use std::io::Read;
 
-    use super::{ContentReader, block_len, fill_block, fill_block_prefix};
-    use crate::{BLOCK_SIZE, ContentSeed, HEADER_SIZE};
+    use super::{
+        ContentReader, block_len, fill_block, fill_block_prefix, fill_block_prefix_with_format,
+        fill_block_with_format,
+    };
+    use crate::{BLOCK_SIZE, ContentSeed, Format, HEADER_SIZE, hex};
 
     fn seed() -> ContentSeed {
         ContentSeed::from_bytes(*b"0123456789abcdef")
@@ -277,6 +331,57 @@ mod tests {
         assert_eq!(block_len(0), BLOCK_SIZE - HEADER_SIZE);
         assert_eq!(block_len(1), BLOCK_SIZE);
         assert_eq!(block_len(u64::MAX), BLOCK_SIZE);
+    }
+
+    #[test]
+    fn format_display_is_stable() {
+        assert_eq!(Format::V2.to_string(), "v2");
+        assert_eq!(Format::V3.to_string(), "v3");
+    }
+
+    #[test]
+    fn versioned_content_matches_independent_reference_vectors() {
+        let seed = ContentSeed::from_hex("b42d9a6630882f79c7599ae213435f86").unwrap();
+        let mut v2 = [0_u8; 32];
+        let mut v3 = [0_u8; 32];
+        fill_block_prefix(seed, 0, &mut v2);
+        fill_block_prefix_with_format(Format::V3, seed, 0, &mut v3);
+
+        assert_eq!(
+            v2,
+            hex::decode::<32>("9e27e1f2bf314a966a1b3c097df1aa92a574eb64a131799366da401c23ffa9e8")
+                .unwrap(),
+        );
+        assert_eq!(
+            v3,
+            hex::decode::<32>("30086111280c1f7778f3dbe93a02e7d118c96f003975cf1608bd4d8df1960495")
+                .unwrap(),
+        );
+        assert_ne!(v2, v3);
+    }
+
+    #[test]
+    fn v2_entry_points_remain_aliases_for_v2_format() {
+        let mut legacy = vec![0_u8; block_len(1)];
+        let mut explicit = vec![0_u8; block_len(1)];
+        fill_block(seed(), 1, &mut legacy);
+        fill_block_with_format(Format::V2, seed(), 1, &mut explicit);
+        assert_eq!(legacy, explicit);
+        assert_eq!(ContentReader::new(seed()).format(), Format::V2);
+    }
+
+    #[test]
+    fn v3_offset_reader_matches_v3_stream() {
+        let offset = u64::try_from(block_len(0)).unwrap() + 31;
+        let mut whole = vec![0_u8; usize::try_from(offset).unwrap() + 64];
+        ContentReader::new_with_format(seed(), Format::V3)
+            .read_exact(&mut whole)
+            .unwrap();
+        let mut tail = [0_u8; 64];
+        let reader = &mut ContentReader::new_with_offset_and_format(seed(), offset, Format::V3);
+        reader.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, whole[usize::try_from(offset).unwrap()..]);
+        assert_eq!(reader.format(), Format::V3);
     }
 
     #[test]

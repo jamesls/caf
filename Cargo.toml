@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-# This release does not change the version 2 file format.
+# CAF v3 is additive; the version 2 on-disk format remains unchanged.
 version = "0.4.1"
 edition = "2024"
 # Rust 1.85 is the minimum version that supports edition 2024. CI builds
@@ -22,8 +22,10 @@ caf-format = { path = "crates/caf-format" }
 caf-store = { path = "crates/caf-store" }
 
 # RustCrypto hashes implement the version 2 BLAKE2b-160, SHA3-256, and
-# SHAKE-128 algorithms. They are pure Rust and permissively licensed.
+# SHAKE-128 algorithms. BLAKE3 implements the version 3 Merkle identity.
+# They are pure Rust and permissively licensed.
 blake2 = "0.10"
+blake3 = "=1.8.2"
 sha3 = "0.10"
 # OS randomness supplies content seeds and temporary names. `rand` and
 # `rand_distr` implement size selection. `tempfile` creates temporary test
@@ -110,6 +112,8 @@ debug = 1
 # crypto cores optimized in dev builds so `cargo test` stays fast. Conformance
 # results are identical at every opt-level.
 [profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.blake3]
 opt-level = 3
 [profile.dev.package.keccak]
 opt-level = 3

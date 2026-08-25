@@ -6,10 +6,15 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use assert_cmd::Command;
+use caf_format::{
+    ContentReader, ContentSeed, Digest, FileId, Format, HEADER_SIZE, Header, hash_to_path,
+    v3_file_id_from_bytes,
+};
 
 /// Exit status of `output`, panicking only on signal termination.
 fn code(output: &Output) -> i32 {
@@ -112,6 +117,55 @@ fn store_with(args: &[&str]) -> (tempfile::TempDir, Vec<PathBuf>) {
     (dir, files)
 }
 
+/// Builds one canonical CAF file for a CLI verification fixture.
+fn chain_file_bytes(
+    format: Format,
+    parent: Digest,
+    seed: ContentSeed,
+    file_length: u64,
+) -> Vec<u8> {
+    let header = match format {
+        Format::V2 => Header::new(parent, seed, file_length),
+        Format::V3 => Header::new_v3(FileId::from_bytes(parent.into_inner()), seed, file_length),
+    }
+    .expect("fixture length is valid");
+    let mut bytes = header.encode().to_vec();
+    let content_length =
+        usize::try_from(file_length).expect("fixture fits in memory") - HEADER_SIZE;
+    let mut content = vec![0_u8; content_length];
+    ContentReader::new_with_format(seed, format)
+        .read_exact(&mut content)
+        .expect("the content stream is infinite");
+    bytes.extend_from_slice(&content);
+    bytes
+}
+
+/// Places a fixture at its format-specific identity path.
+fn place_file(root: &Path, format: Format, bytes: &[u8]) -> Digest {
+    let digest = match format {
+        Format::V2 => Digest::compute(bytes),
+        Format::V3 => Digest::from_bytes(v3_file_id_from_bytes(bytes).into_inner()),
+    };
+    let path = hash_to_path(root, digest);
+    fs::create_dir_all(path.parent().expect("hash paths have parents"))
+        .expect("create shard directories");
+    fs::write(path, bytes).expect("write fixture");
+    digest
+}
+
+/// Writes one chain-tip marker and the matching aggregate.
+fn write_tip_metadata(root: &Path, tip: Digest) {
+    let marker = tip.to_hex();
+    let roots = root.join(".metadata").join("roots");
+    fs::create_dir_all(&roots).expect("create metadata directories");
+    fs::File::create(roots.join(&marker)).expect("create chain-tip marker");
+    fs::write(
+        root.join(".metadata").join("all"),
+        Digest::compute(marker.as_bytes()).to_hex(),
+    )
+    .expect("write marker aggregate");
+}
+
 // --- version, help, and usage errors ----------------------------------
 
 #[test]
@@ -133,6 +187,51 @@ fn help_lists_the_frozen_commands() {
     for command in ["gen", "verify", "dev"] {
         assert!(help.contains(command), "missing {command}: {help}");
     }
+}
+
+#[test]
+fn generation_help_lists_both_formats_and_v3_default() {
+    let output = caf(["gen", "--help"]);
+    assert_eq!(code(&output), 0);
+    let help = stdout(&output);
+    for value in ["--format", "v2", "v3", "default: v3"] {
+        assert!(help.contains(value), "missing {value:?}: {help}");
+    }
+}
+
+#[test]
+fn generation_format_defaults_to_v3_and_accepts_both_versions() {
+    for (arguments, expected, descriptor) in [
+        (&[][..], Format::V3, *b"CAF\x03\x01\x01\x14\x00"),
+        (&["--format", "v2"][..], Format::V2, [0_u8; 8]),
+        (
+            &["--format", "v3"][..],
+            Format::V3,
+            *b"CAF\x03\x01\x01\x14\x00",
+        ),
+    ] {
+        let mut args = vec!["--max-files", "1"];
+        args.extend_from_slice(arguments);
+        let (_dir, files) = store_with(&args);
+        let bytes = fs::read(&files[0]).expect("generated file is readable");
+        assert_eq!(
+            Header::parse(&bytes).expect("valid header").format(),
+            expected
+        );
+        assert_eq!(bytes[52..60], descriptor);
+    }
+}
+
+#[test]
+fn unknown_generation_format_is_a_usage_error() {
+    let dir = tempdir();
+    assert_eq!(
+        code(&generate(
+            dir.path(),
+            &["--format", "v4", "--max-files", "1"]
+        )),
+        2,
+    );
 }
 
 #[test]
@@ -451,8 +550,8 @@ fn verify_detects_content_corruption() {
     for field in [
         "Error Analysis",
         "CONTENT CORRUPTED",
-        "Expected BLAKE2b",
-        "Actual BLAKE2b",
+        "Expected v3 file ID",
+        "Actual v3 file ID",
         "Content Seed:",
         "Corruption Analysis",
         "Region 1:",
@@ -464,6 +563,62 @@ fn verify_detects_content_corruption() {
     // Captured output is not a terminal: no ANSI escapes anywhere.
     assert!(!report.contains('\u{1b}'), "{report}");
     assert!(!stderr(&output).contains('\u{1b}'), "{}", stderr(&output));
+}
+
+#[test]
+fn verify_reports_noncanonical_v3_content_without_calling_its_id_invalid() {
+    let dir = tempdir();
+    let header = Header::new_v3(
+        FileId::ZERO,
+        ContentSeed::from_bytes(*b"cli-noncanonical"),
+        512,
+    )
+    .expect("fixture length is valid");
+    let mut bytes = header.encode().to_vec();
+    bytes.resize(512, 0);
+    let digest = place_file(dir.path(), Format::V3, &bytes);
+    write_tip_metadata(dir.path(), digest);
+
+    let output = verify(dir.path(), &[]);
+    assert_eq!(code(&output), 1);
+    let diagnostics = stderr(&output);
+    assert!(
+        diagnostics.contains("Noncanonical CAF v3 content in file"),
+        "{diagnostics}"
+    );
+    assert!(!diagnostics.contains("Invalid file ID"), "{diagnostics}");
+}
+
+#[test]
+fn verify_reports_cross_version_parent_links_clearly() {
+    let dir = tempdir();
+    let parent_bytes = chain_file_bytes(
+        Format::V2,
+        Digest::ZERO,
+        ContentSeed::from_bytes(*b"cli-v2-parent!!!"),
+        512,
+    );
+    let parent = place_file(dir.path(), Format::V2, &parent_bytes);
+    let child_bytes = chain_file_bytes(
+        Format::V3,
+        parent,
+        ContentSeed::from_bytes(*b"cli-v3-child!!!!"),
+        512,
+    );
+    let child = place_file(dir.path(), Format::V3, &child_bytes);
+    write_tip_metadata(dir.path(), child);
+
+    let output = verify(dir.path(), &[]);
+    assert_eq!(code(&output), 1);
+    let diagnostics = stderr(&output);
+    assert!(
+        diagnostics.contains("Chain format mismatch in"),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("v3 child references v2 parent"),
+        "{diagnostics}"
+    );
 }
 
 #[test]
@@ -626,12 +781,13 @@ fn dev_show_prints_header_info() {
         "Content Seed",
         "File Length",
         "Header Checksum",
-        "Reserved",
+        "Format Descriptor",
+        "File-ID scheme",
         "Basic validation:",
     ] {
         assert!(report.contains(field), "missing {field:?}: {report}");
     }
-    assert!(!report.contains("File checksum"), "{report}");
+    assert!(!report.contains("File ID ("), "{report}");
 }
 
 #[test]
@@ -674,8 +830,48 @@ fn dev_show_verify_checksum_succeeds_for_clean_file() {
     let output = caf_with_path(&["dev", "show"], &files[0], &["--verify-checksum"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let report = stdout(&output);
+    assert!(
+        report.contains("File ID (CAF-Merkle-BLAKE3-160):"),
+        "{report}"
+    );
+    assert!(report.contains("Matches: yes"), "{report}");
+}
+
+#[test]
+fn dev_show_preserves_v2_header_and_checksum_diagnostics() {
+    let (_dir, files) = store_with(&["--format", "v2", "--max-files", "1", "--file-size", "1024"]);
+    let output = caf_with_path(&["dev", "show"], &files[0], &["--verify-checksum"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.contains("Reserved (52:60): 0000000000000000"),
+        "{report}"
+    );
     assert!(report.contains("File checksum (BLAKE2b-160):"), "{report}");
     assert!(report.contains("Matches: yes"), "{report}");
+}
+
+#[test]
+fn dev_show_does_not_guess_an_identity_for_an_unknown_descriptor() {
+    let (_dir, files) = store_with(&["--max-files", "1", "--file-size", "1024"]);
+    let mut bytes = fs::read(&files[0]).expect("generated file is readable");
+    bytes[52] ^= 1;
+    fs::write(&files[0], bytes).expect("damage the v3 marker");
+
+    let output = caf_with_path(&["dev", "show"], &files[0], &["--verify-checksum"]);
+    assert_eq!(code(&output), 1);
+    let report = stdout(&output);
+    for field in [
+        "CAF header",
+        "Header format valid: no",
+        "File identity:",
+        "Actual: <unavailable: unknown header format>",
+        "Matches: no",
+    ] {
+        assert!(report.contains(field), "missing {field:?}: {report}");
+    }
+    assert!(!report.contains("BLAKE2b-160"), "{report}");
+    assert!(!report.contains("CAF-Merkle-BLAKE3-160"), "{report}");
 }
 
 #[test]

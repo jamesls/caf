@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use caf_format::{
-    BLOCK_SIZE, CONTENT_DOMAIN, ContentReader, ContentSeed, Digest, HEADER_SIZE, Hasher, Header,
-    block_len, hash_to_relpath, parse_hash_from_path,
+    BLOCK_SIZE, CONTENT_DOMAIN, ContentReader, ContentSeed, Digest, HEADER_SIZE, Header,
+    MetadataHasher, block_len, hash_to_relpath, parse_hash_from_path,
 };
 use serde::Deserialize;
 
@@ -201,7 +201,7 @@ fn metadata_all_digests_match_vectors() {
     for vector in &VECTORS.metadata_vectors {
         let mut names = vector.root_names.clone();
         names.sort_unstable();
-        let mut hasher = Hasher::new();
+        let mut hasher = MetadataHasher::new();
         for name in &names {
             hasher.update(name.as_bytes());
         }

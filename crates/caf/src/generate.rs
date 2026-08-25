@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
+use caf_format::Format;
 use caf_store::{Generator, ParseSizeError, SizeSpec, parse_byte_size};
 
 use crate::EXIT_FAILURE;
@@ -96,6 +97,10 @@ pub struct Args {
     #[arg(long, value_name = "DIRECTORY")]
     directory: Option<PathBuf>,
 
+    /// CAF file format to generate. Version 3 is the default.
+    #[arg(long, value_enum, default_value = "v3")]
+    format: FormatArg,
+
     /// The maximum number of files to generate.
     #[arg(
         long,
@@ -131,6 +136,22 @@ pub struct Args {
         value_parser = parse_positive
     )]
     jobs: NonZeroUsize,
+}
+
+/// Values accepted by `--format`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum FormatArg {
+    V2,
+    V3,
+}
+
+impl From<FormatArg> for Format {
+    fn from(format: FormatArg) -> Self {
+        match format {
+            FormatArg::V2 => Self::V2,
+            FormatArg::V3 => Self::V3,
+        }
+    }
 }
 
 /// Parses a worker count, rejecting values below one as usage errors.
@@ -199,6 +220,7 @@ fn generate(args: &Args) -> Result<()> {
         .context("seeding the file size sampler")?;
 
     builder
+        .format(args.format.into())
         .file_sizes(sizes)
         .jobs(args.jobs)
         .build()

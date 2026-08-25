@@ -1,6 +1,6 @@
 [package]
 name = "caf-format"
-description = "CAF version 2 file format: headers, digests, deterministic content, and hash-path rules"
+description = "CAF file formats: headers, identities, deterministic content, and hash-path rules"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 blake2 = { workspace = true }
+blake3 = { workspace = true }
 sha3 = { workspace = true }
 
 [dev-dependencies]

@@ -1,0 +1,258 @@
+{
+  "description": "Independent golden conformance vectors for the CAF v3 file format. Implementations must reproduce every byte and hash.",
+  "constants": {
+    "header_size": 60,
+    "block_size": 1048576,
+    "block_0_size": 1048516,
+    "block_size_log_2": 20,
+    "format_marker_hex": "43414603",
+    "file_id_scheme": 1,
+    "content_scheme": 1,
+    "flags": 0,
+    "descriptor_hex": "4341460301011400",
+    "content_domain": "caf:content:shake128:v3:",
+    "leaf_domain_hex": "6361663a66696c653a6c6561663a626c616b65333a763300",
+    "node_domain_hex": "6361663a66696c653a6e6f64653a626c616b65333a763300",
+    "root_domain_hex": "6361663a66696c653a726f6f743a626c616b65333a763300",
+    "merkle_hash_size": 32,
+    "file_id_size": 20,
+    "parent_file_id_size": 20,
+    "content_seed_size": 16,
+    "root_parent_file_id": "0000000000000000000000000000000000000000"
+  },
+  "file_vectors": [
+    {
+      "name": "header-only",
+      "description": "Minimum v3 file: one leaf containing only the header.",
+      "parent_file_id": "0000000000000000000000000000000000000000",
+      "content_seed": "000102030405060708090a0b0c0d0e0f",
+      "file_length": 60,
+      "block_count": 1,
+      "header": "0000000000000000000000000000000000000000000102030405060708090a0b0c0d0e0f000000000000003c53e6d262cd6e43984341460301011400",
+      "content_slices": [],
+      "leaf_hashes": [
+        "ecf20d0e6cf135b04592518fe3fa282d9524559ff61757e78bb70387196efb72"
+      ],
+      "reduction_levels": [],
+      "tree_root": "ecf20d0e6cf135b04592518fe3fa282d9524559ff61757e78bb70387196efb72",
+      "full_root": "5587a5d1fb49bcd03aa47b4563cbd567bb89fa3f1d3d7a663fd3e30e7c36eb34",
+      "file_id": "5587a5d1fb49bcd03aa47b4563cbd567bb89fa3f",
+      "relative_path": "55/87/a5/d1fb49bcd03aa47b4563cbd567bb89fa3f",
+      "file_hex": "0000000000000000000000000000000000000000000102030405060708090a0b0c0d0e0f000000000000003c53e6d262cd6e43984341460301011400"
+    },
+    {
+      "name": "one-content-byte",
+      "description": "Header plus the first v3 content byte in one leaf.",
+      "parent_file_id": "101112131415161718191a1b1c1d1e1f20212223",
+      "content_seed": "202122232425262728292a2b2c2d2e2f",
+      "file_length": 61,
+      "block_count": 1,
+      "header": "101112131415161718191a1b1c1d1e1f20212223202122232425262728292a2b2c2d2e2f000000000000003d2536d1409e5e92264341460301011400",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "10"
+        }
+      ],
+      "leaf_hashes": [
+        "44478a3810e613285addd498836fc65419fd01b633de04991d8e5c5441aea436"
+      ],
+      "reduction_levels": [],
+      "tree_root": "44478a3810e613285addd498836fc65419fd01b633de04991d8e5c5441aea436",
+      "full_root": "3cb4d18d5438e209832bd632314c15c77ea8b1b7d8f63924634914f3e803294c",
+      "file_id": "3cb4d18d5438e209832bd632314c15c77ea8b1b7",
+      "relative_path": "3c/b4/d1/8d5438e209832bd632314c15c77ea8b1b7",
+      "file_hex": "101112131415161718191a1b1c1d1e1f20212223202122232425262728292a2b2c2d2e2f000000000000003d2536d1409e5e9226434146030101140010"
+    },
+    {
+      "name": "one-complete-physical-block",
+      "description": "The file ends exactly at the 1 MiB leaf boundary.",
+      "parent_file_id": "303132333435363738393a3b3c3d3e3f40414243",
+      "content_seed": "404142434445464748494a4b4c4d4e4f",
+      "file_length": 1048576,
+      "block_count": 1,
+      "header": "303132333435363738393a3b3c3d3e3f40414243404142434445464748494a4b4c4d4e4f000000000010000093e52226d1edbd334341460301011400",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "0f9a50f340c75a7696c58b77b72f8b6c77498fffa043f0755b34bfc6c995bffa"
+        },
+        {
+          "file_offset": 1048544,
+          "hex": "2b13a8425b9cabd2b176ac95dcfc1e93a96f3ba72d74add5f6b2719aabac2f85"
+        }
+      ],
+      "leaf_hashes": [
+        "cfa5a383262167970c9ca8d269ddf3f8ae8f0c87c4c8422a12c7a83a2a97cd7c"
+      ],
+      "reduction_levels": [],
+      "tree_root": "cfa5a383262167970c9ca8d269ddf3f8ae8f0c87c4c8422a12c7a83a2a97cd7c",
+      "full_root": "89059b6ef66efc3c23bf50acb5534a4c04b463dd60ed6a686f5e4b2d9e109470",
+      "file_id": "89059b6ef66efc3c23bf50acb5534a4c04b463dd",
+      "relative_path": "89/05/9b/6ef66efc3c23bf50acb5534a4c04b463dd",
+      "file_hex": null
+    },
+    {
+      "name": "first-byte-of-second-block",
+      "description": "A two-leaf file ending one byte after the boundary.",
+      "parent_file_id": "505152535455565758595a5b5c5d5e5f60616263",
+      "content_seed": "606162636465666768696a6b6c6d6e6f",
+      "file_length": 1048577,
+      "block_count": 2,
+      "header": "505152535455565758595a5b5c5d5e5f60616263606162636465666768696a6b6c6d6e6f000000000010000134931e2865c872224341460301011400",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "f6e2af285a352c724276421a1aad2746ed6c6608a052490e2adfa263093f8694"
+        },
+        {
+          "file_offset": 1048545,
+          "hex": "995f162ee03918d24de339f71cf2f74b25b1e5e2215ec1e5b1d5ea0a331eb488"
+        },
+        {
+          "file_offset": 1048560,
+          "hex": "4b25b1e5e2215ec1e5b1d5ea0a331eb488"
+        }
+      ],
+      "leaf_hashes": [
+        "e44dc58d46566a2eb1fadaff528f9c83a19e3a9a284bb2a0d8e29863fadd9856",
+        "0e37a93b65d5dfc5ce2fab99c118585b511d77f9af54a0ca398bb616765c676d"
+      ],
+      "reduction_levels": [
+        {
+          "level": 1,
+          "hashes": [
+            "3cc4ea8d1afb8c0ba8279d24e5ff995a77d806df703abd693c95f536a0f3a880"
+          ]
+        }
+      ],
+      "tree_root": "3cc4ea8d1afb8c0ba8279d24e5ff995a77d806df703abd693c95f536a0f3a880",
+      "full_root": "d8d7583094f2f96604e2624c049d5ea9f1f1848a3e82d6449475fe892b19cd96",
+      "file_id": "d8d7583094f2f96604e2624c049d5ea9f1f1848a",
+      "relative_path": "d8/d7/58/3094f2f96604e2624c049d5ea9f1f1848a",
+      "file_hex": null
+    },
+    {
+      "name": "three-complete-blocks",
+      "description": "Three leaves exercise an odd child in level one.",
+      "parent_file_id": "707172737475767778797a7b7c7d7e7f80818283",
+      "content_seed": "808182838485868788898a8b8c8d8e8f",
+      "file_length": 3145728,
+      "block_count": 3,
+      "header": "707172737475767778797a7b7c7d7e7f80818283808182838485868788898a8b8c8d8e8f000000000030000002eb1f99673427ef4341460301011400",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "4d64eacd569b5690691b50a56939e894d1527d89e7abcc002899004b44a31006"
+        },
+        {
+          "file_offset": 1048560,
+          "hex": "f350c97a828737006bc252e5f33f38a5cb5297d41801472cd236412e00d079b7"
+        },
+        {
+          "file_offset": 2097136,
+          "hex": "a17c8d043511638b4937cbf81ddba79733fab3f4b206e3e8ff5d500d980e9f01"
+        },
+        {
+          "file_offset": 3145696,
+          "hex": "1dd21b58ebb482b39711a6858a6824a77a7a57ea6eeca1d54f3ab5ce1a048803"
+        }
+      ],
+      "leaf_hashes": [
+        "c6083b15c5ad8ccddcd88616ec30bbf0c76f04bd3d274df198277c81de5b9695",
+        "dbcc02975cb030bf50e0f9de9aa8298394576a2f545416e6daec9fa9e5516d3a",
+        "d73a590ed58e80e84d74bf1e1386f70639ea17205bd00b7777bf56b7a7a3f770"
+      ],
+      "reduction_levels": [
+        {
+          "level": 1,
+          "hashes": [
+            "13fc1a01518c8deb48d71738639f70f679f0ad59676ca572fc4d5ce9caab1d35",
+            "bab7a41611ce63caf67ec0b1bb808b6413461e72d4a637e834eda85a1a99ae44"
+          ]
+        },
+        {
+          "level": 2,
+          "hashes": [
+            "66db75a59fd1855dd2d096237a4f5eeb2e6ac0cb80627377033ca28a4f1238c1"
+          ]
+        }
+      ],
+      "tree_root": "66db75a59fd1855dd2d096237a4f5eeb2e6ac0cb80627377033ca28a4f1238c1",
+      "full_root": "20f4f899c03ecf684dc137f5b8caa43d9cecbded8ef807cf3803b74a20268ce6",
+      "file_id": "20f4f899c03ecf684dc137f5b8caa43d9cecbded",
+      "relative_path": "20/f4/f8/99c03ecf684dc137f5b8caa43d9cecbded",
+      "file_hex": null
+    },
+    {
+      "name": "five-leaf-tree",
+      "description": "Four complete blocks plus one byte exercise singleton nodes at two levels.",
+      "parent_file_id": "909192939495969798999a9b9c9d9e9fa0a1a2a3",
+      "content_seed": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "file_length": 4194305,
+      "block_count": 5,
+      "header": "909192939495969798999a9b9c9d9e9fa0a1a2a3a0a1a2a3a4a5a6a7a8a9aaabacadaeaf0000000000400001be56364ddace058c4341460301011400",
+      "content_slices": [
+        {
+          "file_offset": 60,
+          "hex": "2977faf3610c23235c8bb8271efa6fea9fdf639501b99e5292d3af7f94b75cea"
+        },
+        {
+          "file_offset": 1048560,
+          "hex": "2596819eb61d1ba09e59653bf42e291e0aba21f66d44f21e16206d14ad82eb9a"
+        },
+        {
+          "file_offset": 2097136,
+          "hex": "9c0c4c51eef16bbb97af457f692c4e2e9f4705295df221113062aea3bc5f8068"
+        },
+        {
+          "file_offset": 3145712,
+          "hex": "4fcaec8a2893eadf90df333209559ff2ccb7534e59d4ab6bef82e050887dec10"
+        },
+        {
+          "file_offset": 4194273,
+          "hex": "3d2aaa641a5188a1dce7f0f3915a11f90ba6f4d5c63e748553111cb0d91d4fd9"
+        },
+        {
+          "file_offset": 4194288,
+          "hex": "f90ba6f4d5c63e748553111cb0d91d4fd9"
+        }
+      ],
+      "leaf_hashes": [
+        "d3cdda9141e1815a28c7366518c06e38cdad50d71a7c81d0e2311c59032d170c",
+        "b312c89bfebdcbd6003464fe1b67f2d1769c71858bdf8ad528ed721905f8bbcf",
+        "ec80f534adc918afeba0e1d33d6c2e2cb928946b3bd8b80f3143c4f98d59c81a",
+        "b0818edf69d2749f34484761ca52dc7a369a72cadf6d6fe3e596e1541bdb3d53",
+        "f90a480c9980bdff47fda7df0ffa772c73614b83237f1a2feaef5001b51ee112"
+      ],
+      "reduction_levels": [
+        {
+          "level": 1,
+          "hashes": [
+            "3b6a16c02fec6dde2532120473402a8211778269f442059b0c13ebc183c063e4",
+            "7800b1038dd48e1dad696b7e6fe900738e74bc04f198500c737db11c5d351418",
+            "f24b3598eb38591c2807a8d496afa5df798448fb1bb59c5a4c83f71f38e52597"
+          ]
+        },
+        {
+          "level": 2,
+          "hashes": [
+            "388e4f70a3d719dc3f3ea0aa6e16ff7553725d722997cca2f1d38a31988096b5",
+            "5aac8f11582d82e17eb3c00cae9a02884bc4f70887382cf9aff4f0e1d101af78"
+          ]
+        },
+        {
+          "level": 3,
+          "hashes": [
+            "3a8aef8226d185240765aa5d26dc8297dd66696d116329d7d7f95376bd64acba"
+          ]
+        }
+      ],
+      "tree_root": "3a8aef8226d185240765aa5d26dc8297dd66696d116329d7d7f95376bd64acba",
+      "full_root": "af600c7c0c31691aea9a5f9ead1cf9c7162d5fe8dc095ed9602b5e57eb34d635",
+      "file_id": "af600c7c0c31691aea9a5f9ead1cf9c7162d5fe8",
+      "relative_path": "af/60/0c/7c0c31691aea9a5f9ead1cf9c7162d5fe8",
+      "file_hex": null
+    }
+  ]
+}

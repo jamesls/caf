@@ -8,7 +8,7 @@ members = [
 
 [workspace.package]
 # This release does not change the version 2 file format.
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # Rust 1.85 is the minimum version that supports edition 2024. CI builds
 # with it on every supported platform.

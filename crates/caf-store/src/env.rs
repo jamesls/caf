@@ -11,10 +11,11 @@
 //! The abstraction is deliberately thin — one method per syscall the
 //! crate makes, with `std` types in the signatures — so the native path
 //! stays a direct call. [`FileHandle`] carries the positional
-//! ([`write_all_at`](FileHandle::write_all_at)) and preallocating
-//! ([`set_len`](FileHandle::set_len)) operations parallel generation
-//! needs alongside the cursor-based [`Read`]/[`Write`] impls the
-//! sequential paths use.
+//! ([`read_full_at`](FileHandle::read_full_at),
+//! [`write_all_at`](FileHandle::write_all_at)) and preallocating
+//! ([`set_len`](FileHandle::set_len)) operations parallel generation and
+//! verification need alongside the cursor-based [`Read`]/[`Write`] impls
+//! the sequential paths use.
 
 #[cfg(feature = "test-util")]
 pub(crate) mod mock;
@@ -299,6 +300,46 @@ impl FileHandle {
         }
     }
 
+    /// Reads once into `buf` at `offset`, independently of the file
+    /// cursor. The read may be short and returns zero at end-of-file.
+    /// Windows implements this with `seek_read`, which can move the
+    /// handle's cursor as a side effect, so callers must not overlap
+    /// positional reads with cursor-based I/O on the same handle.
+    pub(crate) fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Native(file) => std::os::unix::fs::FileExt::read_at(file, buf, offset),
+            #[cfg(windows)]
+            Self::Native(file) => std::os::windows::fs::FileExt::seek_read(file, buf, offset),
+            #[cfg(feature = "test-util")]
+            Self::Mocked(file) => file.read_at(buf, offset),
+        }
+    }
+
+    /// Reads into `buf` at `offset` until it is full or EOF is reached.
+    ///
+    /// Interrupted reads are retried and short reads advance both the
+    /// buffer and file offset. A zero-byte read stops immediately, so an
+    /// unexpected EOF cannot spin.
+    pub(crate) fn read_full_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            let at = offset.checked_add(filled as u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "positional read offset overflow",
+                )
+            })?;
+            match self.read_at(&mut buf[filled..], at) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(filled)
+    }
+
     /// Writes all of `buf` at `offset`, independent of the file cursor.
     ///
     /// The offset travels with each call and no shared cursor moves, so
@@ -388,10 +429,56 @@ impl Seek for FileHandle {
 
 #[cfg(all(test, feature = "test-util"))]
 mod tests {
-    use std::io;
+    use std::io::{self, Read as _};
     use std::num::NonZeroUsize;
+    use std::path::Path;
 
+    use super::Env;
     use crate::{Generator, SizeChooser};
+
+    #[test]
+    fn mocked_positional_reads_retry_and_do_not_move_the_cursor() {
+        let (env, ctrl) = Env::mocked();
+        ctrl.write_file("/file", b"0123456789".to_vec())
+            .expect("the fixture is writable");
+        let mut file = env.open(Path::new("/file")).expect("the file opens");
+
+        let mut cursor_prefix = [0_u8; 2];
+        file.read_exact(&mut cursor_prefix).expect("cursor read");
+        assert_eq!(&cursor_prefix, b"01");
+
+        ctrl.interrupt_next_read_at();
+        ctrl.limit_next_read_at(2);
+        let mut positional = [0_u8; 6];
+        let got = file
+            .read_full_at(&mut positional, 3)
+            .expect("interrupted and short reads are retried");
+        assert_eq!(got, positional.len());
+        assert_eq!(&positional, b"345678");
+
+        let mut cursor_suffix = [0_u8; 2];
+        file.read_exact(&mut cursor_suffix)
+            .expect("cursor remains at 2");
+        assert_eq!(&cursor_suffix, b"23");
+    }
+
+    #[test]
+    fn mocked_positional_read_stops_on_eof_and_injects_offset_failures() {
+        let (env, ctrl) = Env::mocked();
+        ctrl.write_file("/file", b"abcdef".to_vec())
+            .expect("the fixture is writable");
+        let file = env.open(Path::new("/file")).expect("the file opens");
+
+        let mut tail = [0_u8; 8];
+        assert_eq!(file.read_full_at(&mut tail, 4).expect("read to EOF"), 2);
+        assert_eq!(&tail[..2], b"ef");
+
+        ctrl.fail_read_at(3, io::ErrorKind::PermissionDenied);
+        let error = file
+            .read_full_at(&mut tail, 0)
+            .expect_err("the requested range covers the failed offset");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     /// The point of the dispatch: a full generate-then-verify round trip
     /// with no syscall behind it, serially and on the worker pipeline.

@@ -10,7 +10,9 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use caf_format::{ContentReader, ContentSeed, Digest, HEADER_SIZE, Hasher, Header, hash_to_path};
+use caf_format::{
+    BLOCK_SIZE, ContentReader, ContentSeed, Digest, HEADER_SIZE, Hasher, Header, hash_to_path,
+};
 use caf_store::{
     CorruptionClass, CorruptionPattern, Diagnostic, GenerationReport, Generator, Severity,
     SizeChooser, VerificationReport, Verifier,
@@ -979,17 +981,68 @@ fn parallel_verification_matches_serial_on_a_clean_store() {
 }
 
 #[test]
+fn within_file_digest_and_analysis_match_serial_across_boundaries() {
+    let store = tempfile::tempdir().expect("create temp store");
+    generate(store.path(), 1, 9 * BLOCK_SIZE as u64 + 1);
+    let [file] = &*data_files(store.path()) else {
+        panic!("exactly one data file is generated");
+    };
+    // Cross both kinds of boundary: CAF blocks begin at absolute 1 MiB
+    // offsets, while verification segments begin after the 60-byte
+    // header. The non-divisor analysis chunk also crosses both rather
+    // than accidentally splitting there.
+    overwrite(file, BLOCK_SIZE as u64 - 17, &[0xA5; 64]);
+    overwrite(
+        file,
+        HEADER_SIZE as u64 + 4 * BLOCK_SIZE as u64 - 19,
+        &[0x5A; 80],
+    );
+    let chunk_size = positive(70_001);
+    let serial = Verifier::new(store.path())
+        .analysis_chunk_size(chunk_size)
+        .verify()
+        .expect("serial verification runs");
+    assert!(!serial.success());
+
+    for jobs in [2, 4, 8, 16] {
+        let parallel = Verifier::new(store.path())
+            .analysis_chunk_size(chunk_size)
+            .jobs(positive(jobs))
+            .verify()
+            .expect("parallel verification runs");
+        let serial_keys: Vec<String> = serial.diagnostics().iter().map(diagnostic_key).collect();
+        let parallel_keys: Vec<String> =
+            parallel.diagnostics().iter().map(diagnostic_key).collect();
+        assert_eq!(parallel_keys, serial_keys, "jobs {jobs}");
+    }
+}
+
+#[test]
 fn parallel_verification_matches_serial_on_a_corrupted_store() {
     // One store with every diagnostic family at once: content
-    // corruption, truncation, a stray temp file, a wrong-path copy,
-    // and a broken chain (missing parent plus orphan).
+    // corruption, truncation, an invalid header, a stray temp file, a
+    // wrong-path copy, a broken chain (missing parent plus orphan), and
+    // a bad chain-tip aggregate.
     let store = tempfile::tempdir().expect("create temp store");
     let generation = generate(store.path(), 12, 2048);
     let files = data_files(store.path());
-    overwrite(&files[1], 100, b"corrupt_data");
-    truncate(&files[3], 1024);
+    let victim = hash_to_path(
+        store.path(),
+        parent_of(store.path(), generation.chain_tip()),
+    );
+    let fixtures: Vec<&PathBuf> = files
+        .iter()
+        .filter(|path| *path != &victim)
+        .take(4)
+        .collect();
+    let [content_file, truncated_file, copy_file, invalid_header] = &*fixtures else {
+        panic!("enough generated files remain for every corruption fixture");
+    };
+    overwrite(content_file, 100, b"corrupt_data");
+    truncate(truncated_file, 1024);
+    overwrite(invalid_header, 55, &[0x01]);
     fs::write(store.path().join("00000000000000005678cdef"), b"stray").expect("write the stray");
-    let copy_bytes = fs::read(&files[5]).expect("data files are readable");
+    let copy_bytes = fs::read(copy_file).expect("data files are readable");
     let real_digest = Digest::compute(&copy_bytes);
     let mut hex = real_digest.to_hex();
     let flipped = if hex.starts_with('0') { "f" } else { "0" };
@@ -999,8 +1052,8 @@ fn parallel_verification_matches_serial_on_a_corrupted_store() {
     fs::create_dir_all(wrong_path.parent().expect("hash paths have parents"))
         .expect("create shard directories");
     fs::write(&wrong_path, &copy_bytes).expect("write the copy");
-    let victim = parent_of(store.path(), generation.chain_tip());
-    fs::remove_file(hash_to_path(store.path(), victim)).expect("delete the mid-chain file");
+    fs::remove_file(victim).expect("delete the mid-chain file");
+    fs::write(store.path().join(".metadata/all"), b"bad").expect("damage the aggregate");
 
     let serial = verify(store.path());
     assert!(!serial.success());
@@ -1009,7 +1062,7 @@ fn parallel_verification_matches_serial_on_a_corrupted_store() {
         "{:?}",
         serial.diagnostics()
     );
-    for jobs in [2, 4, 8] {
+    for jobs in [1, 2, 4, 8, 32] {
         assert_matches_serial(store.path(), &serial, jobs);
     }
 }

@@ -30,6 +30,10 @@ detection:
     - 4096 bytes: Standard 4KB block analysis (default)
     - 65536 bytes: Fast scanning for large files
 
+The --jobs option is a global verification-worker budget. Files are
+validated concurrently, and spare workers read and analyze segments of
+large files while their ordered whole-file digest is computed.
+
 When corruption is detected, the verifier will:
 
     - Identify exact corrupted byte ranges
@@ -56,8 +60,10 @@ pub struct Args {
     )]
     chunk_size: NonZeroUsize,
 
-    /// Number of worker threads for file validation. Defaults to 1
-    /// (serial verification); results are identical at any count.
+    /// Global verification-worker budget. Different files run in
+    /// parallel, and large files use spare workers for segment reads and
+    /// corruption analysis. Defaults to 1 (serial verification); results
+    /// are identical at any count.
     #[arg(
         long,
         value_name = "INTEGER",

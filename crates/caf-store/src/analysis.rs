@@ -10,9 +10,15 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread;
 
 use caf_format::{ContentReader, ContentSeed, Digest, HEADER_SIZE, Header};
+
+use crate::env::FileHandle;
 
 /// A chunk is `sparse` when fewer than this fraction of its bytes differ.
 const SPARSE_RATE: f64 = 0.1;
@@ -20,6 +26,77 @@ const SPARSE_RATE: f64 = 0.1;
 const ALIGNMENT_BOUNDARIES: [usize; 4] = [512, 1024, 4096, 8192];
 /// Only the first this-many differing positions are alignment-checked.
 const ALIGNMENT_POSITIONS: usize = 5;
+/// Target bytes compared by one independently scheduled task.
+const ANALYSIS_TASK_BYTES: usize = 8 * 1024 * 1024;
+/// Aggregate actual-plus-expected task buffers allowed per verification.
+const ANALYSIS_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Shared task-buffer budget for one verification run.
+#[derive(Debug)]
+pub(crate) struct AnalysisMemory {
+    used: Mutex<usize>,
+    available: Condvar,
+    limit: usize,
+}
+
+impl AnalysisMemory {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(ANALYSIS_MEMORY_BYTES)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            used: Mutex::new(0),
+            available: Condvar::new(),
+            limit,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, usize> {
+        self.used.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reserves actual-plus-expected bytes before either task buffer is
+    /// allocated. A panic aborts blocked sibling tasks; an I/O error only
+    /// stops new claims, so already-claimed lower-offset tasks still run
+    /// and can supply the deterministic first error.
+    fn acquire<'memory>(
+        &'memory self,
+        bytes: usize,
+        gate: &AnalysisGate,
+    ) -> Option<AnalysisMemoryPermit<'memory>> {
+        debug_assert!(bytes <= self.limit, "one task fits the analysis budget");
+        let mut used = self.lock();
+        loop {
+            if gate.aborted() {
+                return None;
+            }
+            if bytes <= self.limit - *used {
+                *used += bytes;
+                return Some(AnalysisMemoryPermit {
+                    memory: self,
+                    bytes,
+                });
+            }
+            used = self
+                .available
+                .wait(used)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+struct AnalysisMemoryPermit<'memory> {
+    memory: &'memory AnalysisMemory,
+    bytes: usize,
+}
+
+impl Drop for AnalysisMemoryPermit<'_> {
+    fn drop(&mut self) {
+        *self.memory.lock() -= self.bytes;
+        self.memory.available.notify_all();
+    }
+}
 
 /// The kind of corruption observed in one region of a file.
 ///
@@ -311,29 +388,425 @@ pub(crate) fn analyze(
         remaining -= got as u64;
     }
 
-    if actual_size < expected_size {
-        let missing_bytes = expected_size - actual_size;
-        push_region(
-            &mut regions,
-            CorruptionRegion::new(
-                actual_size,
-                missing_bytes,
-                CorruptionPattern::Truncated { missing_bytes },
-            ),
-        );
-    } else if actual_size > expected_size {
-        let extra_count = actual_size - expected_size;
-        push_region(
-            &mut regions,
-            CorruptionRegion::new(
-                expected_size,
-                extra_count,
-                CorruptionPattern::ExtraBytes { extra_count },
-            ),
-        );
-    }
+    append_size_region(&mut regions, actual_size, expected_size);
 
     Ok(regions)
+}
+
+/// Positional, parallel corruption analysis for one file group.
+///
+/// Tasks begin on exact analysis-chunk boundaries measured from the
+/// first content byte. Results are merged by task index, so task and I/O
+/// completion order cannot affect region classification or ordering.
+/// `width` is the whole file-group width; the calling coordinator also
+/// executes tasks, keeping total live threads within it.
+pub(crate) fn analyze_parallel(
+    source: &FileHandle,
+    header: &Header,
+    actual_size: u64,
+    chunk_size: NonZeroUsize,
+    width: usize,
+    memory: &AnalysisMemory,
+) -> io::Result<Vec<CorruptionRegion>> {
+    let expected_size = header.file_length();
+    let compare_end = actual_size.min(expected_size);
+    let compare_len = compare_end.saturating_sub(HEADER_SIZE as u64);
+    if compare_len == 0 {
+        let mut regions = Vec::new();
+        append_size_region(&mut regions, actual_size, expected_size);
+        return Ok(regions);
+    }
+
+    let chunks_per_task = (ANALYSIS_TASK_BYTES / chunk_size.get()).max(1);
+    let task_len = chunks_per_task
+        .checked_mul(chunk_size.get())
+        .expect("analysis chunks are clamped to 64 MiB");
+    let total_tasks = compare_len.div_ceil(task_len as u64);
+    let lanes = analysis_lane_count(width, task_len, total_tasks);
+    debug_assert!(lanes > 0, "parallel analysis has content and spare lanes");
+
+    let plan = AnalysisPlan {
+        source,
+        seed: header.content_seed(),
+        compare_len,
+        chunk_size: chunk_size.get(),
+        task_len,
+        total_tasks,
+        lanes,
+    };
+    let mut collection = run_parallel_analysis(&plan, memory);
+    debug_assert!(
+        collection.failure.is_some()
+            || collection.panic_payload.is_some()
+            || collection.next_result == total_tasks,
+        "every successful analysis task is collected"
+    );
+    if let Some(payload) = collection.panic_payload {
+        panic::resume_unwind(payload);
+    }
+    if let Some((_index, source)) = collection.failure {
+        return Err(source);
+    }
+
+    append_size_region(&mut collection.regions, actual_size, expected_size);
+    Ok(collection.regions)
+}
+
+fn analysis_lane_count(width: usize, task_len: usize, total_tasks: u64) -> usize {
+    debug_assert!(task_len > 0, "an analysis task contains at least one chunk");
+    debug_assert!(total_tasks > 0, "analysis lanes require content to compare");
+    let memory_lanes = (ANALYSIS_MEMORY_BYTES / task_len.saturating_mul(2)).max(1);
+    width
+        .min(memory_lanes)
+        .min(usize::try_from(total_tasks).unwrap_or(usize::MAX))
+}
+
+#[derive(Clone, Copy)]
+struct AnalysisPlan<'file> {
+    source: &'file FileHandle,
+    seed: ContentSeed,
+    compare_len: u64,
+    chunk_size: usize,
+    task_len: usize,
+    total_tasks: u64,
+    lanes: usize,
+}
+
+fn run_parallel_analysis(plan: &AnalysisPlan<'_>, memory: &AnalysisMemory) -> AnalysisCollection {
+    let window = plan.lanes.saturating_mul(4);
+    let gate = AnalysisGate::new();
+    let (sender, receiver) = mpsc::sync_channel(window);
+
+    thread::scope(|scope| {
+        // The coordinator below is one analysis lane. Every additional
+        // lane runs the same claim loop on a scoped worker thread.
+        for _ in 1..plan.lanes {
+            let sender = sender.clone();
+            let gate = &gate;
+            scope.spawn(move || {
+                let worked = panic::catch_unwind(AssertUnwindSafe(|| {
+                    analyze_tasks(plan, gate, window, memory, &sender);
+                }));
+                if let Err(payload) = worked {
+                    gate.abort(memory);
+                    let _ignored = sender.send(AnalysisMessage::Panic(payload));
+                }
+            });
+        }
+        drop(sender);
+
+        let mut collection = AnalysisCollection::new();
+        let worked = panic::catch_unwind(AssertUnwindSafe(|| {
+            loop {
+                while let Ok(message) = receiver.try_recv() {
+                    collection.absorb(message);
+                    gate.collected_through(collection.next_result);
+                }
+
+                let index = match gate.try_claim(plan.total_tasks, window) {
+                    AnalysisClaim::Index(index) => index,
+                    AnalysisClaim::Blocked => {
+                        // Receiving while blocked lets the missing early
+                        // result advance the claim window without
+                        // deadlocking behind a full result channel.
+                        match receiver.recv() {
+                            Ok(message) => {
+                                collection.absorb(message);
+                                gate.collected_through(collection.next_result);
+                            }
+                            Err(_disconnected) => break,
+                        }
+                        continue;
+                    }
+                    AnalysisClaim::Stopped => break,
+                };
+                let Some(result) = analyze_task(plan, index, memory, &gate) else {
+                    break;
+                };
+                if result.is_err() {
+                    gate.stop();
+                }
+                collection.absorb(AnalysisMessage::Task { index, result });
+                gate.collected_through(collection.next_result);
+            }
+        }));
+        if let Err(payload) = worked {
+            gate.abort(memory);
+            collection.absorb(AnalysisMessage::Panic(payload));
+        }
+
+        // Worker senders close after all siblings observe exhaustion or
+        // cancellation. Drain every in-flight result before the scope
+        // joins and before a panic is resumed.
+        for message in receiver {
+            collection.absorb(message);
+            gate.collected_through(collection.next_result);
+        }
+        collection
+    })
+}
+
+fn analyze_tasks(
+    plan: &AnalysisPlan<'_>,
+    gate: &AnalysisGate,
+    window: usize,
+    memory: &AnalysisMemory,
+    sender: &SyncSender<AnalysisMessage>,
+) {
+    while let Some(index) = gate.claim(plan.total_tasks, window) {
+        let Some(result) = analyze_task(plan, index, memory, gate) else {
+            return;
+        };
+        if result.is_err() {
+            gate.stop();
+        }
+        if sender
+            .send(AnalysisMessage::Task { index, result })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Hands out analysis tasks no farther than the bounded reorder window
+/// ahead of the lowest result not yet collected.
+struct AnalysisGate {
+    state: Mutex<AnalysisGateState>,
+    changed: Condvar,
+}
+
+struct AnalysisGateState {
+    next_claim: u64,
+    collected: u64,
+    stopped: bool,
+    aborted: bool,
+}
+
+enum AnalysisClaim {
+    Index(u64),
+    Blocked,
+    Stopped,
+}
+
+impl AnalysisGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AnalysisGateState {
+                next_claim: 0,
+                collected: 0,
+                stopped: false,
+                aborted: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AnalysisGateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Nonblocking claim for the coordinator, which must remain able to
+    /// drain the result channel when the ordered window is full.
+    fn try_claim(&self, total: u64, window: usize) -> AnalysisClaim {
+        let mut state = self.lock();
+        if state.stopped || state.next_claim >= total {
+            return AnalysisClaim::Stopped;
+        }
+        let limit = state
+            .collected
+            .saturating_add(u64::try_from(window).unwrap_or(u64::MAX));
+        if state.next_claim >= limit {
+            return AnalysisClaim::Blocked;
+        }
+        let index = state.next_claim;
+        state.next_claim += 1;
+        AnalysisClaim::Index(index)
+    }
+
+    /// Blocking worker claim. Cancellation and ordered collection both
+    /// wake waiters, so errors and panics cannot strand sibling lanes.
+    fn claim(&self, total: u64, window: usize) -> Option<u64> {
+        let mut state = self.lock();
+        loop {
+            if state.stopped || state.next_claim >= total {
+                return None;
+            }
+            let limit = state
+                .collected
+                .saturating_add(u64::try_from(window).unwrap_or(u64::MAX));
+            if state.next_claim < limit {
+                let index = state.next_claim;
+                state.next_claim += 1;
+                return Some(index);
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn collected_through(&self, next_result: u64) {
+        let mut state = self.lock();
+        if next_result > state.collected {
+            state.collected = next_result;
+            drop(state);
+            self.changed.notify_all();
+        }
+    }
+
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.changed.notify_all();
+    }
+
+    fn aborted(&self) -> bool {
+        self.lock().aborted
+    }
+
+    /// Stops new claims and wakes tasks blocked on the shared memory
+    /// budget. Taking the memory lock before the gate lock matches
+    /// `AnalysisMemory::acquire`, preventing a cancellation wakeup from
+    /// being lost between its abort check and condition-variable wait.
+    fn abort(&self, memory: &AnalysisMemory) {
+        let _memory = memory.lock();
+        let mut state = self.lock();
+        state.stopped = true;
+        state.aborted = true;
+        drop(state);
+        self.changed.notify_all();
+        memory.available.notify_all();
+    }
+}
+
+fn analyze_task(
+    plan: &AnalysisPlan<'_>,
+    index: u64,
+    memory: &AnalysisMemory,
+    gate: &AnalysisGate,
+) -> Option<io::Result<Vec<CorruptionRegion>>> {
+    let content_offset = index * plan.task_len as u64;
+    let len = usize::try_from((plan.compare_len - content_offset).min(plan.task_len as u64))
+        .expect("a task is bounded by task_len");
+    let _memory = memory.acquire(len.saturating_mul(2), gate)?;
+    Some((|| {
+        let file_offset = HEADER_SIZE as u64 + content_offset;
+        let mut actual = vec![0_u8; len];
+        let got = plan.source.read_full_at(&mut actual, file_offset)?;
+        actual.truncate(got);
+        let mut expected = vec![0_u8; got];
+        ContentReader::new_with_offset(plan.seed, content_offset)
+            .read_exact(&mut expected)
+            .expect("the content stream is infinite and never fails");
+
+        let mut regions = Vec::new();
+        for (chunk_index, (actual, expected)) in actual
+            .chunks(plan.chunk_size)
+            .zip(expected.chunks(plan.chunk_size))
+            .enumerate()
+        {
+            if actual != expected {
+                let relative = chunk_index * plan.chunk_size;
+                push_region(
+                    &mut regions,
+                    CorruptionRegion::new(
+                        file_offset + relative as u64,
+                        actual.len() as u64,
+                        classify_chunk(actual, expected),
+                    ),
+                );
+            }
+        }
+        Ok(regions)
+    })())
+}
+
+enum AnalysisMessage {
+    Task {
+        index: u64,
+        result: io::Result<Vec<CorruptionRegion>>,
+    },
+    Panic(Box<dyn std::any::Any + Send>),
+}
+
+/// Ordered, bounded fold of analysis task messages.
+struct AnalysisCollection {
+    pending: std::collections::BTreeMap<u64, Vec<CorruptionRegion>>,
+    next_result: u64,
+    regions: Vec<CorruptionRegion>,
+    failure: Option<(u64, io::Error)>,
+    panic_payload: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl AnalysisCollection {
+    fn new() -> Self {
+        Self {
+            pending: std::collections::BTreeMap::new(),
+            next_result: 0,
+            regions: Vec::new(),
+            failure: None,
+            panic_payload: None,
+        }
+    }
+
+    fn absorb(&mut self, message: AnalysisMessage) {
+        match message {
+            AnalysisMessage::Task { index, result } => match result {
+                Ok(task_regions) => {
+                    self.pending.insert(index, task_regions);
+                    while let Some(task_regions) = self.pending.remove(&self.next_result) {
+                        for region in task_regions {
+                            push_region(&mut self.regions, region);
+                        }
+                        self.next_result += 1;
+                    }
+                }
+                Err(source) => {
+                    if self
+                        .failure
+                        .as_ref()
+                        .is_none_or(|(recorded, _source)| index < *recorded)
+                    {
+                        self.failure = Some((index, source));
+                    }
+                }
+            },
+            AnalysisMessage::Panic(payload) => {
+                if self.panic_payload.is_none() {
+                    self.panic_payload = Some(payload);
+                }
+            }
+        }
+    }
+}
+
+fn append_size_region(regions: &mut Vec<CorruptionRegion>, actual_size: u64, expected_size: u64) {
+    match actual_size.cmp(&expected_size) {
+        std::cmp::Ordering::Less => {
+            let missing_bytes = expected_size - actual_size;
+            push_region(
+                regions,
+                CorruptionRegion::new(
+                    actual_size,
+                    missing_bytes,
+                    CorruptionPattern::Truncated { missing_bytes },
+                ),
+            );
+        }
+        std::cmp::Ordering::Greater => {
+            let extra_count = actual_size - expected_size;
+            push_region(
+                regions,
+                CorruptionRegion::new(
+                    expected_size,
+                    extra_count,
+                    CorruptionPattern::ExtraBytes { extra_count },
+                ),
+            );
+        }
+        std::cmp::Ordering::Equal => {}
+    }
 }
 
 /// Appends `region`, merging it into the previous region when they are
@@ -430,11 +903,15 @@ pub(crate) fn read_full(mut source: impl Read, buf: &mut [u8]) -> io::Result<usi
 mod tests {
     use std::io::{Cursor, Read as _, Write as _};
     use std::num::NonZeroUsize;
+    use std::sync::{Barrier, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     use caf_format::{ContentReader, ContentSeed, Digest, HEADER_SIZE, Header};
 
     use super::{
-        CorruptionClass, CorruptionPattern, CorruptionRegion, CorruptionReport, analyze,
+        ANALYSIS_MEMORY_BYTES, AnalysisClaim, AnalysisGate, AnalysisMemory, CorruptionClass,
+        CorruptionPattern, CorruptionRegion, CorruptionReport, analysis_lane_count, analyze,
         check_alignment, classify_chunk, push_region,
     };
 
@@ -469,6 +946,86 @@ mod tests {
     fn clean_content_yields_no_regions() {
         let bytes = clean_file(4096);
         assert_eq!(regions_of(&bytes, 256), Vec::new());
+    }
+
+    #[test]
+    fn analysis_lanes_honor_the_actual_plus_expected_memory_limit() {
+        let mib = 1024 * 1024;
+        assert_eq!(analysis_lane_count(256, 64 * mib, 100), 2);
+        assert_eq!(analysis_lane_count(256, 8 * mib, 100), 16);
+        assert_eq!(analysis_lane_count(256, ANALYSIS_MEMORY_BYTES, 100), 1);
+        assert_eq!(analysis_lane_count(256, 8 * mib, 3), 3);
+    }
+
+    #[test]
+    fn analysis_memory_is_shared_and_released_across_groups() {
+        let memory = AnalysisMemory::with_limit(10);
+        let first_gate = AnalysisGate::new();
+        let second_gate = AnalysisGate::new();
+        let first = memory.acquire(8, &first_gate).expect("first permit");
+        let barrier = Barrier::new(2);
+        let (sender, receiver) = mpsc::channel();
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                let second = memory.acquire(8, &second_gate).expect("second permit");
+                sender.send(()).expect("the test receiver remains");
+                drop(second);
+            });
+            barrier.wait();
+            assert_eq!(*memory.lock(), 8);
+            assert!(receiver.try_recv().is_err());
+            drop(first);
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("releasing the first group wakes the second");
+        });
+        assert_eq!(*memory.lock(), 0);
+    }
+
+    #[test]
+    fn analysis_memory_waiters_wake_when_their_group_aborts() {
+        let memory = AnalysisMemory::with_limit(10);
+        let occupying_gate = AnalysisGate::new();
+        let blocked_gate = AnalysisGate::new();
+        let occupying = memory
+            .acquire(10, &occupying_gate)
+            .expect("occupying permit");
+        let barrier = Barrier::new(2);
+        let (sender, receiver) = mpsc::channel();
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                sender
+                    .send(memory.acquire(8, &blocked_gate).is_none())
+                    .expect("the test receiver remains");
+            });
+            barrier.wait();
+            blocked_gate.abort(&memory);
+            assert!(
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("abort wakes the blocked task")
+            );
+        });
+        drop(occupying);
+        assert_eq!(*memory.lock(), 0);
+    }
+
+    #[test]
+    fn analysis_claims_stay_within_the_ordered_window() {
+        let gate = AnalysisGate::new();
+        for expected in 0..8 {
+            let AnalysisClaim::Index(actual) = gate.try_claim(100, 8) else {
+                panic!("index {expected} should be claimable");
+            };
+            assert_eq!(actual, expected);
+        }
+        assert!(matches!(gate.try_claim(100, 8), AnalysisClaim::Blocked));
+        gate.collected_through(1);
+        assert!(matches!(gate.try_claim(100, 8), AnalysisClaim::Index(8)));
     }
 
     #[test]
@@ -685,5 +1242,109 @@ mod tests {
         assert_eq!(report.class(), CorruptionClass::Content);
         // Percentage uses the larger of the two sizes.
         assert!((report.corruption_percentage() - 50.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod mocked_parallel_tests {
+    use std::io::{self, Cursor, Read as _};
+    use std::num::NonZeroUsize;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::path::Path;
+    use std::time::Duration;
+
+    use caf_format::{ContentReader, ContentSeed, Digest, HEADER_SIZE, Header};
+
+    use super::{ANALYSIS_TASK_BYTES, AnalysisMemory, analyze, analyze_parallel};
+    use crate::env::Env;
+
+    fn fixture(content_len: usize) -> (Header, Vec<u8>) {
+        let seed = ContentSeed::from_bytes(*b"parallel-analyze");
+        let file_len = HEADER_SIZE as u64 + content_len as u64;
+        let header = Header::new(Digest::ZERO, seed, file_len).expect("the fixture size is valid");
+        let mut bytes = header.encode().to_vec();
+        let mut content = vec![0_u8; content_len];
+        ContentReader::new(seed)
+            .read_exact(&mut content)
+            .expect("expected content is infinite");
+        bytes.extend_from_slice(&content);
+        (header, bytes)
+    }
+
+    fn chunk_size() -> NonZeroUsize {
+        NonZeroUsize::new(4096).expect("the chunk size is positive")
+    }
+
+    #[test]
+    fn parallel_analysis_retries_and_reorders_positional_reads() {
+        let (header, mut bytes) = fixture(2 * ANALYSIS_TASK_BYTES + 1234);
+        bytes[HEADER_SIZE + 17] ^= 0xFF;
+        bytes[HEADER_SIZE + ANALYSIS_TASK_BYTES + 29] ^= 0xFF;
+        let expected = analyze(
+            Cursor::new(&bytes),
+            &header,
+            bytes.len() as u64,
+            chunk_size(),
+        )
+        .expect("serial analysis succeeds");
+
+        let (env, ctrl) = Env::mocked();
+        ctrl.write_file("/file", bytes.clone())
+            .expect("the fixture is writable");
+        ctrl.delay_read_at(HEADER_SIZE as u64 + 1, Duration::from_millis(30));
+        ctrl.interrupt_next_read_at();
+        ctrl.limit_next_read_at(17);
+        let file = env.open(Path::new("/file")).expect("the file opens");
+
+        let actual = analyze_parallel(
+            &file,
+            &header,
+            bytes.len() as u64,
+            chunk_size(),
+            4,
+            &AnalysisMemory::new(),
+        )
+        .expect("parallel analysis retries and succeeds");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parallel_analysis_returns_the_lowest_offset_error() {
+        let (header, bytes) = fixture(2 * ANALYSIS_TASK_BYTES + 1234);
+        let (env, ctrl) = Env::mocked();
+        ctrl.write_file("/file", bytes.clone())
+            .expect("the fixture is writable");
+        ctrl.delay_read_at(HEADER_SIZE as u64 + 1, Duration::from_millis(30));
+        ctrl.fail_read_at(HEADER_SIZE as u64 + 100, io::ErrorKind::PermissionDenied);
+        ctrl.fail_read_at(
+            HEADER_SIZE as u64 + ANALYSIS_TASK_BYTES as u64 + 100,
+            io::ErrorKind::StorageFull,
+        );
+        let file = env.open(Path::new("/file")).expect("the file opens");
+        let memory = AnalysisMemory::with_limit(2 * ANALYSIS_TASK_BYTES);
+
+        let error = analyze_parallel(&file, &header, bytes.len() as u64, chunk_size(), 3, &memory)
+            .expect_err("both initial analysis tasks fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn parallel_analysis_propagates_a_worker_panic() {
+        let (header, bytes) = fixture(2 * ANALYSIS_TASK_BYTES + 1234);
+        let (env, ctrl) = Env::mocked();
+        ctrl.write_file("/file", bytes.clone())
+            .expect("the fixture is writable");
+        ctrl.panic_read_at(HEADER_SIZE as u64 + ANALYSIS_TASK_BYTES as u64 + 100);
+        let file = env.open(Path::new("/file")).expect("the file opens");
+        let memory = AnalysisMemory::with_limit(2 * ANALYSIS_TASK_BYTES);
+
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+            analyze_parallel(&file, &header, bytes.len() as u64, chunk_size(), 3, &memory)
+        }))
+        .expect_err("the worker panic reaches the coordinator");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"the mocked positional read panicked")
+        );
     }
 }

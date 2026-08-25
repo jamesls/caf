@@ -10,9 +10,10 @@
 //!   orphan checks; corruption regeneration, pattern classification
 //!   ([`CorruptionPattern`]), region merging, and structured reports
 //!   ([`VerificationReport`], [`Diagnostic`], [`CorruptionReport`]).
-//! - Bounded parallel verification ([`Verifier::jobs`]): a fixed worker
-//!   pool behind a claim window, with results collected back in sorted
-//!   file order so serial and parallel reports are identical.
+//! - Bounded parallel verification ([`Verifier::jobs`]): one global
+//!   worker budget shared by concurrent files and positional segment
+//!   readers within large files, with results collected back in sorted
+//!   file and byte order so serial and parallel reports are identical.
 //! - Parallel generation of one file ([`GeneratorBuilder::jobs`]): block
 //!   generators, positional writers, and an ordered hasher over a fixed
 //!   buffer pool, producing byte-identical files at any worker count.
@@ -55,6 +56,7 @@ mod analysis;
 mod env;
 mod generate;
 mod metadata;
+mod parallel_verify;
 mod parallel_write;
 mod pipeline;
 mod random;
@@ -86,9 +88,10 @@ use std::num::NonZeroUsize;
 /// Largest worker count honored by [`Verifier::jobs`] and
 /// [`GeneratorBuilder::jobs`].
 ///
-/// A resource bound: each worker costs a thread and a block-sized
-/// buffer, and both operations saturate on I/O long before this many.
-/// Larger requests clamp to this value instead of failing to spawn.
+/// A resource bound: each worker costs a thread and verification readers
+/// can hold a few block-sized buffers. Both operations saturate on I/O
+/// long before this many. Larger requests clamp to this value instead of
+/// failing to spawn.
 pub const MAX_JOBS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 #[cfg(test)]

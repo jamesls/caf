@@ -8,6 +8,7 @@
 //! Diagnostic lines go to standard error, the Error Analysis report to
 //! standard output.
 
+use caf_format::Format;
 use caf_store::{
     CorruptionClass, CorruptionPattern, CorruptionRegion, CorruptionReport, Diagnostic,
     VerificationReport,
@@ -52,14 +53,36 @@ fn message(diagnostic: &Diagnostic) -> String {
             "File size mismatch in {}: expected {expected}, got {actual}",
             path.display()
         ),
-        Diagnostic::DigestMismatch { report } => format!(
-            "Invalid checksum for file \"{}\": actual blake2b {}",
-            report.path().display(),
-            report.actual_digest()
-        ),
+        Diagnostic::DigestMismatch { report } => match report.format() {
+            Format::V2 => format!(
+                "Invalid checksum for file \"{}\": actual blake2b {}",
+                report.path().display(),
+                report.actual_digest()
+            ),
+            Format::V3 if report.actual_digest() == report.expected_digest() => format!(
+                "Noncanonical CAF v3 content in file \"{}\"",
+                report.path().display()
+            ),
+            Format::V3 => format!(
+                "Invalid file ID for file \"{}\": actual CAF-Merkle-BLAKE3-160 {}",
+                report.path().display(),
+                report.actual_digest()
+            ),
+        },
         Diagnostic::MissingParent { parent_path, .. } => {
             format!("Parent hash not found: {}", parent_path.display())
         }
+        Diagnostic::ChainFormatMismatch {
+            path,
+            parent_path,
+            child_format,
+            parent_format,
+            ..
+        } => format!(
+            "Chain format mismatch in {}: {child_format} child references {parent_format} parent {}",
+            path.display(),
+            parent_path.display()
+        ),
         Diagnostic::OrphanedFile { path } => {
             format!("File not referenced by any files: {}", path.display())
         }
@@ -133,7 +156,7 @@ fn path_mismatch_block(report: &CorruptionReport, style: Style) {
             format!("{} bytes", commas(report.actual_size())),
         ),
         ("Path indicates", report.expected_digest().to_hex()),
-        ("Actual checksum", report.actual_digest().to_hex()),
+        ("Actual file ID", report.actual_digest().to_hex()),
     ]);
     println!();
     println!("The file content is valid but stored at an incorrect path.");
@@ -156,8 +179,14 @@ fn content_block(report: &CorruptionReport, style: Style) {
             "Header Size",
             format!("{} bytes", commas(report.expected_size())),
         ),
-        ("Expected BLAKE2b", report.expected_digest().to_hex()),
-        ("Actual BLAKE2b", report.actual_digest().to_hex()),
+        (
+            expected_id_label(report.format()),
+            report.expected_digest().to_hex(),
+        ),
+        (
+            actual_id_label(report.format()),
+            report.actual_digest().to_hex(),
+        ),
     ]);
     println!();
     // Analysis runs only on files whose header validated, so header
@@ -192,6 +221,20 @@ fn content_block(report: &CorruptionReport, style: Style) {
 
     println!();
     visualization(analysis_size, report.regions(), style);
+}
+
+fn expected_id_label(format: Format) -> &'static str {
+    match format {
+        Format::V2 => "Expected BLAKE2b",
+        Format::V3 => "Expected v3 file ID",
+    }
+}
+
+fn actual_id_label(format: Format) -> &'static str {
+    match format {
+        Format::V2 => "Actual BLAKE2b",
+        Format::V3 => "Actual v3 file ID",
+    }
 }
 
 /// The `(pattern name, details)` pair for one region.

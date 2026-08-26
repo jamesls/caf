@@ -1,4 +1,4 @@
-//! BLAKE2b-160 digests: file identities, parent links, and metadata hashes.
+//! BLAKE2b-160 digests and the shared 20-byte store identity representation.
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io::{self, Write};
@@ -12,12 +12,16 @@ use crate::hex::{self, ParseHexError};
 /// `BLAKE2b` parameterized to the fixed 20-byte v2 output length.
 type Blake2b160 = blake2::Blake2b<U20>;
 
-/// A 20-byte BLAKE2b-160 digest.
+/// A 20-byte digest or store identity.
 ///
-/// Digests identify files (the hex form is the sharded store path, see
-/// [`hash_to_relpath`](crate::hash_to_relpath)), link a file to its parent
-/// in the header, and pin the `.metadata/all` aggregate. The all-zero
-/// digest ([`Digest::ZERO`]) marks the first file of a chain.
+/// CAF v2 uses this value directly for its BLAKE2b-160 file identity. CAF v3
+/// exposes [`FileId`](crate::FileId) for the algorithm-specific type and
+/// converts it to this shared representation at store boundaries. The hex
+/// form is the sharded store path (see
+/// [`hash_to_relpath`](crate::hash_to_relpath)); the value also represents
+/// v2 parent links. [`Digest::ZERO`] marks the first file of a v2 chain.
+/// Metadata aggregation uses the distinct
+/// [`MetadataDigest`](crate::MetadataDigest) type.
 ///
 /// Ordering is byte-wise, which matches lexicographic ordering of the
 /// lowercase hex form.
@@ -133,8 +137,9 @@ impl FromStr for Digest {
 
 /// Streaming BLAKE2b-160 hasher producing a [`Digest`].
 ///
-/// Used for whole-file digests and the `.metadata/all` aggregate. Also
-/// implements [`std::io::Write`], so it composes with [`std::io::copy`].
+/// Used for CAF v2 whole-file digests. Also implements [`std::io::Write`],
+/// so it composes with [`std::io::copy`]. Metadata aggregation uses the
+/// distinct [`MetadataHasher`](crate::MetadataHasher) type.
 ///
 /// # Examples
 ///

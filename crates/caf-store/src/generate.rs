@@ -2,7 +2,7 @@
 //!
 //! [`Generator`] appends one backward-linked chain to a store. The first
 //! file has a zero parent, every later file names the preceding file's
-//! digest, and the last file's hex digest becomes the run's chain-tip
+//! identity, and the last file's hex identity becomes the run's chain-tip
 //! marker. Both stopping
 //! conditions are checked before each file, sizes below
 //! the 60-byte header are silently clamped up, content is written
@@ -11,10 +11,10 @@
 //! marker and atomically replacing `.metadata/all`.
 //!
 //! The chain serializes file creation — each header embeds the previous
-//! file's digest — so parallelism lives inside a single file:
+//! file's identity — so parallelism lives inside a single file:
 //! [`GeneratorBuilder::jobs`] hands large files to
 //! [`parallel_write`](crate::parallel_write), which produces the same
-//! bytes and the same digest as the sequential path.
+//! bytes and the same identity as the sequential path.
 //!
 //! Concurrent generation runs against one store and verifying while a
 //! writer is active are unsupported. A killed process can
@@ -29,7 +29,9 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use caf_format::{
-    BLOCK_SIZE, ContentReader, ContentSeed, Digest, HEADER_SIZE, Hasher, Header, hash_to_path,
+    BLOCK_SIZE, ContentReader, ContentSeed, Digest, FileId, Format, HEADER_SIZE, Hasher, Header,
+    MerkleHash, MetadataDigest, fill_block_prefix_with_format, hash_to_path,
+    v3_file_id_from_leaves, v3_leaf_hash,
 };
 
 use crate::env::Env;
@@ -81,6 +83,7 @@ const MIN_FILE_SIZE: u64 = HEADER_SIZE as u64;
 pub struct Generator {
     env: Env,
     root: PathBuf,
+    format: Format,
     max_files: Option<u64>,
     max_disk_usage: Option<u64>,
     sizes: SizeChooser,
@@ -156,6 +159,7 @@ impl Generator {
         metadata::write_chain_tip(&self.env, &self.root, parent)?;
         let all_digest = metadata::update_all(&self.env, &self.root)?;
         Ok(GenerationReport {
+            format: self.format,
             files_created,
             bytes_written,
             chain_tip: parent,
@@ -164,7 +168,7 @@ impl Generator {
     }
 
     /// Writes one file: header, deterministic content, and hash-derived
-    /// placement. Returns the file's digest (the next file's parent).
+    /// placement. Returns the file's identity (the next file's parent).
     fn write_file(
         &self,
         parent: Digest,
@@ -174,8 +178,11 @@ impl Generator {
     ) -> Result<Digest, GenerateError> {
         let seed =
             ContentSeed::from_bytes(self.env.random_array().map_err(GenerateError::randomness)?);
-        let header = Header::new(parent, seed, file_size)
-            .expect("file size is clamped to the header minimum");
+        let header = match self.format {
+            Format::V2 => Header::new(parent, seed, file_size),
+            Format::V3 => Header::new_v3(FileId::from_bytes(parent.into_inner()), seed, file_size),
+        }
+        .expect("file size is clamped to the header minimum");
 
         // The temporary file lives in the store root so the final rename
         // stays on one filesystem. The name uses the parent digest prefix;
@@ -183,7 +190,7 @@ impl Generator {
         let mut temp = TempFile::create(&self.env, &self.root, &parent.to_hex()[..16])
             .map_err(|source| GenerateError::io("creating a temporary file", &self.root, source))?;
 
-        // Both paths produce the same bytes and the same digest; only
+        // Both paths produce the same bytes and the same identity; only
         // the thread count differs.
         let digest = if use_parallel_path(file_size, self.jobs) {
             parallel_write::write_content(&temp, &header, self.jobs, self.write_threads)?
@@ -222,6 +229,7 @@ impl GeneratorBuilder {
             generator: Generator {
                 env,
                 root: root.into(),
+                format: Format::V3,
                 max_files: None,
                 max_disk_usage: None,
                 sizes: SizeChooser::fixed(DEFAULT_FILE_SIZE),
@@ -229,6 +237,16 @@ impl GeneratorBuilder {
                 write_threads: DEFAULT_WRITE_THREADS,
             },
         }
+    }
+
+    /// Selects the on-disk format for every file in this generated chain.
+    ///
+    /// Version 3 is the default. Selecting [`Format::V2`] preserves the
+    /// original whole-file `BLAKE2b` identity and v2 content domain.
+    #[must_use]
+    pub fn format(mut self, format: Format) -> Self {
+        self.generator.format = format;
+        self
     }
 
     /// Stops after `count` files. Zero generates no data files but still
@@ -262,14 +280,14 @@ impl GeneratorBuilder {
     /// same content, digest, and path at any worker count, so this is
     /// purely a speed setting. It applies within one file — the chain
     /// serializes file creation, since each header embeds the previous
-    /// file's digest — so it only speeds up large files. Files with
+    /// file's identity — so it only speeds up large files. Files with
     /// fewer than two 1 MiB blocks per worker are written sequentially
     /// whatever the count is.
     ///
-    /// Peak memory grows with the worker count, a few block-sized
-    /// buffers per worker, and never with the file size. Values above
-    /// [`MAX_JOBS`] clamp to it. The CLI rejects values below one as a
-    /// usage error.
+    /// Peak memory grows with the worker count and, for v3, with the
+    /// transient 32-byte Merkle leaf stored for each 1 MiB file block.
+    /// Values above [`MAX_JOBS`] clamp to it. The CLI rejects values below
+    /// one as a usage error.
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.generator.jobs = count.min(MAX_JOBS);
@@ -307,12 +325,16 @@ fn use_parallel_path(file_size: u64, jobs: NonZeroUsize) -> bool {
 }
 
 /// Writes the header and content sequentially, hashing as it goes, and
-/// returns the file's digest.
+/// returns the file's identity.
 fn write_content_serial(
     temp: &mut TempFile,
     header: &Header,
     buffer: &mut [u8],
 ) -> Result<Digest, GenerateError> {
+    if header.format() == Format::V3 {
+        return write_v3_content_serial(temp, header, buffer);
+    }
+
     let mut hasher = Hasher::new();
     let encoded = header.encode();
     temp.file_mut()
@@ -341,16 +363,71 @@ fn write_content_serial(
     Ok(hasher.finalize())
 }
 
+/// Writes and hashes a v3 file one physical block at a time.
+fn write_v3_content_serial(
+    temp: &mut TempFile,
+    header: &Header,
+    buffer: &mut [u8],
+) -> Result<Digest, GenerateError> {
+    debug_assert_eq!(header.format(), Format::V3);
+    let encoded = header.encode();
+    let block_count = parallel_write::total_blocks(header.file_length());
+    let leaf_count = usize::try_from(block_count).map_err(|_error| {
+        GenerateError::io(
+            "allocating v3 file hashes",
+            temp.path(),
+            io::Error::new(io::ErrorKind::FileTooLarge, "too many v3 file blocks"),
+        )
+    })?;
+    let mut leaves: Vec<MerkleHash> = Vec::new();
+    leaves.try_reserve_exact(leaf_count).map_err(|_source| {
+        GenerateError::io(
+            "allocating v3 file hashes",
+            temp.path(),
+            io::Error::from(io::ErrorKind::OutOfMemory),
+        )
+    })?;
+
+    for index in 0..block_count {
+        let offset = index * BLOCK_SIZE as u64;
+        let len = usize::try_from((header.file_length() - offset).min(BLOCK_SIZE as u64))
+            .expect("a physical block is at most BLOCK_SIZE bytes");
+        let block = &mut buffer[..len];
+        if index == 0 {
+            let (header_bytes, content) = block.split_at_mut(HEADER_SIZE);
+            header_bytes.copy_from_slice(&encoded);
+            fill_block_prefix_with_format(Format::V3, header.content_seed(), 0, content);
+        } else {
+            fill_block_prefix_with_format(Format::V3, header.content_seed(), index, block);
+        }
+        leaves.push(v3_leaf_hash(index, &*block));
+        temp.file_mut()
+            .write_all(block)
+            .map_err(|source| GenerateError::io("writing content", temp.path(), source))?;
+    }
+
+    Ok(Digest::from_bytes(
+        v3_file_id_from_leaves(header.file_length(), leaves).into_inner(),
+    ))
+}
+
 /// Structured results of one generation run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationReport {
+    format: Format,
     files_created: u64,
     bytes_written: u64,
     chain_tip: Digest,
-    all_digest: Digest,
+    all_digest: MetadataDigest,
 }
 
 impl GenerationReport {
+    /// CAF format used for every file in this generated chain.
+    #[must_use]
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
     /// Number of data files created by this run.
     #[must_use]
     pub fn files_created(&self) -> u64 {
@@ -363,16 +440,27 @@ impl GenerationReport {
         self.bytes_written
     }
 
-    /// Digest of the last file in the chain ([`Digest::ZERO`] when no
-    /// files were generated); its hex form names the chain-tip marker.
+    /// Version-agnostic 20-byte representation of the last file identity.
+    ///
+    /// The all-zero value is returned when no files were generated. Its hex
+    /// form names the chain-tip marker. For a typed v3 result, use
+    /// [`GenerationReport::chain_tip_file_id`].
     #[must_use]
     pub fn chain_tip(&self) -> Digest {
         self.chain_tip
     }
 
+    /// Typed chain-tip file ID for a v3 generation run.
+    ///
+    /// Returns `None` for a v2 run.
+    #[must_use]
+    pub fn chain_tip_file_id(&self) -> Option<FileId> {
+        (self.format == Format::V3).then(|| FileId::from_bytes(self.chain_tip.into_inner()))
+    }
+
     /// The aggregate digest written to `.metadata/all`.
     #[must_use]
-    pub fn all_digest(&self) -> Digest {
+    pub fn all_digest(&self) -> MetadataDigest {
         self.all_digest
     }
 }

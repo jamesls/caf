@@ -32,7 +32,7 @@ detection:
 
 The --jobs option is a global verification-worker budget. Files are
 validated concurrently, and spare workers read and analyze segments of
-large files while their ordered whole-file digest is computed.
+large files while their version-specific file identity is computed.
 
 When corruption is detected, the verifier will:
 

@@ -4,8 +4,8 @@
 //! than 60 bytes is an error (exit 1); otherwise every header field is printed
 //! even when invalid, and without `--verify-checksum` the exit status is
 //! always 0. With `--verify-checksum`, the exit status is 1 when the
-//! path is not CAF layout, the whole-file digest mismatches, or basic
-//! header validation fails. This is deliberately stricter than `caf verify`.
+//! path is not CAF layout, the version-specific file identity mismatches, or
+//! basic header validation fails. This is deliberately stricter than `caf verify`.
 //!
 //! Header bytes are interpreted by [`caf_format::RawHeader`], the shared
 //! diagnostic view of the header implementation. The CLI never parses
@@ -18,7 +18,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, Result, bail};
 use caf_format::{
-    BLOCK_SIZE, Digest, HEADER_SIZE, Hasher, RawHeader, hash_to_path, parse_hash_from_path,
+    BLOCK_SIZE, Digest, Format, HEADER_SIZE, Hasher, MerkleHash, RawHeader, hash_to_path,
+    parse_hash_from_path, v3_file_id_from_leaves, v3_leaf_hash,
 };
 
 use crate::EXIT_FAILURE;
@@ -36,8 +37,8 @@ pub struct Args {
     // renders verbatim without linting.
     #[arg(
         long,
-        help = "Calculate the file BLAKE2b checksum and verify it matches \
-                the hash implied by the CAF path layout"
+        help = "Calculate the version-specific file ID and verify it matches \
+                the ID implied by the CAF path layout"
     )]
     verify_checksum: bool,
 }
@@ -86,10 +87,14 @@ fn show(args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let Some(format) = checks.format else {
+        print_unknown_identity_diagnostics(expected_hash, style);
+        return Ok(ExitCode::from(EXIT_FAILURE));
+    };
     let actual_hash =
-        blake2b_160_of_file(path).with_context(|| format!("reading {}", path.display()))?;
+        file_id_of_file(path, format).with_context(|| format!("reading {}", path.display()))?;
     let matches = Answer::of(expected_hash == PathDigest::InLayout(actual_hash));
-    print_checksum_diagnostics(expected_hash, actual_hash, matches, style);
+    print_checksum_diagnostics(expected_hash, actual_hash, format, matches, style);
 
     if expected_hash.digest().is_none() || matches == Answer::No || !checks.basic_valid() {
         Ok(ExitCode::from(EXIT_FAILURE))
@@ -152,6 +157,8 @@ impl Answer {
 
 /// The basic validation checks in the `dev show` output.
 struct Checks {
+    format: Option<Format>,
+    header_valid: Answer,
     checksum_valid: Answer,
     reserved_zero: Answer,
     length_matches: Answer,
@@ -160,7 +167,10 @@ struct Checks {
 
 impl Checks {
     fn new(raw: &RawHeader, actual_size: u64) -> Self {
+        let validated = raw.validate().ok();
         Self {
+            format: raw.format().ok(),
+            header_valid: Answer::of(validated.is_some()),
             checksum_valid: Answer::of(raw.checksum_matches()),
             reserved_zero: Answer::of(raw.reserved_is_zero()),
             length_matches: Answer::of(raw.file_length() == actual_size),
@@ -169,8 +179,7 @@ impl Checks {
     }
 
     fn basic_valid(&self) -> bool {
-        self.checksum_valid == Answer::Yes
-            && self.reserved_zero == Answer::Yes
+        self.header_valid == Answer::Yes
             && self.length_matches == Answer::Yes
             && self.length_minimum == Answer::Yes
     }
@@ -230,12 +239,25 @@ fn print_header_diagnostics(
     println!("  Header Checksum (44:52): {}", hex(&raw.stored_checksum()));
     println!("    Expected: {}", hex(&raw.computed_checksum()));
     println!("    Valid: {}", yes_no(checks.checksum_valid));
-    println!("  Reserved (52:60): {}", hex(&raw.reserved()));
-    println!("    All zeros: {}", yes_no(checks.reserved_zero));
+    if checks.format == Some(Format::V3) {
+        let descriptor = raw.reserved();
+        println!("  Format Descriptor (52:60): {}", hex(&descriptor));
+        println!("    Marker (52:56): {}", hex(&descriptor[..4]));
+        println!("    File-ID scheme (56): {}", descriptor[4]);
+        println!("    Content scheme (57): {}", descriptor[5]);
+        println!("    Block size log2 (58): {}", descriptor[6]);
+        println!("    Flags (59): {}", descriptor[7]);
+    } else {
+        println!("  Reserved (52:60): {}", hex(&raw.reserved()));
+        println!("    All zeros: {}", yes_no(checks.reserved_zero));
+    }
     println!();
     println!("{}", style.bold("Basic validation:"));
     println!("  Header checksum valid: {}", yes_no(checks.checksum_valid));
-    println!("  Reserved bytes zero: {}", yes_no(checks.reserved_zero));
+    println!("  Header format valid: {}", yes_no(checks.header_valid));
+    if checks.format != Some(Format::V3) {
+        println!("  Reserved bytes zero: {}", yes_no(checks.reserved_zero));
+    }
     println!(
         "  File length matches actual: {}",
         yes_no(checks.length_matches)
@@ -261,11 +283,16 @@ fn print_header_diagnostics(
 fn print_checksum_diagnostics(
     expected_hash: PathDigest,
     actual_hash: Digest,
+    format: Format,
     matches: Answer,
     style: Style,
 ) {
     println!();
-    println!("{} (BLAKE2b-160):", style.bold("File checksum"));
+    let (title, algorithm) = match format {
+        Format::V2 => ("File checksum", "BLAKE2b-160"),
+        Format::V3 => ("File ID", "CAF-Merkle-BLAKE3-160"),
+    };
+    println!("{} ({algorithm}):", style.bold(title));
     match expected_hash {
         PathDigest::InLayout(digest) => println!("  Expected (from path): {digest}"),
         PathDigest::Outside => {
@@ -274,6 +301,20 @@ fn print_checksum_diagnostics(
     }
     println!("  Actual: {actual_hash}");
     println!("  Matches: {}", matches.render(style));
+}
+
+/// Prints the identity result when the descriptor selects no algorithm.
+fn print_unknown_identity_diagnostics(expected_hash: PathDigest, style: Style) {
+    println!();
+    println!("{}:", style.bold("File identity"));
+    match expected_hash {
+        PathDigest::InLayout(digest) => println!("  Expected (from path): {digest}"),
+        PathDigest::Outside => {
+            println!("  Expected (from path): <unavailable: not in CAF layout>");
+        }
+    }
+    println!("  Actual: <unavailable: unknown header format>");
+    println!("  Matches: {}", Answer::No.render(style));
 }
 
 /// The store root implied by a sharded content path: four levels up
@@ -297,4 +338,43 @@ fn blake2b_160_of_file(path: &Path) -> std::io::Result<Digest> {
         }
     }
     Ok(hasher.finalize())
+}
+
+fn file_id_of_file(path: &Path, format: Format) -> std::io::Result<Digest> {
+    match format {
+        Format::V2 => blake2b_160_of_file(path),
+        Format::V3 => v3_id_of_file(path),
+    }
+}
+
+/// Computes the v3 ID while preserving the normative physical blocks.
+fn v3_id_of_file(path: &Path) -> std::io::Result<Digest> {
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0_u8; BLOCK_SIZE];
+    let mut leaves: Vec<MerkleHash> = Vec::new();
+    let mut file_length = 0_u64;
+    let mut index = 0_u64;
+    loop {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match file.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        leaves.push(v3_leaf_hash(index, &buffer[..filled]));
+        file_length += filled as u64;
+        index += 1;
+        if filled < buffer.len() {
+            break;
+        }
+    }
+    Ok(Digest::from_bytes(
+        v3_file_id_from_leaves(file_length, leaves).into_inner(),
+    ))
 }

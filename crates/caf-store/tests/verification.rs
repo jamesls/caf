@@ -11,7 +11,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use caf_format::{
-    BLOCK_SIZE, ContentReader, ContentSeed, Digest, HEADER_SIZE, Hasher, Header, hash_to_path,
+    BLOCK_SIZE, ContentReader, ContentSeed, Digest, FileId, Format, HEADER_SIZE, Hasher, Header,
+    hash_to_path, hash_to_relpath, v3_file_id_from_bytes,
 };
 use caf_store::{
     CorruptionClass, CorruptionPattern, Diagnostic, GenerationReport, Generator, Severity,
@@ -124,11 +125,24 @@ fn write_roots_metadata(root: &Path, markers: &[&str]) {
 /// Builds the bytes of a self-consistent chain file (valid header
 /// naming `parent` and deterministic content) of `file_length` bytes.
 fn chain_file_bytes(parent: Digest, seed: ContentSeed, file_length: u64) -> Vec<u8> {
-    let header = Header::new(parent, seed, file_length).expect("length is legal");
+    chain_file_bytes_with_format(Format::V2, parent, seed, file_length)
+}
+
+fn chain_file_bytes_with_format(
+    format: Format,
+    parent: Digest,
+    seed: ContentSeed,
+    file_length: u64,
+) -> Vec<u8> {
+    let header = match format {
+        Format::V2 => Header::new(parent, seed, file_length),
+        Format::V3 => Header::new_v3(FileId::from_bytes(parent.into_inner()), seed, file_length),
+    }
+    .expect("length is legal");
     let mut bytes = header.encode().to_vec();
     let content_length = usize::try_from(file_length).expect("test sizes are small") - HEADER_SIZE;
     let mut content = vec![0_u8; content_length];
-    ContentReader::new(seed)
+    ContentReader::new_with_format(seed, format)
         .read_exact(&mut content)
         .expect("the content stream is infinite");
     bytes.extend_from_slice(&content);
@@ -143,12 +157,29 @@ fn clean_file_bytes(seed: ContentSeed, file_length: u64) -> Vec<u8> {
 /// Writes `bytes` at their whole-file digest's path and returns the
 /// digest.
 fn place_file(root: &Path, bytes: &[u8]) -> Digest {
-    let digest = Digest::compute(bytes);
+    place_file_with_format(root, Format::V2, bytes)
+}
+
+fn place_file_with_format(root: &Path, format: Format, bytes: &[u8]) -> Digest {
+    let digest = match format {
+        Format::V2 => Digest::compute(bytes),
+        Format::V3 => Digest::from_bytes(v3_file_id_from_bytes(bytes).into_inner()),
+    };
     let path = hash_to_path(root, digest);
     fs::create_dir_all(path.parent().expect("hash paths have parents"))
         .expect("create shard directories");
     fs::write(&path, bytes).expect("write the file");
     digest
+}
+
+fn file_id(bytes: &[u8]) -> Digest {
+    match Header::parse(bytes)
+        .expect("the file has a valid header")
+        .format()
+    {
+        Format::V2 => Digest::compute(bytes),
+        Format::V3 => Digest::from_bytes(v3_file_id_from_bytes(bytes).into_inner()),
+    }
 }
 
 // --- Python test equivalents (tests/test_verifier.py) ---
@@ -162,6 +193,212 @@ fn clean_store_verifies() {
     assert!(report.success());
     assert_eq!(report.files_checked(), 3);
     assert!(report.diagnostics().is_empty());
+}
+
+#[test]
+fn independent_v2_and_v3_chains_share_one_store() {
+    let store = tempfile::tempdir().expect("create temp store");
+    Generator::builder(store.path())
+        .format(Format::V2)
+        .max_files(2)
+        .file_sizes(SizeChooser::fixed(512))
+        .build()
+        .generate()
+        .expect("v2 generation succeeds");
+    Generator::builder(store.path())
+        .format(Format::V3)
+        .max_files(2)
+        .file_sizes(SizeChooser::fixed(512))
+        .build()
+        .generate()
+        .expect("v3 generation succeeds");
+
+    let formats: std::collections::HashSet<Format> = data_files(store.path())
+        .iter()
+        .map(|path| {
+            Header::parse(fs::read(path).expect("data file is readable"))
+                .expect("header is valid")
+                .format()
+        })
+        .collect();
+    assert_eq!(formats, [Format::V2, Format::V3].into_iter().collect());
+    assert!(verify(store.path()).success());
+}
+
+#[test]
+fn cross_version_parent_links_are_chain_format_errors() {
+    for (parent_format, child_format) in [(Format::V2, Format::V3), (Format::V3, Format::V2)] {
+        let store = tempfile::tempdir().expect("create temp store");
+        let parent_bytes = chain_file_bytes_with_format(
+            parent_format,
+            Digest::ZERO,
+            ContentSeed::from_bytes(*b"parent-format-01"),
+            512,
+        );
+        let parent = place_file_with_format(store.path(), parent_format, &parent_bytes);
+        let child_bytes = chain_file_bytes_with_format(
+            child_format,
+            parent,
+            ContentSeed::from_bytes(*b"child--format-02"),
+            512,
+        );
+        let child = place_file_with_format(store.path(), child_format, &child_bytes);
+        write_roots_metadata(store.path(), &[&child.to_hex()]);
+
+        let report = verify(store.path());
+        let [diagnostic] = report.diagnostics() else {
+            panic!(
+                "exactly one chain-format diagnostic: {:?}",
+                report.diagnostics()
+            );
+        };
+        assert!(matches!(
+            diagnostic,
+            Diagnostic::ChainFormatMismatch {
+                path,
+                parent: linked_parent,
+                child_format: actual_child,
+                parent_format: actual_parent,
+                ..
+            } if path == &hash_to_path(store.path(), child)
+                && *linked_parent == parent
+                && *actual_child == child_format
+                && *actual_parent == parent_format
+        ));
+    }
+}
+
+#[test]
+fn chain_format_resolves_the_parent_at_its_canonical_path() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let parent_bytes = chain_file_bytes_with_format(
+        Format::V3,
+        Digest::ZERO,
+        ContentSeed::from_bytes(*b"canonical-parent"),
+        512,
+    );
+    let parent = place_file_with_format(store.path(), Format::V3, &parent_bytes);
+    let child_bytes = chain_file_bytes_with_format(
+        Format::V3,
+        parent,
+        ContentSeed::from_bytes(*b"canonical-child!"),
+        512,
+    );
+    let child = place_file_with_format(store.path(), Format::V3, &child_bytes);
+    write_roots_metadata(store.path(), &[&child.to_hex()]);
+
+    // A valid v2 file under an extra directory whose last four
+    // components still decode to the parent's digest. It sorts after
+    // every canonical shard ('z' > any hex character), so a
+    // digest-keyed format lookup would take its v2 format for the
+    // parent and invent a chain-format mismatch.
+    let decoy_bytes = clean_file_bytes(ContentSeed::from_bytes(*b"v2-format-decoy!"), 512);
+    let decoy_path = store.path().join("zz-extra").join(hash_to_relpath(parent));
+    fs::create_dir_all(decoy_path.parent().expect("decoy paths have parents"))
+        .expect("create the decoy directories");
+    fs::write(&decoy_path, &decoy_bytes).expect("write the decoy");
+
+    let report = verify(store.path());
+    // The decoy is corrupt at the identity its path claims, but the v3
+    // chain itself is homogeneous: no chain-format finding.
+    let [Diagnostic::DigestMismatch { report: corruption }] = report.diagnostics() else {
+        panic!("only the decoy is diagnosed: {:?}", report.diagnostics());
+    };
+    assert_eq!(corruption.path(), decoy_path);
+}
+
+#[test]
+fn chain_format_findings_keep_sorted_path_order() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let parent_bytes = chain_file_bytes_with_format(
+        Format::V2,
+        Digest::ZERO,
+        ContentSeed::from_bytes(*b"ordering-parent!"),
+        512,
+    );
+    let parent = place_file_with_format(store.path(), Format::V2, &parent_bytes);
+    let child_bytes = chain_file_bytes_with_format(
+        Format::V3,
+        parent,
+        ContentSeed::from_bytes(*b"ordering-child!!"),
+        512,
+    );
+    let child = place_file_with_format(store.path(), Format::V3, &child_bytes);
+    write_roots_metadata(store.path(), &[&child.to_hex()]);
+
+    // A layout violation on a path that sorts after every canonical
+    // one. Its finding must not overtake the child's chain-format
+    // finding on an earlier path.
+    let junk_path = store.path().join("zz-junk");
+    fs::write(&junk_path, b"not a data file").expect("write the stray file");
+
+    let report = verify(store.path());
+    let [
+        Diagnostic::ChainFormatMismatch { path: mismatch, .. },
+        Diagnostic::InvalidPathLayout { path: layout },
+        Diagnostic::OrphanedFile { path: orphan },
+    ] = report.diagnostics()
+    else {
+        panic!(
+            "per-file findings stay in path order: {:?}",
+            report.diagnostics()
+        );
+    };
+    assert_eq!(mismatch, &hash_to_path(store.path(), child));
+    assert_eq!(layout, &junk_path);
+    assert_eq!(orphan, &junk_path);
+}
+
+#[test]
+fn v3_rejects_noncanonical_content_at_its_correct_id_path() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let header = Header::new_v3(
+        FileId::ZERO,
+        ContentSeed::from_bytes(*b"strict-content!!"),
+        512,
+    )
+    .expect("length is valid");
+    let mut bytes = header.encode().to_vec();
+    bytes.resize(512, 0);
+    let digest = place_file_with_format(store.path(), Format::V3, &bytes);
+    write_roots_metadata(store.path(), &[&digest.to_hex()]);
+
+    let report = verify(store.path());
+    let [Diagnostic::DigestMismatch { report: corruption }] = report.diagnostics() else {
+        panic!(
+            "strict content mismatch is reported: {:?}",
+            report.diagnostics()
+        );
+    };
+    assert_eq!(corruption.format(), Format::V3);
+    assert_eq!(corruption.expected_digest(), digest);
+    assert_eq!(corruption.actual_digest(), digest);
+    assert_eq!(corruption.class(), CorruptionClass::Content);
+    assert!(corruption.total_corrupted_bytes() > 0);
+}
+
+#[test]
+fn explicit_v2_content_corruption_uses_the_legacy_digest_path() {
+    let store = tempfile::tempdir().expect("create temp store");
+    Generator::builder(store.path())
+        .format(Format::V2)
+        .max_files(1)
+        .file_sizes(SizeChooser::fixed(1024))
+        .build()
+        .generate()
+        .expect("v2 generation succeeds");
+    let [file] = &*data_files(store.path()) else {
+        panic!("exactly one data file is generated");
+    };
+    overwrite(file, 100, b"v2 corruption");
+
+    let report = verify(store.path());
+    let [Diagnostic::DigestMismatch { report: corruption }] = report.diagnostics() else {
+        panic!("one v2 digest mismatch: {:?}", report.diagnostics());
+    };
+    assert_eq!(corruption.format(), Format::V2);
+    assert_ne!(corruption.actual_digest(), corruption.expected_digest());
+    assert_eq!(corruption.class(), CorruptionClass::Content);
 }
 
 #[test]
@@ -304,6 +541,9 @@ fn truncated_file_reports_a_truncated_region() {
     let Diagnostic::DigestMismatch { report: corruption } = digest_mismatch else {
         panic!("expected a digest mismatch: {digest_mismatch:?}");
     };
+    let actual_bytes = fs::read(file).expect("truncated file is readable");
+    assert_eq!(corruption.format(), Format::V3);
+    assert_eq!(corruption.actual_digest(), file_id(&actual_bytes));
     // Content before the truncation point is intact, so the only region
     // is the truncated tail; the class is content, not path mismatch.
     assert_eq!(corruption.class(), CorruptionClass::Content);
@@ -516,7 +756,7 @@ fn extra_bytes_report_size_mismatch_and_region() {
     };
     let mut existing = fs::read(file).expect("data files are readable");
     existing.extend_from_slice(&[0xAB; 100]);
-    fs::write(file, existing).expect("append extra bytes");
+    fs::write(file, &existing).expect("append extra bytes");
 
     let report = verify(store.path());
     assert!(!report.success());
@@ -534,6 +774,8 @@ fn extra_bytes_report_size_mismatch_and_region() {
     let Diagnostic::DigestMismatch { report: corruption } = digest_mismatch else {
         panic!("expected a digest mismatch: {digest_mismatch:?}");
     };
+    assert_eq!(corruption.format(), Format::V3);
+    assert_eq!(corruption.actual_digest(), file_id(&existing));
     assert_eq!(corruption.class(), CorruptionClass::Content);
     let [region] = corruption.regions() else {
         panic!("exactly one region: {:?}", corruption.regions());
@@ -619,7 +861,7 @@ fn wrong_path_classifies_as_path_mismatch() {
         panic!("exactly one data file is generated");
     };
     let bytes = fs::read(file).expect("data files are readable");
-    let real_digest = Digest::compute(&bytes);
+    let real_digest = file_id(&bytes);
     let mut hex = real_digest.to_hex();
     let flipped = if hex.starts_with('0') { "f" } else { "0" };
     hex.replace_range(0..1, flipped);
@@ -1043,7 +1285,7 @@ fn parallel_verification_matches_serial_on_a_corrupted_store() {
     overwrite(invalid_header, 55, &[0x01]);
     fs::write(store.path().join("00000000000000005678cdef"), b"stray").expect("write the stray");
     let copy_bytes = fs::read(copy_file).expect("data files are readable");
-    let real_digest = Digest::compute(&copy_bytes);
+    let real_digest = file_id(&copy_bytes);
     let mut hex = real_digest.to_hex();
     let flipped = if hex.starts_with('0') { "f" } else { "0" };
     hex.replace_range(0..1, flipped);

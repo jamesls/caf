@@ -1,34 +1,34 @@
-//! Parallel generation of one file's bytes: generators, writers, hasher.
+//! Parallel generation of one file's bytes and identity.
 //!
 //! [`write_content`] fills one file from many threads and returns the
 //! same digest, over the same bytes, that a sequential write produces.
-//! The version 2 format allows it because content blocks are
-//! independently derivable and their file offsets are known upfront; the
-//! digest chains over the byte stream in order, so hashing stays a
-//! single ordered stage.
+//! Content blocks are independently derivable and their file offsets are
+//! known upfront. Version 2 keeps a single ordered hashing stage because
+//! its digest chains over the byte stream. Version 3 generators hash each
+//! completed block directly into its indexed Merkle leaf slot.
 //!
-//! Three stages run at once over one set of buffers:
+//! The shared stages run over one set of buffers:
 //!
 //! - **Generators** (`jobs` threads) take a buffer from the pool, claim
 //!   the next block index, squeeze the block's SHAKE output into the
-//!   buffer, and hand the same block to both consumers.
+//!   buffer, and compute its v3 leaf when applicable.
 //! - **Writers** (a few threads) put each block on disk at its offset
 //!   the moment it exists, through positional writes that share one
 //!   handle and move no cursor.
-//! - **The hasher** (the calling thread) absorbs blocks in index order,
-//!   reordering what arrives early in a private map.
+//! - **The v2 hasher** (the calling thread) absorbs blocks in index order,
+//!   reordering what arrives early in a private map. Version 3 has no hash
+//!   channel; after all workers finish, the caller reduces the leaf array.
 //!
-//! Both consumers only read the block, so neither waits on the other.
-//! Whichever stage is slowest accumulates the buffers, the pool runs
-//! dry, and the generators stall until it drains: the pool is the only
-//! backpressure in the system, which is why the channels can be
-//! unbounded. Peak memory is the pool, one block per buffer.
+//! Whichever stage is slowest accumulates the buffers, the pool runs dry,
+//! and the generators stall until it drains. The pool bounds file-data
+//! memory, one block per buffer. Version 3 also holds one 32-byte leaf per
+//! physical file block until reduction completes.
 //!
-//! Blocks are freed by [`Arc`]: each is sent to both consumers, and
-//! whichever drops its reference last returns the buffer to the pool. A
-//! write failure records itself, cancels the run, and surfaces as the
-//! error of the whole file; the caller's temporary-file guard removes
-//! the partial file.
+//! Blocks are freed by [`Arc`]. Version 2 sends one reference to each
+//! consumer; version 3 sends only to the writer. The final reference
+//! returns the buffer to the pool. A write failure records itself, cancels
+//! the run, and surfaces as the error of the whole file; the caller's
+//! temporary-file guard removes the partial file.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -39,7 +39,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use caf_format::{BLOCK_SIZE, ContentSeed, Digest, HEADER_SIZE, Hasher, Header, fill_block_prefix};
+use caf_format::{
+    BLOCK_SIZE, ContentSeed, Digest, Format, HEADER_SIZE, Hasher, Header, MerkleHash,
+    fill_block_prefix_with_format, v3_file_id_from_leaves, v3_leaf_hash,
+};
 
 use crate::env::FileHandle;
 use crate::generate::GenerateError;
@@ -48,8 +51,8 @@ use crate::temp::TempFile;
 /// Buffers the pool holds per generator thread.
 ///
 /// One is the block being filled; the other three absorb the spread
-/// between the block a generator has just produced and the block the
-/// hasher is still waiting for, which grows with the thread count.
+/// between the block a generator has just produced and the block a
+/// downstream consumer is still processing.
 const BUFFERS_PER_GENERATOR: usize = 4;
 
 /// Buffers the pool holds per writer thread: one being written and one
@@ -103,11 +106,25 @@ pub(crate) fn write_content(
         .map_err(|source| GenerateError::io("writing content", temp.path(), source))
 }
 
-/// Runs the three stages over `pool` and returns the file's digest.
+/// Runs the format-specific stages over `pool` and returns the file identity.
 ///
 /// Split out from [`write_content`] so tests can hold the pool and check
 /// that every buffer comes back.
 fn run(
+    file: &FileHandle,
+    plan: &Plan,
+    pool: &Pool,
+    generators: usize,
+    writers: usize,
+) -> Result<Digest, io::Error> {
+    match plan.format {
+        Format::V2 => run_v2(file, plan, pool, generators, writers),
+        Format::V3 => run_v3(file, plan, pool, generators, writers),
+    }
+}
+
+/// Runs the ordered v2 hashing pipeline unchanged.
+fn run_v2(
     file: &FileHandle,
     plan: &Plan,
     pool: &Pool,
@@ -139,7 +156,7 @@ fn run(
             let write_tx = write_tx.clone();
             spawned = thread::Builder::new()
                 .spawn_scoped(scope, move || {
-                    generate(plan, pool, next_index, &hash_tx, &write_tx);
+                    generate_v2(plan, pool, next_index, &hash_tx, &write_tx);
                 })
                 .map(drop);
         }
@@ -160,7 +177,7 @@ fn run(
             pool.cancel();
             return Err(source);
         }
-        Ok(hash(&hash_rx, plan.blocks))
+        Ok(hash_v2(&hash_rx, plan.blocks))
     });
 
     // The scope has joined the writers, so every write that was going to
@@ -177,8 +194,72 @@ fn run(
     Ok(hashed?.expect("the block stream ends early only after a cancellation"))
 }
 
+/// Runs v3 generation with workers storing leaves directly by block index.
+fn run_v3(
+    file: &FileHandle,
+    plan: &Plan,
+    pool: &Pool,
+    generators: usize,
+    writers: usize,
+) -> Result<Digest, io::Error> {
+    let failure = ErrorSlot::new();
+    let next_index = AtomicU64::new(0);
+    let completed = AtomicU64::new(0);
+    let leaves = Mutex::new(allocate_leaves(plan.blocks)?);
+    let (write_tx, write_rx) = mpsc::channel();
+    let write_rx = Mutex::new(write_rx);
+
+    let spawned = thread::scope(|scope| {
+        let next_index = &next_index;
+        let completed = &completed;
+        let leaves = &leaves;
+        let mut spawned = Ok(());
+        for _ in 0..generators {
+            if spawned.is_err() {
+                break;
+            }
+            let write_tx = write_tx.clone();
+            spawned = thread::Builder::new()
+                .spawn_scoped(scope, move || {
+                    generate_v3(plan, pool, next_index, completed, leaves, &write_tx);
+                })
+                .map(drop);
+        }
+        for _ in 0..writers {
+            if spawned.is_err() {
+                break;
+            }
+            spawned = thread::Builder::new()
+                .spawn_scoped(scope, || write(file, &write_rx, pool, &failure))
+                .map(drop);
+        }
+        drop(write_tx);
+
+        if spawned.is_err() {
+            pool.cancel();
+        }
+        spawned
+    });
+
+    if let Some(source) = failure.take() {
+        return Err(source);
+    }
+    spawned?;
+    if completed.load(Ordering::Relaxed) != plan.blocks {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "v3 generation ended before every block was produced",
+        ));
+    }
+    let leaves = leaves.into_inner().unwrap_or_else(PoisonError::into_inner);
+    Ok(Digest::from_bytes(
+        v3_file_id_from_leaves(plan.file_size, leaves).into_inner(),
+    ))
+}
+
 /// Everything a generator needs to produce any block of one file.
 struct Plan {
+    format: Format,
     seed: ContentSeed,
     header: [u8; HEADER_SIZE],
     file_size: u64,
@@ -188,6 +269,7 @@ struct Plan {
 impl Plan {
     fn new(header: &Header) -> Self {
         Self {
+            format: header.format(),
             seed: header.content_seed(),
             header: header.encode(),
             file_size: header.file_length(),
@@ -218,9 +300,9 @@ impl Plan {
             // block 0 always has room for it.
             let (header, content) = buffer.split_at_mut(HEADER_SIZE);
             header.copy_from_slice(&self.header);
-            fill_block_prefix(self.seed, 0, content);
+            fill_block_prefix_with_format(self.format, self.seed, 0, content);
         } else {
-            fill_block_prefix(self.seed, index, &mut buffer);
+            fill_block_prefix_with_format(self.format, self.seed, index, &mut buffer);
         }
         Block {
             index,
@@ -242,9 +324,8 @@ fn block_offset(index: u64) -> u64 {
 
 /// One filled block, on loan from the pool.
 ///
-/// The generator sends one reference to each consumer and keeps none.
-/// Whichever consumer drops last returns the buffer, so there is no
-/// release protocol to get wrong: `Arc` is the protocol.
+/// The generator sends references to the format's consumers and keeps none.
+/// The final consumer returns the buffer, so `Arc` is the release protocol.
 struct Block<'pool> {
     index: u64,
     offset: u64,
@@ -265,7 +346,7 @@ impl Drop for Block<'_> {
 }
 
 /// Fills blocks until the indices run out or the run is cancelled.
-fn generate<'pool>(
+fn generate_v2<'pool>(
     plan: &Plan,
     pool: &'pool Pool,
     next_index: &AtomicU64,
@@ -286,6 +367,32 @@ fn generate<'pool>(
         // A closed queue means the consumer is gone, which only a
         // cancelled or unwinding run does; the block drops here.
         if write_tx.send(Arc::clone(&block)).is_err() || hash_tx.send(block).is_err() {
+            return;
+        }
+    }
+}
+
+/// Generates v3 blocks and stores each Merkle leaf in its indexed slot.
+fn generate_v3<'pool>(
+    plan: &Plan,
+    pool: &'pool Pool,
+    next_index: &AtomicU64,
+    completed: &AtomicU64,
+    leaves: &Mutex<Vec<MerkleHash>>,
+    write_tx: &Sender<Arc<Block<'pool>>>,
+) {
+    while let Some(buffer) = pool.take() {
+        let index = next_index.fetch_add(1, Ordering::Relaxed);
+        if index >= plan.blocks {
+            pool.put(buffer);
+            return;
+        }
+        let block = Arc::new(plan.fill(index, buffer, pool));
+        let leaf = v3_leaf_hash(index, block.bytes());
+        let slot = usize::try_from(index).expect("a block index fits because the leaf count does");
+        leaves.lock().unwrap_or_else(PoisonError::into_inner)[slot] = leaf;
+        completed.fetch_add(1, Ordering::Relaxed);
+        if write_tx.send(block).is_err() {
             return;
         }
     }
@@ -329,11 +436,8 @@ fn next_block<'pool>(
     queue.lock().unwrap_or_else(PoisonError::into_inner).recv()
 }
 
-/// Absorbs blocks in index order and returns the file's digest.
-///
-/// Returns `None` if the block stream ends before every block has been
-/// hashed, which a cancelled run is the only cause of.
-fn hash(blocks: &Receiver<Arc<Block<'_>>>, total: u64) -> Option<Digest> {
+/// Absorbs v2 blocks in index order through the streaming `BLAKE2b` state.
+fn hash_v2(blocks: &Receiver<Arc<Block<'_>>>, total: u64) -> Option<Digest> {
     let mut hasher = Hasher::new();
     let mut pending: BTreeMap<u64, Arc<Block<'_>>> = BTreeMap::new();
     let mut next = 0_u64;
@@ -350,6 +454,18 @@ fn hash(blocks: &Receiver<Arc<Block<'_>>>, total: u64) -> Option<Digest> {
         }
     }
     Some(hasher.finalize())
+}
+
+/// Fallibly allocates the indexed v3 leaf array.
+fn allocate_leaves(blocks: u64) -> io::Result<Vec<MerkleHash>> {
+    let leaf_count = usize::try_from(blocks)
+        .map_err(|_error| io::Error::new(io::ErrorKind::FileTooLarge, "too many v3 file blocks"))?;
+    let mut leaves = Vec::new();
+    leaves
+        .try_reserve_exact(leaf_count)
+        .map_err(|_source| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    leaves.resize(leaf_count, MerkleHash::from_bytes([0; MerkleHash::SIZE]));
+    Ok(leaves)
 }
 
 /// Threads to spawn for one stage against a `requested` parallelism:
@@ -486,7 +602,10 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::path::Path;
 
-    use caf_format::{BLOCK_SIZE, ContentReader, ContentSeed, Digest, HEADER_SIZE, Hasher, Header};
+    use caf_format::{
+        BLOCK_SIZE, ContentReader, ContentSeed, Digest, FileId, Format, HEADER_SIZE, Hasher,
+        Header, v3_file_id_from_bytes,
+    };
 
     use super::{
         BUFFERS_PER_GENERATOR, BUFFERS_PER_WRITER, ErrorSlot, Plan, Pool, block_offset,
@@ -516,6 +635,11 @@ mod tests {
     fn header_for(file_size: u64) -> Header {
         let seed = ContentSeed::from_bytes(*b"parallel-write!!");
         Header::new(Digest::ZERO, seed, file_size).expect("the sizes are at least a header")
+    }
+
+    fn v3_header_for(file_size: u64) -> Header {
+        let seed = ContentSeed::from_bytes(*b"parallel-write!!");
+        Header::new_v3(FileId::ZERO, seed, file_size).expect("the sizes are at least a header")
     }
 
     /// A mocked store with one temporary file open in it.
@@ -564,6 +688,18 @@ mod tests {
         (hasher.finalize(), bytes)
     }
 
+    /// Builds the same v3 bytes without using the positional writer.
+    fn write_v3_serial(header: &Header) -> (Digest, Vec<u8>) {
+        let len = usize::try_from(header.file_length()).expect("test files fit in memory");
+        let mut bytes = vec![0_u8; len];
+        bytes[..HEADER_SIZE].copy_from_slice(&header.encode());
+        ContentReader::new_with_format(header.content_seed(), Format::V3)
+            .read_exact(&mut bytes[HEADER_SIZE..])
+            .expect("the content stream is infinite");
+        let digest = Digest::from_bytes(v3_file_id_from_bytes(&bytes).into_inner());
+        (digest, bytes)
+    }
+
     /// The load-bearing property: parallelism is a speed knob, so the
     /// file and its digest must be what the sequential path produces at
     /// every block boundary and every thread count.
@@ -574,6 +710,26 @@ mod tests {
             assert_eq!(expected_bytes.len() as u64, file_size, "size {file_size}");
             for threads in [1, 2, 4, 7] {
                 let (digest, bytes) = write_parallel(&header_for(file_size), threads);
+                assert_eq!(bytes, expected_bytes, "size {file_size}, {threads} threads");
+                assert_eq!(
+                    digest, expected_digest,
+                    "size {file_size}, {threads} threads",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v3_parallel_output_covers_partial_and_odd_leaf_counts() {
+        for file_size in [
+            BLOCK_SIZE as u64 + 1,
+            3 * BLOCK_SIZE as u64,
+            5 * BLOCK_SIZE as u64,
+        ] {
+            let header = v3_header_for(file_size);
+            let (expected_digest, expected_bytes) = write_v3_serial(&header);
+            for threads in [2, 4, 7] {
+                let (digest, bytes) = write_parallel(&header, threads);
                 assert_eq!(bytes, expected_bytes, "size {file_size}, {threads} threads");
                 assert_eq!(
                     digest, expected_digest,

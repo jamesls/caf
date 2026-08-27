@@ -24,7 +24,7 @@ This command verifies all CAF files in the specified directory and
 provides detailed corruption analysis if any files are corrupted.
 
 The --chunk-size option controls the granularity of corruption
-detection:
+detection. Chunks are aligned to absolute file offsets:
 
     - 512 bytes: Fine-grained analysis, slower but more precise
     - 4096 bytes: Standard 4KB block analysis (default)

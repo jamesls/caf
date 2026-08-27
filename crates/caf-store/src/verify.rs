@@ -127,9 +127,10 @@ impl Verifier {
     /// Compares corrupted files against regenerated content in chunks of
     /// `bytes` (default [`DEFAULT_ANALYSIS_CHUNK_SIZE`]).
     ///
-    /// Smaller chunks give finer-grained corruption regions. The chunk
-    /// size never affects whether verification succeeds, only the
-    /// granularity of [`CorruptionReport`] regions. Values above
+    /// Chunks are aligned to absolute file offsets. Smaller chunks give
+    /// finer-grained corruption regions. The chunk size never affects
+    /// whether verification succeeds, only the granularity of
+    /// [`CorruptionReport`] regions. Values above
     /// [`MAX_ANALYSIS_CHUNK_SIZE`] clamp to it. The CLI rejects values
     /// below one as a usage error.
     #[must_use]

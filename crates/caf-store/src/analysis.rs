@@ -2,9 +2,10 @@
 //!
 //! When a file's identity does not match its path, or v3 content is not
 //! canonical, the verifier regenerates the expected content from the
-//! header's seed and compares it in `analysis_chunk_size` chunks. Differing
-//! chunks become [`CorruptionRegion`]s, contiguous regions with an identical pattern
-//! merge, and size deltas append `truncated` / `extra-bytes` regions.
+//! header's seed and compares it in `analysis_chunk_size` chunks aligned to
+//! absolute file offsets. Differing chunks become [`CorruptionRegion`]s,
+//! contiguous regions with an identical pattern merge, and size deltas
+//! append `truncated` / `extra-bytes` regions.
 //! The v2 clean path never runs any of this; v3 verification performs its
 //! canonical-content comparison while computing Merkle leaves and retains
 //! only whether a mismatch occurred.
@@ -186,9 +187,10 @@ impl CorruptionPattern {
 /// One corrupted byte range of a file.
 ///
 /// Offsets are absolute file offsets. Region granularity is the
-/// verifier's analysis chunk size; contiguous chunks with an identical
-/// pattern merge into one region (the pattern of the first chunk is
-/// kept).
+/// verifier's analysis chunk size, aligned to absolute file offsets; the
+/// first content region can be shorter because the header occupies the
+/// beginning of its chunk. Contiguous chunks with an identical pattern
+/// merge into one region (the pattern of the first chunk is kept).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CorruptionRegion {
     offset: u64,
@@ -360,21 +362,20 @@ pub(crate) fn analyze(
     let mut remaining = compare_end.saturating_sub(HEADER_SIZE as u64);
     // No chunk can exceed the bytes left to compare, so the buffers stay
     // bounded by the file rather than by the requested chunk size.
-    let chunk_size = usize::try_from(remaining)
+    let buffer_size = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
         .min(chunk_size.get());
 
     source.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
     let mut expected_stream =
         ContentReader::new_with_format(header.content_seed(), header.format());
-    let mut actual_chunk = vec![0_u8; chunk_size];
-    let mut expected_chunk = vec![0_u8; chunk_size];
+    let mut actual_chunk = vec![0_u8; buffer_size];
+    let mut expected_chunk = vec![0_u8; buffer_size];
     let mut regions: Vec<CorruptionRegion> = Vec::new();
     let mut offset = HEADER_SIZE as u64;
 
     while remaining > 0 {
-        let want = usize::try_from(remaining.min(chunk_size as u64))
-            .expect("chunk length is bounded by chunk_size");
+        let want = analysis_chunk_len(offset, remaining, chunk_size.get());
         let got = read_full(&mut source, &mut actual_chunk[..want])?;
         if got == 0 {
             break;
@@ -404,9 +405,10 @@ pub(crate) fn analyze(
 
 /// Positional, parallel corruption analysis for one file group.
 ///
-/// Tasks begin on exact analysis-chunk boundaries measured from the
-/// first content byte. Results are merged by task index, so task and I/O
-/// completion order cannot affect region classification or ordering.
+/// Tasks and analysis chunks are aligned to absolute file offsets. The
+/// first task begins after the header, partway through the first physical
+/// chunk. Results are merged by task index, so task and I/O completion
+/// order cannot affect region classification or ordering.
 /// `width` is the whole file-group width; the calling coordinator also
 /// executes tasks, keeping total live threads within it.
 pub(crate) fn analyze_parallel(
@@ -419,8 +421,7 @@ pub(crate) fn analyze_parallel(
 ) -> io::Result<Vec<CorruptionRegion>> {
     let expected_size = header.file_length();
     let compare_end = actual_size.min(expected_size);
-    let compare_len = compare_end.saturating_sub(HEADER_SIZE as u64);
-    if compare_len == 0 {
+    if compare_end <= HEADER_SIZE as u64 {
         let mut regions = Vec::new();
         append_size_region(&mut regions, actual_size, expected_size);
         return Ok(regions);
@@ -430,7 +431,7 @@ pub(crate) fn analyze_parallel(
     let task_len = chunks_per_task
         .checked_mul(chunk_size.get())
         .expect("analysis chunks are clamped to 64 MiB");
-    let total_tasks = compare_len.div_ceil(task_len as u64);
+    let total_tasks = compare_end.div_ceil(task_len as u64);
     let lanes = analysis_lane_count(width, task_len, total_tasks);
     debug_assert!(lanes > 0, "parallel analysis has content and spare lanes");
 
@@ -438,7 +439,7 @@ pub(crate) fn analyze_parallel(
         source,
         format: header.format(),
         seed: header.content_seed(),
-        compare_len,
+        compare_end,
         chunk_size: chunk_size.get(),
         task_len,
         total_tasks,
@@ -476,7 +477,7 @@ struct AnalysisPlan<'file> {
     source: &'file FileHandle,
     format: Format,
     seed: ContentSeed,
-    compare_len: u64,
+    compare_end: u64,
     chunk_size: usize,
     task_len: usize,
     total_tasks: u64,
@@ -697,28 +698,34 @@ fn analyze_task(
     memory: &AnalysisMemory,
     gate: &AnalysisGate,
 ) -> Option<io::Result<Vec<CorruptionRegion>>> {
-    let content_offset = index * plan.task_len as u64;
-    let len = usize::try_from((plan.compare_len - content_offset).min(plan.task_len as u64))
-        .expect("a task is bounded by task_len");
+    let task_start = index * plan.task_len as u64;
+    let file_offset = task_start.max(HEADER_SIZE as u64);
+    let task_end = task_start
+        .saturating_add(plan.task_len as u64)
+        .min(plan.compare_end);
+    let len = usize::try_from(task_end - file_offset).expect("a task is bounded by task_len");
     let _memory = memory.acquire(len.saturating_mul(2), gate)?;
     Some((|| {
-        let file_offset = HEADER_SIZE as u64 + content_offset;
         let mut actual = vec![0_u8; len];
         let got = plan.source.read_full_at(&mut actual, file_offset)?;
         actual.truncate(got);
         let mut expected = vec![0_u8; got];
+        let content_offset = file_offset - HEADER_SIZE as u64;
         ContentReader::new_with_offset_and_format(plan.seed, content_offset, plan.format)
             .read_exact(&mut expected)
             .expect("the content stream is infinite and never fails");
 
         let mut regions = Vec::new();
-        for (chunk_index, (actual, expected)) in actual
-            .chunks(plan.chunk_size)
-            .zip(expected.chunks(plan.chunk_size))
-            .enumerate()
-        {
+        let mut relative = 0;
+        while relative < got {
+            let chunk_len = analysis_chunk_len(
+                file_offset + relative as u64,
+                (got - relative) as u64,
+                plan.chunk_size,
+            );
+            let actual = &actual[relative..relative + chunk_len];
+            let expected = &expected[relative..relative + chunk_len];
             if actual != expected {
-                let relative = chunk_index * plan.chunk_size;
                 push_region(
                     &mut regions,
                     CorruptionRegion::new(
@@ -728,9 +735,22 @@ fn analyze_task(
                     ),
                 );
             }
+            relative += chunk_len;
         }
         Ok(regions)
     })())
+}
+
+/// Length of the next analysis chunk at an absolute file offset.
+///
+/// The first content chunk ends at the next physical chunk boundary;
+/// subsequent chunks have the configured size unless the comparison ends
+/// first.
+fn analysis_chunk_len(file_offset: u64, remaining: u64, chunk_size: usize) -> usize {
+    let chunk_size = chunk_size as u64;
+    let to_boundary = chunk_size - file_offset % chunk_size;
+    usize::try_from(remaining.min(to_boundary))
+        .expect("the chunk length is bounded by the configured chunk size")
 }
 
 enum AnalysisMessage {
@@ -1041,17 +1061,34 @@ mod tests {
 
     #[test]
     fn zeroed_chunks_merge_into_one_region() {
-        // Zero file offsets 1084..1852: exactly three 256-byte analysis
-        // chunks (chunks start at 60 + 256k), which must merge.
+        // Zero file offsets 1024..1792: exactly three physical 256-byte
+        // analysis chunks, which must merge.
         let mut bytes = clean_file(4096);
-        bytes[1084..1852].fill(0);
+        bytes[1024..1792].fill(0);
         let regions = regions_of(&bytes, 256);
         assert_eq!(regions.len(), 1, "{regions:?}");
-        assert_eq!(regions[0].offset(), 1084);
+        assert_eq!(regions[0].offset(), 1024);
         assert_eq!(regions[0].size(), 768);
-        assert_eq!(regions[0].end(), 1852);
+        assert_eq!(regions[0].end(), 1792);
         assert_eq!(regions[0].pattern(), CorruptionPattern::ZeroFilled);
         assert_eq!(regions[0].pattern().name(), "zero-filled");
+    }
+
+    #[test]
+    fn aligned_zeroed_block_is_one_region() {
+        let mut bytes = clean_file(3 * 4096);
+        bytes[4096..8192].fill(0);
+
+        let regions = regions_of(&bytes, 4096);
+
+        assert_eq!(
+            regions,
+            vec![CorruptionRegion::new(
+                4096,
+                4096,
+                CorruptionPattern::ZeroFilled,
+            )]
+        );
     }
 
     #[test]

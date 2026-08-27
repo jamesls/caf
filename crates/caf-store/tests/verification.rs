@@ -663,7 +663,7 @@ fn detects_corrupted_metadata_aggregate() {
 fn zero_filled_corruption_merges_whole_chunks() {
     // test_verify_files_reports_zero_filled_corruption. With a 256-byte
     // chunk size, zeroing 1000..2024 fully covers the three chunks at
-    // 1084..1852, which must merge into one zero-filled region.
+    // 1024..1792, which must merge into one zero-filled region.
     let store = tempfile::tempdir().expect("create temp store");
     generate(store.path(), 1, 4096);
     let [file] = &*data_files(store.path()) else {
@@ -684,8 +684,30 @@ fn zero_filled_corruption_merges_whole_chunks() {
     let [merged] = &*zero_filled else {
         panic!("one merged zero-filled region: {:?}", corruption.regions());
     };
-    assert_eq!(merged.offset(), 1084);
+    assert_eq!(merged.offset(), 1024);
     assert_eq!(merged.size(), 768);
+}
+
+#[test]
+fn aligned_zeroed_block_is_reported_as_one_physical_chunk() {
+    let store = tempfile::tempdir().expect("create temp store");
+    generate(store.path(), 1, 3 * 4096);
+    let [file] = &*data_files(store.path()) else {
+        panic!("exactly one data file is generated");
+    };
+    overwrite(file, 4096, &[0_u8; 4096]);
+
+    let report = verify(store.path());
+    let [corruption] = &*report.corruption_reports().collect::<Vec<_>>() else {
+        panic!("exactly one corruption report");
+    };
+    let [region] = corruption.regions() else {
+        panic!("one aligned corruption region: {:?}", corruption.regions());
+    };
+    assert_eq!(region.offset(), 4096);
+    assert_eq!(region.size(), 4096);
+    assert_eq!(region.pattern(), CorruptionPattern::ZeroFilled);
+    assert_eq!(corruption.total_corrupted_bytes(), 4096);
 }
 
 #[test]

@@ -37,7 +37,7 @@ use caf_format::{
 use crate::env::Env;
 use crate::size::{SampleError, SizeChooser};
 use crate::temp::TempFile;
-use crate::{MAX_JOBS, metadata, parallel_write};
+use crate::{MAX_JOBS, default_jobs, metadata, parallel_write};
 
 /// Default size of generated files in bytes when none is configured.
 ///
@@ -233,7 +233,7 @@ impl GeneratorBuilder {
                 max_files: None,
                 max_disk_usage: None,
                 sizes: SizeChooser::fixed(DEFAULT_FILE_SIZE),
-                jobs: NonZeroUsize::MIN,
+                jobs: default_jobs(),
                 write_threads: DEFAULT_WRITE_THREADS,
             },
         }
@@ -273,8 +273,8 @@ impl GeneratorBuilder {
         self
     }
 
-    /// Generates each file's content on `count` threads (default 1,
-    /// sequential).
+    /// Generates each file's content on `count` threads (default
+    /// [`default_jobs`]).
     ///
     /// The store is identical to a sequential run: every file has the
     /// same content, digest, and path at any worker count, so this is

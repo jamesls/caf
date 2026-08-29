@@ -15,6 +15,7 @@ use caf_format::{
     ContentReader, ContentSeed, Digest, FileId, Format, HEADER_SIZE, Header, hash_to_path,
     v3_file_id_from_bytes,
 };
+use caf_store::default_jobs;
 
 /// Exit status of `output`, panicking only on signal termination.
 fn code(output: &Output) -> i32 {
@@ -196,6 +197,17 @@ fn generation_help_lists_both_formats_and_v3_default() {
     let help = stdout(&output);
     for value in ["--format", "v2", "v3", "default: v3"] {
         assert!(help.contains(value), "missing {value:?}: {help}");
+    }
+}
+
+#[test]
+fn generation_and_verification_show_the_cpu_aware_jobs_default() {
+    let expected = format!("default: {}", default_jobs());
+    for command in ["gen", "verify"] {
+        let output = caf([command, "--help"]);
+        assert_eq!(code(&output), 0);
+        let help = stdout(&output);
+        assert!(help.contains(&expected), "missing {expected:?}: {help}");
     }
 }
 

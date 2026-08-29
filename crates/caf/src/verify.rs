@@ -2,15 +2,15 @@
 //!
 //! The header lines and the Error Analysis report go to standard output.
 //! Diagnostic lines go to standard error, and the exit status is 0 for a clean
-//! store and 1 for any failure. `--chunk-size` rejects values below one
-//! and `--jobs` defaults to 1 and rejects values below one.
+//! store and 1 for any failure. `--chunk-size` rejects values below one,
+//! while `--jobs` defaults to a CPU-aware budget and rejects values below one.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
-use caf_store::{DEFAULT_ANALYSIS_CHUNK_SIZE, Verifier};
+use caf_store::{DEFAULT_ANALYSIS_CHUNK_SIZE, Verifier, default_jobs};
 
 use crate::style::Style;
 use crate::util::{StoreRoot, commas};
@@ -62,12 +62,12 @@ pub struct Args {
 
     /// Global verification-worker budget. Different files run in
     /// parallel, and large files use spare workers for segment reads and
-    /// corruption analysis. Defaults to 1 (serial verification); results
+    /// corruption analysis. Defaults to a CPU-aware worker budget; results
     /// are identical at any count.
     #[arg(
         long,
         value_name = "INTEGER",
-        default_value_t = NonZeroUsize::MIN,
+        default_value_t = default_jobs(),
         value_parser = parse_positive
     )]
     jobs: NonZeroUsize,

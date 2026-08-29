@@ -41,7 +41,7 @@ use caf_format::{
 use crate::analysis::{self, CorruptionReport, read_full};
 use crate::env::{DirEntry, Env, FileHandle};
 use crate::metadata::{ALL_FILE, METADATA_DIR, ROOTS_DIR};
-use crate::{MAX_JOBS, parallel_verify, pipeline};
+use crate::{MAX_JOBS, default_jobs, parallel_verify, pipeline};
 
 /// Default corruption-analysis chunk size in bytes.
 pub const DEFAULT_ANALYSIS_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
@@ -120,7 +120,7 @@ impl Verifier {
             env,
             root: root.into(),
             analysis_chunk_size: DEFAULT_ANALYSIS_CHUNK_SIZE,
-            jobs: NonZeroUsize::MIN,
+            jobs: default_jobs(),
         }
     }
 
@@ -141,8 +141,8 @@ impl Verifier {
 
     /// Sets the store-wide verification worker limit.
     ///
-    /// The default is one worker, which runs serially. Different files run
-    /// concurrently. When the worker budget exceeds
+    /// The default is [`default_jobs`]. Different files run concurrently.
+    /// When the worker budget exceeds
     /// the remaining file count, large files receive spare workers for
     /// positional reads and corruption analysis. The report is identical
     /// to a serial run: results are folded back in sorted file order and

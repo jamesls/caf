@@ -20,7 +20,9 @@
 //! unstarted files, spare lanes read and analyze segments within large
 //! files. Serial and parallel runs produce identical reports: per-file
 //! work is order-independent, and collectors fold results back in sorted
-//! file order before the store-level checks run.
+//! file order before the store-level checks run. A worker thread the OS
+//! refuses narrows a stage to the threads that did start, down to the
+//! calling thread alone; thread-resource pressure never fails a run.
 
 use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,7 +37,7 @@ use std::thread;
 
 use caf_format::{
     BLOCK_SIZE, Digest, Format, HEADER_SIZE, Hasher, Header, HeaderError, MetadataDigest,
-    MetadataHasher, hash_to_path, parse_hash_from_path,
+    MetadataHasher, hash_to_path, hash_to_relpath, parse_hash_from_path,
 };
 
 use crate::analysis::{self, CorruptionReport, read_full};
@@ -150,7 +152,10 @@ impl Verifier {
     /// worker count and, for v3, with the transient 32-byte Merkle leaf
     /// stored for each 1 MiB file block. It does not grow with the number
     /// of queued files. Values above [`MAX_JOBS`] clamp to it. The CLI
-    /// rejects values below one as a usage error.
+    /// rejects values below one as a usage error. The count is a budget,
+    /// not a demand: if the OS refuses a worker thread, verification
+    /// proceeds on the threads that did start — down to the calling
+    /// thread alone — instead of failing.
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.jobs = count.min(MAX_JOBS);
@@ -287,22 +292,36 @@ impl Verifier {
         });
 
         let (sender, receiver) = mpsc::channel();
+        // One file group's whole task, shared by the spawned path and
+        // the inline fallback when the OS refuses a thread.
+        let run_group = |index: usize, sender: &mpsc::Sender<TailMessage>| {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut scratch = parallel_verify::ScanBuffers::new();
+                self.validate_file(
+                    files[index].clone(),
+                    widths[index],
+                    &mut scratch,
+                    analysis_memory,
+                )
+            }));
+            let message = match result {
+                Ok(result) => TailMessage::Outcome { index, result },
+                Err(payload) => TailMessage::Panic(payload),
+            };
+            let _ignored = sender.send(message);
+        };
         let (mut outcomes, panic_payload) = thread::scope(|scope| {
             for index in start_order {
-                let sender = sender.clone();
-                let path = files[index].clone();
-                let width = widths[index];
-                scope.spawn(move || {
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mut scratch = parallel_verify::ScanBuffers::new();
-                        self.validate_file(path, width, &mut scratch, analysis_memory)
-                    }));
-                    let message = match result {
-                        Ok(result) => TailMessage::Outcome { index, result },
-                        Err(payload) => TailMessage::Panic(payload),
-                    };
-                    let _ignored = sender.send(message);
-                });
+                let group_sender = sender.clone();
+                let run_group = &run_group;
+                let spawned = thread::Builder::new()
+                    .spawn_scoped(scope, move || run_group(index, &group_sender));
+                if spawned.is_err() {
+                    // The OS refused a thread; run this file's group on
+                    // the calling thread so resource pressure degrades
+                    // to serial work instead of a panic.
+                    run_group(index, &sender);
+                }
             }
             drop(sender);
 
@@ -360,7 +379,7 @@ impl Verifier {
                 diagnostics,
             });
         };
-        let canonical_path = path.ancestors().nth(4) == Some(self.root.as_path());
+        let canonical_path = is_canonical_path(&path, &self.root, digest_from_path);
 
         let mut file = self
             .env
@@ -544,8 +563,9 @@ struct FileRecord {
     path: PathBuf,
     /// The digest the path claims, when the path has the CAF layout.
     digest: Option<Digest>,
-    /// Whether the path is exactly the canonical four-component path
-    /// below the store root, rather than merely ending in that layout.
+    /// Whether the path is exactly the canonical lowercase store path
+    /// for its digest below the store root, rather than another
+    /// spelling or depth that decodes to the same digest.
     canonical_path: bool,
     /// The parent link from a validated non-root header.
     parent: Option<Digest>,
@@ -663,6 +683,18 @@ impl StoreChecks {
             })
             .collect()
     }
+}
+
+/// Returns `true` when `path` is exactly the canonical store path for
+/// `digest`: the lowercase sharded spelling directly below `root`.
+///
+/// Layout parsing accepts any hex case, so on a case-sensitive
+/// filesystem a mixed-case spelling can decode to a digest whose
+/// canonical path holds no file. Only the exact spelling may satisfy a
+/// parent link or supply a parent's format.
+fn is_canonical_path(path: &Path, root: &Path, digest: Digest) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|relative| relative == hash_to_relpath(digest))
 }
 
 /// Returns `true` when a metadata failure means "nothing usable is

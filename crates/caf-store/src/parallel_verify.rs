@@ -149,11 +149,12 @@ pub(crate) fn hash_file(
     let (sender, receiver) = mpsc::sync_channel(buffer_count);
 
     let (failure, panic_payload, next_hashed) = thread::scope(|scope| {
+        let mut spawned = 0_usize;
         for _ in 0..readers {
             let sender = sender.clone();
             let pool = &pool;
             let next_index = &next_index;
-            scope.spawn(move || {
+            let handle = thread::Builder::new().spawn_scoped(scope, move || {
                 let worked = panic::catch_unwind(AssertUnwindSafe(|| {
                     read_segments(
                         file,
@@ -170,8 +171,23 @@ pub(crate) fn hash_file(
                     let _ignored = sender.send(Message::Panic(payload));
                 }
             });
+            match handle {
+                Ok(_handle) => spawned += 1,
+                // The OS refused a reader; the readers that did start
+                // still cover every segment.
+                Err(_refused) => break,
+            }
         }
         drop(sender);
+
+        if spawned == 0 {
+            // No reader could start at all: read and hash sequentially
+            // on this thread instead of treating the empty segment
+            // stream as the whole file.
+            let (failure, segments) =
+                hash_segments_serially(file, &mut hasher, content_start, content_len, total);
+            return (failure, None, segments);
+        }
 
         let mut pending = BTreeMap::new();
         let mut next_hashed = 0_u64;
@@ -216,6 +232,32 @@ pub(crate) fn hash_file(
     }
     debug_assert_eq!(next_hashed, total, "every successful segment is hashed");
     Ok(hasher.finalize())
+}
+
+/// Sequential fallback for [`hash_file`] when the OS refuses every
+/// reader thread: reads each segment on the calling thread and hashes
+/// it immediately. A short read truncates its segment and moves on,
+/// exactly as the reader protocol does. Returns the indexed read
+/// failure, if any, and the count of segments hashed.
+fn hash_segments_serially(
+    file: &FileHandle,
+    hasher: &mut Hasher,
+    content_start: u64,
+    content_len: u64,
+    total: u64,
+) -> (Option<(u64, io::Error)>, u64) {
+    let mut buffer = Vec::new();
+    for index in 0..total {
+        let relative = index * BLOCK_SIZE as u64;
+        let len = usize::try_from((content_len - relative).min(BLOCK_SIZE as u64))
+            .expect("a segment is at most BLOCK_SIZE bytes");
+        buffer.resize(len, 0);
+        match file.read_full_at(&mut buffer, content_start + relative) {
+            Ok(got) => hasher.update(&buffer[..got]),
+            Err(source) => return (Some((index, source)), index),
+        }
+    }
+    (None, total)
 }
 
 /// Result of one strict v3 read pass.
@@ -303,7 +345,7 @@ pub(crate) fn hash_v3_file(
             let next_index = &next_index;
             let cancelled = &cancelled;
             let results = &results;
-            scope.spawn(move || {
+            let handle = thread::Builder::new().spawn_scoped(scope, move || {
                 let worked = panic::catch_unwind(AssertUnwindSafe(|| {
                     read_v3_blocks(
                         file,
@@ -321,6 +363,11 @@ pub(crate) fn hash_v3_file(
                     results.record_panic(payload);
                 }
             });
+            // A refused peer only narrows the group: the calling worker
+            // below claims every remaining block itself.
+            if handle.is_err() {
+                break;
+            }
         }
 
         let worked = panic::catch_unwind(AssertUnwindSafe(|| {

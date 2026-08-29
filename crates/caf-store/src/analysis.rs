@@ -495,7 +495,7 @@ fn run_parallel_analysis(plan: &AnalysisPlan<'_>, memory: &AnalysisMemory) -> An
         for _ in 1..plan.lanes {
             let sender = sender.clone();
             let gate = &gate;
-            scope.spawn(move || {
+            let handle = thread::Builder::new().spawn_scoped(scope, move || {
                 let worked = panic::catch_unwind(AssertUnwindSafe(|| {
                     analyze_tasks(plan, gate, window, memory, &sender);
                 }));
@@ -504,6 +504,11 @@ fn run_parallel_analysis(plan: &AnalysisPlan<'_>, memory: &AnalysisMemory) -> An
                     let _ignored = sender.send(AnalysisMessage::Panic(payload));
                 }
             });
+            // A refused lane only narrows the group: the coordinator
+            // runs the same claim loop and finishes the tasks.
+            if handle.is_err() {
+                break;
+            }
         }
         drop(sender);
 

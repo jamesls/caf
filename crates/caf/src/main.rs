@@ -13,6 +13,7 @@
 
 mod corrupt;
 mod generate;
+mod progress;
 mod render;
 mod show;
 mod style;

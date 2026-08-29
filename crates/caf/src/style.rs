@@ -57,6 +57,11 @@ impl Style {
         self.paint("32", text)
     }
 
+    /// Cyan, for an active progress indicator.
+    pub fn cyan(self, text: impl Display) -> String {
+        self.paint("36", text)
+    }
+
     /// Red, for failure markers (`✗`, `no`) and corruption bars.
     pub fn red(self, text: impl Display) -> String {
         self.paint("31", text)

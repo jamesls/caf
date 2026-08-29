@@ -276,6 +276,23 @@ pub(crate) fn hash_v3_file(
     let total = actual_size.div_ceil(BLOCK_SIZE as u64);
     let leaf_count = usize::try_from(total)
         .map_err(|_error| io::Error::new(io::ErrorKind::FileTooLarge, "too many v3 blocks"))?;
+    if width == 1 {
+        let mut leaves = allocate_leaves(leaf_count)?;
+        let mut content_matches = true;
+        for index in 0..total {
+            let (leaf, block_content_matches) =
+                read_v3_block(file, header, actual_size, index, scratch)?;
+            let slot =
+                usize::try_from(index).expect("a block index fits because the leaf count does");
+            leaves[slot] = leaf;
+            content_matches &= block_content_matches;
+        }
+        return Ok(V3HashResult {
+            digest: Digest::from_bytes(v3_file_id_from_leaves(actual_size, leaves).into_inner()),
+            content_matches,
+        });
+    }
+
     let results = V3Results::new(allocate_leaves(leaf_count)?);
     let workers = v3_worker_count(total, width);
     let next_index = AtomicU64::new(0);

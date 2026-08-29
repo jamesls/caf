@@ -326,7 +326,6 @@ impl MockCtrl {
             .filter(|(child, _)| child.parent() == Some(path))
             .map(|(child, node)| DirEntry {
                 path: child.clone(),
-                file_name: child.file_name().unwrap_or(path.as_os_str()).to_os_string(),
                 file_type: match node {
                     Node::Dir => FileType::Dir,
                     Node::File(_) => FileType::File,

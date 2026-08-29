@@ -20,7 +20,9 @@
 //! unstarted files, spare lanes read and analyze segments within large
 //! files. Serial and parallel runs produce identical reports: per-file
 //! work is order-independent, and collectors fold results back in sorted
-//! file order before the store-level checks run.
+//! file order before the store-level checks run. A worker thread the OS
+//! refuses narrows a stage to the threads that did start, down to the
+//! calling thread alone; thread-resource pressure never fails a run.
 
 use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,13 +37,13 @@ use std::thread;
 
 use caf_format::{
     BLOCK_SIZE, Digest, Format, HEADER_SIZE, Hasher, Header, HeaderError, MetadataDigest,
-    MetadataHasher, hash_to_path, parse_hash_from_path,
+    MetadataHasher, hash_to_path, hash_to_relpath, parse_hash_from_path,
 };
 
 use crate::analysis::{self, CorruptionReport, read_full};
 use crate::env::{DirEntry, Env, FileHandle};
 use crate::metadata::{ALL_FILE, METADATA_DIR, ROOTS_DIR};
-use crate::{MAX_JOBS, parallel_verify, pipeline};
+use crate::{MAX_JOBS, default_jobs, parallel_verify, pipeline};
 
 /// Default corruption-analysis chunk size in bytes.
 pub const DEFAULT_ANALYSIS_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
@@ -120,7 +122,7 @@ impl Verifier {
             env,
             root: root.into(),
             analysis_chunk_size: DEFAULT_ANALYSIS_CHUNK_SIZE,
-            jobs: NonZeroUsize::MIN,
+            jobs: default_jobs(),
         }
     }
 
@@ -141,8 +143,8 @@ impl Verifier {
 
     /// Sets the store-wide verification worker limit.
     ///
-    /// The default is one worker, which runs serially. Different files run
-    /// concurrently. When the worker budget exceeds
+    /// The default is [`default_jobs`]. Different files run concurrently.
+    /// When the worker budget exceeds
     /// the remaining file count, large files receive spare workers for
     /// positional reads and corruption analysis. The report is identical
     /// to a serial run: results are folded back in sorted file order and
@@ -150,7 +152,10 @@ impl Verifier {
     /// worker count and, for v3, with the transient 32-byte Merkle leaf
     /// stored for each 1 MiB file block. It does not grow with the number
     /// of queued files. Values above [`MAX_JOBS`] clamp to it. The CLI
-    /// rejects values below one as a usage error.
+    /// rejects values below one as a usage error. The count is a budget,
+    /// not a demand: if the OS refuses a worker thread, verification
+    /// proceeds on the threads that did start — down to the calling
+    /// thread alone — instead of failing.
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.jobs = count.min(MAX_JOBS);
@@ -190,7 +195,7 @@ impl Verifier {
             }
         }
         let root_markers = read_marker_names(&self.env, &roots_dir)?;
-        let marker_set: HashSet<&OsString> = root_markers.iter().collect();
+        let marker_set = marker_digests(&root_markers);
 
         let files = collect_data_files(&self.env, &self.root)?;
         let files_checked = files.len() as u64;
@@ -287,22 +292,36 @@ impl Verifier {
         });
 
         let (sender, receiver) = mpsc::channel();
+        // One file group's whole task, shared by the spawned path and
+        // the inline fallback when the OS refuses a thread.
+        let run_group = |index: usize, sender: &mpsc::Sender<TailMessage>| {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut scratch = parallel_verify::ScanBuffers::new();
+                self.validate_file(
+                    files[index].clone(),
+                    widths[index],
+                    &mut scratch,
+                    analysis_memory,
+                )
+            }));
+            let message = match result {
+                Ok(result) => TailMessage::Outcome { index, result },
+                Err(payload) => TailMessage::Panic(payload),
+            };
+            let _ignored = sender.send(message);
+        };
         let (mut outcomes, panic_payload) = thread::scope(|scope| {
             for index in start_order {
-                let sender = sender.clone();
-                let path = files[index].clone();
-                let width = widths[index];
-                scope.spawn(move || {
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mut scratch = parallel_verify::ScanBuffers::new();
-                        self.validate_file(path, width, &mut scratch, analysis_memory)
-                    }));
-                    let message = match result {
-                        Ok(result) => TailMessage::Outcome { index, result },
-                        Err(payload) => TailMessage::Panic(payload),
-                    };
-                    let _ignored = sender.send(message);
-                });
+                let group_sender = sender.clone();
+                let run_group = &run_group;
+                let spawned = thread::Builder::new()
+                    .spawn_scoped(scope, move || run_group(index, &group_sender));
+                if spawned.is_err() {
+                    // The OS refused a thread; run this file's group on
+                    // the calling thread so resource pressure degrades
+                    // to serial work instead of a panic.
+                    run_group(index, &sender);
+                }
             }
             drop(sender);
 
@@ -353,12 +372,14 @@ impl Verifier {
                 record: FileRecord {
                     path,
                     digest: None,
+                    canonical_path: false,
                     parent: None,
                     format: None,
                 },
                 diagnostics,
             });
         };
+        let canonical_path = is_canonical_path(&path, &self.root, digest_from_path);
 
         let mut file = self
             .env
@@ -383,6 +404,7 @@ impl Verifier {
                     record: FileRecord {
                         path,
                         digest: Some(digest_from_path),
+                        canonical_path,
                         parent: None,
                         format: None,
                     },
@@ -442,50 +464,16 @@ impl Verifier {
         } else {
             Some(header.parent())
         };
-        if let Some(parent) = parent {
-            self.check_parent(&path, parent, &mut diagnostics)?;
-        }
         Ok(FileOutcome {
             record: FileRecord {
                 path,
                 digest: Some(digest_from_path),
+                canonical_path,
                 parent,
                 format: Some(header.format()),
             },
             diagnostics,
         })
-    }
-
-    /// Reports `path`'s parent link when the linked file is not there.
-    fn check_parent(
-        &self,
-        path: &Path,
-        parent: Digest,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) -> Result<(), VerifyError> {
-        let parent_path = hash_to_path(&self.root, parent);
-        // Absent, or present as something other than a regular file, is
-        // the diagnostic; a metadata failure with any other cause is a
-        // filesystem error, not a missing parent.
-        let missing = match self.env.metadata(&parent_path) {
-            Ok(metadata) => !metadata.is_file(),
-            Err(err) if is_absent(&err) => true,
-            Err(source) => {
-                return Err(VerifyError::io(
-                    "reading a parent file's metadata",
-                    &parent_path,
-                    source,
-                ));
-            }
-        };
-        if missing {
-            diagnostics.push(Diagnostic::MissingParent {
-                path: path.to_owned(),
-                parent,
-                parent_path,
-            });
-        }
-        Ok(())
     }
 
     /// Recomputes the chain-tip aggregate and compares `.metadata/all`.
@@ -575,6 +563,10 @@ struct FileRecord {
     path: PathBuf,
     /// The digest the path claims, when the path has the CAF layout.
     digest: Option<Digest>,
+    /// Whether the path is exactly the canonical lowercase store path
+    /// for its digest below the store root, rather than another
+    /// spelling or depth that decodes to the same digest.
+    canonical_path: bool,
     /// The parent link from a validated non-root header.
     parent: Option<Digest>,
     /// Parsed format of this file, absent when its header is invalid.
@@ -621,10 +613,10 @@ impl StoreChecks {
     /// compared as exact lowercase hex.
     fn into_diagnostics(
         mut self,
-        marker_set: &HashSet<&OsString>,
+        marker_set: &HashSet<Digest>,
         store_root: &Path,
     ) -> Vec<Diagnostic> {
-        let chain_findings = self.chain_format_findings(store_root);
+        let chain_findings = self.chain_findings(store_root);
         let mut diagnostics = Vec::new();
         for (outcome, finding) in self.outcomes.iter_mut().zip(chain_findings) {
             diagnostics.append(&mut outcome.diagnostics);
@@ -633,10 +625,7 @@ impl StoreChecks {
         for outcome in self.outcomes {
             let record = outcome.record;
             let is_referenced = match record.digest {
-                Some(digest) => {
-                    self.referenced.contains(&digest)
-                        || marker_set.contains(&OsString::from(digest.to_hex()))
-                }
+                Some(digest) => self.referenced.contains(&digest) || marker_set.contains(&digest),
                 None => false,
             };
             if !is_referenced {
@@ -646,36 +635,66 @@ impl StoreChecks {
         diagnostics
     }
 
-    /// Computes each file's cross-version parent finding, index-aligned
-    /// with the outcomes.
+    /// Computes each file's missing-parent and cross-version findings,
+    /// index-aligned with the outcomes.
     ///
-    /// The parent's format comes from the record whose path is the
-    /// linked digest's canonical store path — the same file the
-    /// missing-parent check resolves — so another accepted path that
-    /// decodes to the same digest can never stand in for the parent.
-    fn chain_format_findings(&self, store_root: &Path) -> Vec<Option<Diagnostic>> {
-        let formats: HashMap<&Path, Format> = self
+    /// Every data path has already been walked and validated, so parent
+    /// presence and format are resolved from digest-keyed records
+    /// without a redundant metadata syscall, `PathBuf` construction, or
+    /// full-path hash per child. Only records at their canonical path
+    /// enter the map, so another accepted path that decodes to the same
+    /// digest can never stand in for the parent.
+    fn chain_findings(&self, store_root: &Path) -> Vec<Option<Diagnostic>> {
+        let records: HashMap<Digest, Option<Format>> = self
             .outcomes
             .iter()
-            .filter_map(|outcome| Some((outcome.record.path.as_path(), outcome.record.format?)))
+            .filter_map(|outcome| {
+                let record = &outcome.record;
+                if !record.canonical_path {
+                    return None;
+                }
+                Some((record.digest?, record.format))
+            })
             .collect();
         self.outcomes
             .iter()
             .map(|outcome| {
                 let record = &outcome.record;
-                let (parent, child_format) = (record.parent?, record.format?);
-                let parent_path = hash_to_path(store_root, parent);
-                let parent_format = *formats.get(parent_path.as_path())?;
-                (child_format != parent_format).then(|| Diagnostic::ChainFormatMismatch {
-                    path: record.path.clone(),
-                    parent,
-                    parent_path,
-                    child_format,
-                    parent_format,
-                })
+                let parent = record.parent?;
+                let Some(parent_format) = records.get(&parent) else {
+                    return Some(Diagnostic::MissingParent {
+                        path: record.path.clone(),
+                        parent,
+                        parent_path: hash_to_path(store_root, parent),
+                    });
+                };
+                match (record.format, *parent_format) {
+                    (Some(child_format), Some(parent_format)) if child_format != parent_format => {
+                        Some(Diagnostic::ChainFormatMismatch {
+                            path: record.path.clone(),
+                            parent,
+                            parent_path: hash_to_path(store_root, parent),
+                            child_format,
+                            parent_format,
+                        })
+                    }
+                    _ => None,
+                }
             })
             .collect()
     }
+}
+
+/// Returns `true` when `path` is exactly the canonical store path for
+/// `digest`: the lowercase sharded spelling directly below `root`.
+///
+/// Layout parsing accepts any hex case, so on a case-sensitive
+/// filesystem a mixed-case spelling can decode to a digest whose
+/// canonical path holds no file. Only the exact spelling may satisfy a
+/// parent link or supply a parent's format.
+fn is_canonical_path(path: &Path, root: &Path, digest: Digest) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|relative| relative == hash_to_relpath(digest))
 }
 
 /// Returns `true` when a metadata failure means "nothing usable is
@@ -715,6 +734,19 @@ fn read_marker_names(env: &Env, roots_dir: &Path) -> Result<Vec<OsString>, Verif
         .read_dir(roots_dir)
         .map_err(|source| VerifyError::io("listing the chain-tip markers", roots_dir, source))?;
     Ok(entries.into_iter().map(DirEntry::into_file_name).collect())
+}
+
+/// Parses exact lowercase digest marker names once, avoiding a hex-string
+/// allocation for every data file during orphan checks.
+fn marker_digests(names: &[OsString]) -> HashSet<Digest> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let text = name.to_str()?;
+            let digest = Digest::from_hex(text).ok()?;
+            (digest.to_hex() == text).then_some(digest)
+        })
+        .collect()
 }
 
 /// Returns every data file under `root` in byte-wise path order.
@@ -1056,12 +1088,15 @@ impl std::error::Error for VerifyError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::ffi::OsString;
     use std::num::NonZeroUsize;
 
     use super::{
         Diagnostic, MAX_ANALYSIS_CHUNK_SIZE, MAX_JOBS, Severity, VerificationReport, Verifier,
-        VerifyError,
+        VerifyError, marker_digests,
     };
+    use caf_format::Digest;
 
     #[test]
     fn errors_and_results_are_safe_to_move_between_threads() {
@@ -1076,6 +1111,17 @@ mod tests {
         assert_eq!(Severity::Error.to_string(), "ERROR");
         assert_eq!(Severity::Corruption.to_string(), "CORRUPTION");
         assert_eq!(Severity::Orphan.to_string(), "ORPHAN");
+    }
+
+    #[test]
+    fn only_exact_lowercase_root_markers_resolve_to_digests() {
+        let digest = Digest::from_bytes([0xab; Digest::SIZE]);
+        let markers = [
+            OsString::from(digest.to_hex()),
+            OsString::from(digest.to_hex().to_uppercase()),
+            OsString::from("not-a-digest"),
+        ];
+        assert_eq!(marker_digests(&markers), HashSet::from([digest]));
     }
 
     /// Oversized settings clamp to the documented resource bounds

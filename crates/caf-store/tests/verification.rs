@@ -637,6 +637,46 @@ fn broken_chain_reports_missing_parent_and_orphan() {
 }
 
 #[test]
+fn parent_at_a_mixed_case_spelling_is_missing() {
+    // Path parsing is case-insensitive, so an uppercase spelling still
+    // decodes to the parent's digest and verifies clean on its own, but
+    // only the exact lowercase canonical path may satisfy the child's
+    // parent link.
+    let store = tempfile::tempdir().expect("create temp store");
+    let generation = generate(store.path(), 2, 1024);
+    let tip = generation.chain_tip();
+    let parent = parent_of(store.path(), tip);
+
+    let canonical = hash_to_path(store.path(), parent);
+    let uppercase = store.path().join(
+        hash_to_relpath(parent)
+            .to_str()
+            .expect("generated paths are UTF-8")
+            .to_uppercase(),
+    );
+    fs::create_dir_all(uppercase.parent().expect("the layout has shards"))
+        .expect("create the uppercase shards");
+    fs::rename(&canonical, &uppercase).expect("move the parent");
+
+    let report = verify(store.path());
+    assert!(!report.success());
+    assert_eq!(report.files_checked(), 2);
+    let [missing] = report.diagnostics() else {
+        panic!("exactly one diagnostic: {:?}", report.diagnostics());
+    };
+    assert!(
+        matches!(
+            missing,
+            Diagnostic::MissingParent { path, parent: linked, parent_path }
+                if path == &hash_to_path(store.path(), tip)
+                    && *linked == parent
+                    && parent_path == &canonical
+        ),
+        "{missing:?}"
+    );
+}
+
+#[test]
 fn detects_corrupted_metadata_aggregate() {
     // test_verify_files_detects_corrupted_metadata
     let store = tempfile::tempdir().expect("create temp store");

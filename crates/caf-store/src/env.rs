@@ -104,7 +104,6 @@ impl Env {
                     let entry = entry?;
                     Ok(DirEntry {
                         file_type: FileType::from_native(entry.file_type()?),
-                        file_name: entry.file_name(),
                         path: entry.path(),
                     })
                 })
@@ -224,17 +223,12 @@ impl Metadata {
     pub(crate) fn is_dir(self) -> bool {
         self.file_type.is_dir()
     }
-
-    pub(crate) fn is_file(self) -> bool {
-        self.file_type == FileType::File
-    }
 }
 
 /// One entry of a directory listing.
 #[derive(Clone, Debug)]
 pub(crate) struct DirEntry {
     path: PathBuf,
-    file_name: OsString,
     file_type: FileType,
 }
 
@@ -248,11 +242,14 @@ impl DirEntry {
     }
 
     pub(crate) fn file_name(&self) -> &OsStr {
-        &self.file_name
+        self.path.file_name().unwrap_or(self.path.as_os_str())
     }
 
     pub(crate) fn into_file_name(self) -> OsString {
-        self.file_name
+        self.path
+            .file_name()
+            .unwrap_or(self.path.as_os_str())
+            .to_os_string()
     }
 
     /// The entry's own kind: a symlink is reported as one, not followed.

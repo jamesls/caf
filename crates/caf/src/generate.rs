@@ -3,9 +3,9 @@
 //! With no stopping option, exactly 100 files are generated. `--max-files`
 //! and `--max-disk-usage` are each checked before every file; the default
 //! file size is 4,096 bytes; sizes below the 60-byte header are clamped
-//! up by the library. `--jobs` defaults to 1 and rejects values below
-//! one; it changes only how fast a large file is written, never what is
-//! written. `gen` prints nothing on success.
+//! up by the library. `--jobs` defaults to a CPU-aware worker budget and
+//! rejects values below one; it changes only how fast a large file is
+//! written, never what is written. `gen` prints nothing on success.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
 use caf_format::Format;
-use caf_store::{Generator, ParseSizeError, SizeSpec, parse_byte_size};
+use caf_store::{Generator, ParseSizeError, SizeSpec, default_jobs, parse_byte_size};
 
 use crate::EXIT_FAILURE;
 use crate::util::StoreRoot;
@@ -126,13 +126,12 @@ pub struct Args {
     file_size: SizeSpec,
 
     /// Number of worker threads used to generate each file's content.
-    /// Defaults to 1 (serial generation); the files produced are
-    /// identical at any count. Only large files are split across
-    /// workers.
+    /// Defaults to a CPU-aware worker budget; the files produced are
+    /// identical at any count. Only large files are split across workers.
     #[arg(
         long,
         value_name = "INTEGER",
-        default_value_t = NonZeroUsize::MIN,
+        default_value_t = default_jobs(),
         value_parser = parse_positive
     )]
     jobs: NonZeroUsize,

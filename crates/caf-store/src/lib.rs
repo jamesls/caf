@@ -85,6 +85,13 @@ pub use verify::{
 };
 
 use std::num::NonZeroUsize;
+use std::thread;
+
+/// Largest worker count selected automatically.
+///
+/// Parallel generation keeps several 1 MiB buffers per worker, so the
+/// automatic policy stays below the explicit [`MAX_JOBS`] resource bound.
+const DEFAULT_MAX_JOBS: usize = 8;
 
 /// Largest worker count honored by [`Verifier::jobs`] and
 /// [`GeneratorBuilder::jobs`].
@@ -95,12 +102,51 @@ use std::num::NonZeroUsize;
 /// failing to spawn.
 pub const MAX_JOBS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
+/// Returns the default worker budget for generation and verification.
+///
+/// The budget uses half the logical CPUs available to this process, with at
+/// least two workers on multicore systems and a cap of eight. This leaves CPU
+/// and memory headroom while making parallel work the default. If the system
+/// parallelism cannot be determined, the conservative fallback is one worker.
+#[must_use]
+pub fn default_jobs() -> NonZeroUsize {
+    thread::available_parallelism().map_or(NonZeroUsize::MIN, jobs_for_parallelism)
+}
+
+fn jobs_for_parallelism(parallelism: NonZeroUsize) -> NonZeroUsize {
+    let cpus = parallelism.get();
+    let jobs = if cpus == 1 {
+        1
+    } else {
+        (cpus / 2).clamp(2, DEFAULT_MAX_JOBS)
+    };
+    NonZeroUsize::new(jobs).expect("the default worker count is always positive")
+}
+
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
+    use super::jobs_for_parallelism;
+
     // Keeps the workspace metadata (license and MSRV) pinned in CI.
     #[test]
     fn workspace_metadata_is_pinned() {
         assert_eq!(env!("CARGO_PKG_LICENSE"), "Apache-2.0");
         assert_eq!(env!("CARGO_PKG_RUST_VERSION"), "1.85");
+    }
+
+    #[test]
+    fn default_jobs_leaves_headroom_and_caps_resource_use() {
+        let jobs = |cpus| {
+            jobs_for_parallelism(NonZeroUsize::new(cpus).expect("test CPU counts are positive"))
+                .get()
+        };
+        assert_eq!(jobs(1), 1);
+        assert_eq!(jobs(2), 2);
+        assert_eq!(jobs(4), 2);
+        assert_eq!(jobs(8), 4);
+        assert_eq!(jobs(16), 8);
+        assert_eq!(jobs(128), 8);
     }
 }

@@ -8,7 +8,10 @@
 //! results never grow with the total number of tasks. The first task
 //! error in index order cancels the run — exactly the error a serial
 //! sweep would have stopped at — and a worker panic resumes on the
-//! calling thread, as it would have in a serial sweep.
+//! calling thread, as it would have in a serial sweep. If the OS
+//! refuses every worker thread, the run completes as exactly that
+//! serial sweep on the calling thread; refusing only some narrows the
+//! pool.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -30,7 +33,8 @@ const WINDOW_PER_WORKER: usize = 4;
 /// Each worker thread calls `make_worker` once and feeds the returned
 /// closure claimed indices, so per-worker state (such as a reusable
 /// read buffer) lives for the whole run. `collect` runs on the calling
-/// thread.
+/// thread. If the OS refuses every worker thread, the tasks run
+/// serially on the calling thread instead.
 ///
 /// # Errors
 ///
@@ -65,7 +69,7 @@ where
             let sender = sender.clone();
             let gate = &gate;
             let make_worker = &make_worker;
-            handles.push(scope.spawn(move || {
+            let spawned = thread::Builder::new().spawn_scoped(scope, move || {
                 let worked = panic::catch_unwind(AssertUnwindSafe(|| {
                     let mut work = make_worker();
                     while let Some(index) = gate.claim(total, window) {
@@ -92,9 +96,26 @@ where
                     gate.cancel();
                     panic::resume_unwind(payload);
                 }
-            }));
+            });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                // The OS refused a thread; the workers that did start
+                // keep the run correct with a narrower pool.
+                Err(_refused) => break,
+            }
         }
         drop(sender);
+
+        if handles.is_empty() {
+            // No worker could start at all: complete the run as a
+            // serial sweep on this thread rather than reporting an
+            // empty run as success.
+            let mut work = make_worker();
+            for index in 0..total {
+                collect(work(index)?);
+            }
+            return Ok(());
+        }
 
         // Collect in index order through a reorder buffer. The buffer
         // holds only in-flight results, which the claim window bounds.

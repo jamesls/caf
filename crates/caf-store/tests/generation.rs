@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Read as _;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use caf_format::{
     BLOCK_SIZE, ContentReader, Digest, FileId, Format, HEADER_SIZE, Hasher, Header,
@@ -248,6 +249,43 @@ fn parallel_generation_produces_a_structurally_valid_store() {
         );
     }
     check_store(store.path());
+}
+
+#[test]
+fn parallel_generation_reports_exact_monotonic_progress() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let file_size = 8 * BLOCK_SIZE as u64;
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let reported = Arc::clone(&snapshots);
+
+    Generator::builder(store.path())
+        .max_files(2)
+        .file_sizes(SizeChooser::fixed(file_size))
+        .jobs(NonZeroUsize::new(4).expect("four workers"))
+        .progress(move |snapshot| {
+            reported.lock().expect("progress log").push(snapshot);
+        })
+        .build()
+        .generate()
+        .expect("generation succeeds");
+
+    let snapshots = snapshots.lock().expect("progress log");
+    let first = snapshots.first().expect("an initial snapshot");
+    assert_eq!(first.bytes_completed(), 0);
+    assert_eq!(first.files_completed(), 0);
+    assert_eq!(first.total_bytes(), Some(2 * file_size));
+    assert_eq!(first.total_files(), Some(2));
+    let last = snapshots.last().expect("a final snapshot");
+    assert_eq!(last.bytes_completed(), 2 * file_size);
+    assert_eq!(last.files_completed(), 2);
+    assert!(
+        snapshots.len() > 4,
+        "large files report block-level updates"
+    );
+    assert!(snapshots.windows(2).all(|pair| {
+        pair[0].bytes_completed() <= pair[1].bytes_completed()
+            && pair[0].files_completed() <= pair[1].files_completed()
+    }));
 }
 
 #[test]

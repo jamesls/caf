@@ -23,6 +23,7 @@ use caf_format::{
 };
 
 use crate::env::FileHandle;
+use crate::progress::FileProgress;
 
 /// Buffers in flight per positional reader.
 const BUFFERS_PER_READER: usize = 4;
@@ -128,6 +129,7 @@ pub(crate) fn hash_file(
     header_bytes: &[u8],
     actual_size: u64,
     width: usize,
+    progress: Option<&FileProgress<'_>>,
 ) -> io::Result<Digest> {
     assert!(width >= 2, "parallel hashing needs a reader and a hasher");
     let content_start = header_bytes.len() as u64;
@@ -164,6 +166,7 @@ pub(crate) fn hash_file(
                         pool,
                         next_index,
                         &sender,
+                        progress,
                     );
                 }));
                 if let Err(payload) = worked {
@@ -306,6 +309,7 @@ pub(crate) fn hash_v3_file(
     actual_size: u64,
     width: usize,
     scratch: &mut ScanBuffers,
+    progress: Option<&FileProgress<'_>>,
 ) -> io::Result<V3HashResult> {
     debug_assert_eq!(header.format(), Format::V3);
     assert!(width >= 1, "a v3 file hash needs at least one lane");
@@ -319,20 +323,15 @@ pub(crate) fn hash_v3_file(
     let leaf_count = usize::try_from(total)
         .map_err(|_error| io::Error::new(io::ErrorKind::FileTooLarge, "too many v3 blocks"))?;
     if width == 1 {
-        let mut leaves = allocate_leaves(leaf_count)?;
-        let mut content_matches = true;
-        for index in 0..total {
-            let (leaf, block_content_matches) =
-                read_v3_block(file, header, actual_size, index, scratch)?;
-            let slot =
-                usize::try_from(index).expect("a block index fits because the leaf count does");
-            leaves[slot] = leaf;
-            content_matches &= block_content_matches;
-        }
-        return Ok(V3HashResult {
-            digest: Digest::from_bytes(v3_file_id_from_leaves(actual_size, leaves).into_inner()),
-            content_matches,
-        });
+        return hash_v3_serially(
+            file,
+            header,
+            actual_size,
+            total,
+            leaf_count,
+            scratch,
+            progress,
+        );
     }
 
     let results = V3Results::new(allocate_leaves(leaf_count)?);
@@ -356,6 +355,7 @@ pub(crate) fn hash_v3_file(
                         cancelled,
                         results,
                         &mut ScanBuffers::new(),
+                        progress,
                     );
                 }));
                 if let Err(payload) = worked {
@@ -380,6 +380,7 @@ pub(crate) fn hash_v3_file(
                 &cancelled,
                 &results,
                 scratch,
+                progress,
             );
         }));
         if let Err(payload) = worked {
@@ -405,6 +406,35 @@ pub(crate) fn hash_v3_file(
         .leaves
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
+    Ok(V3HashResult {
+        digest: Digest::from_bytes(v3_file_id_from_leaves(actual_size, leaves).into_inner()),
+        content_matches,
+    })
+}
+
+/// Width-one [`hash_v3_file`] pass: reads, checks, and reports each
+/// block on the calling thread, with no worker threads or shared state.
+fn hash_v3_serially(
+    file: &FileHandle,
+    header: &Header,
+    actual_size: u64,
+    total: u64,
+    leaf_count: usize,
+    scratch: &mut ScanBuffers,
+    progress: Option<&FileProgress<'_>>,
+) -> io::Result<V3HashResult> {
+    let mut leaves = allocate_leaves(leaf_count)?;
+    let mut content_matches = true;
+    for index in 0..total {
+        let (leaf, block_content_matches) =
+            read_v3_block(file, header, actual_size, index, scratch)?;
+        if let Some(progress) = progress {
+            report_v3_block(progress, actual_size, index);
+        }
+        let slot = usize::try_from(index).expect("a block index fits because the leaf count does");
+        leaves[slot] = leaf;
+        content_matches &= block_content_matches;
+    }
     Ok(V3HashResult {
         digest: Digest::from_bytes(v3_file_id_from_leaves(actual_size, leaves).into_inner()),
         content_matches,
@@ -503,6 +533,7 @@ fn read_v3_blocks(
     cancelled: &AtomicBool,
     results: &V3Results,
     scratch: &mut ScanBuffers,
+    progress: Option<&FileProgress<'_>>,
 ) {
     while !cancelled.load(Ordering::Relaxed) {
         let index = next_index.fetch_add(1, Ordering::Relaxed);
@@ -511,6 +542,9 @@ fn read_v3_blocks(
         }
         match read_v3_block(file, header, actual_size, index, scratch) {
             Ok((leaf, block_content_matches)) => {
+                if let Some(progress) = progress {
+                    report_v3_block(progress, actual_size, index);
+                }
                 results.store(index, leaf, block_content_matches);
             }
             Err(source) => {
@@ -520,6 +554,15 @@ fn read_v3_blocks(
             }
         }
     }
+}
+
+/// Reports one hashed physical block, net of the header bytes the
+/// caller already counted before block 0 was read back.
+fn report_v3_block(progress: &FileProgress<'_>, actual_size: u64, index: u64) {
+    let offset = index * BLOCK_SIZE as u64;
+    let block_len = (actual_size - offset).min(BLOCK_SIZE as u64);
+    let already_counted = if index == 0 { HEADER_SIZE as u64 } else { 0 };
+    progress.add_bytes(block_len.saturating_sub(already_counted));
 }
 
 fn read_v3_block(
@@ -558,6 +601,10 @@ fn read_v3_block(
     Ok((v3_leaf_hash(index, block), content_matches))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one reader's full segment plan; grouping would only rename it"
+)]
 fn read_segments<'pool>(
     file: &FileHandle,
     content_start: u64,
@@ -566,6 +613,7 @@ fn read_segments<'pool>(
     pool: &'pool Pool,
     next_index: &AtomicU64,
     sender: &SyncSender<Message<'pool>>,
+    progress: Option<&FileProgress<'_>>,
 ) {
     // Taking a buffer before claiming an index guarantees that the
     // lowest outstanding segment always has a reader and bounds claims
@@ -583,6 +631,9 @@ fn read_segments<'pool>(
         match file.read_full_at(&mut buffer.bytes, offset) {
             Ok(got) => {
                 buffer.bytes.truncate(got);
+                if let Some(progress) = progress {
+                    progress.add_bytes(got as u64);
+                }
                 if sender
                     .send(Message::Segment(Segment { index, buffer }))
                     .is_err()
@@ -750,12 +801,14 @@ mod mocked_tests {
     use std::io::{self, Read as _};
     use std::panic::{self, AssertUnwindSafe};
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use caf_format::{BLOCK_SIZE, ContentSeed, Digest, FileId, Header};
+    use caf_format::{BLOCK_SIZE, ContentSeed, Digest, FileId, HEADER_SIZE, Header};
 
     use super::{ScanBuffers, hash_file, hash_v3_file};
     use crate::env::Env;
+    use crate::progress::{FileProgress, ProgressCallback, ProgressTracker};
 
     fn bytes(len: usize) -> Vec<u8> {
         (0..len)
@@ -776,10 +829,64 @@ mod mocked_tests {
         )
         .expect("the header length is valid");
 
-        let error = hash_v3_file(&file, &header, 59, 1, &mut ScanBuffers::new())
+        let error = hash_v3_file(&file, &header, 59, 1, &mut ScanBuffers::new(), None)
             .err()
             .expect("stale short metadata is rejected");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// The width-one branch hashes on the calling thread and must report
+    /// each block as it is read, not leave the file at zero until the
+    /// caller's final `finish` jumps it to complete.
+    #[test]
+    fn v3_width_one_reports_progress_per_block() {
+        let size = 3 * BLOCK_SIZE as u64;
+        let (env, ctrl) = Env::mocked();
+        ctrl.write_file("/file", bytes(3 * BLOCK_SIZE))
+            .expect("the fixture is writable");
+        let file = env.open(Path::new("/file")).expect("the file opens");
+        let header = Header::new_v3(
+            FileId::ZERO,
+            ContentSeed::from_bytes(*b"parallel-verify!"),
+            size,
+        )
+        .expect("the header length is valid");
+
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let reported = Arc::clone(&snapshots);
+        let tracker = ProgressTracker::new(
+            Some(ProgressCallback::new(move |snapshot| {
+                reported
+                    .lock()
+                    .expect("callback lock")
+                    .push(snapshot.bytes_completed());
+            })),
+            Some(size),
+            Some(1),
+        );
+        let file_progress = FileProgress::new(&tracker, size);
+        hash_v3_file(
+            &file,
+            &header,
+            size,
+            1,
+            &mut ScanBuffers::new(),
+            Some(&file_progress),
+        )
+        .expect("the blocks read back");
+
+        // One update per physical block; block 0 is net of the header
+        // bytes the caller counts when it reads the header up front.
+        let block = BLOCK_SIZE as u64;
+        assert_eq!(
+            *snapshots.lock().expect("callback lock"),
+            [
+                0,
+                block - HEADER_SIZE as u64,
+                2 * block - HEADER_SIZE as u64,
+                3 * block - HEADER_SIZE as u64,
+            ]
+        );
     }
 
     #[test]
@@ -795,7 +902,7 @@ mod mocked_tests {
             file.read_exact(&mut header)
                 .expect("the header is readable");
 
-            let actual = hash_file(&file, &header, 4 * BLOCK_SIZE as u64 + 17, 4)
+            let actual = hash_file(&file, &header, 4 * BLOCK_SIZE as u64 + 17, 4, None)
                 .expect("parallel reads succeed");
             assert_eq!(actual, expected, "header length {header_len}");
         }
@@ -815,8 +922,8 @@ mod mocked_tests {
         ctrl.interrupt_next_read_at();
         ctrl.limit_next_read_at(17);
 
-        let actual =
-            hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 2).expect("parallel reads retry");
+        let actual = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 2, None)
+            .expect("parallel reads retry");
         assert_eq!(actual, expected);
     }
 
@@ -832,7 +939,7 @@ mod mocked_tests {
         file.read_exact(&mut header)
             .expect("the header is readable");
 
-        let actual = hash_file(&file, &header, BLOCK_SIZE as u64 + 17, 64)
+        let actual = hash_file(&file, &header, BLOCK_SIZE as u64 + 17, 64, None)
             .expect("more lanes than segments are harmless");
         assert_eq!(actual, expected);
     }
@@ -849,7 +956,7 @@ mod mocked_tests {
             .expect("the header is readable");
         ctrl.fail_read_at(BLOCK_SIZE as u64 + 100, io::ErrorKind::PermissionDenied);
 
-        let error = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 4)
+        let error = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 4, None)
             .expect_err("the injected read fails");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
@@ -867,7 +974,7 @@ mod mocked_tests {
             .expect("the header is readable");
         ctrl.delay_read_at(60, Duration::from_millis(30));
 
-        let actual = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 3)
+        let actual = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 3, None)
             .expect("out-of-order reads succeed");
         assert_eq!(actual, expected);
     }
@@ -886,7 +993,7 @@ mod mocked_tests {
         ctrl.fail_read_at(100, io::ErrorKind::PermissionDenied);
         ctrl.fail_read_at(BLOCK_SIZE as u64 + 100, io::ErrorKind::StorageFull);
 
-        let error = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 3)
+        let error = hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 3, None)
             .expect_err("both initial segments fail");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
@@ -904,7 +1011,7 @@ mod mocked_tests {
         ctrl.panic_read_at(BLOCK_SIZE as u64 + 100);
 
         let payload = panic::catch_unwind(AssertUnwindSafe(|| {
-            hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 3)
+            hash_file(&file, &header, 4 * BLOCK_SIZE as u64, 3, None)
         }))
         .expect_err("the reader panic reaches the coordinator");
         assert_eq!(

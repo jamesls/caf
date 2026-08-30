@@ -35,6 +35,7 @@ use caf_format::{
 };
 
 use crate::env::Env;
+use crate::progress::{OperationProgress, ProgressCallback, ProgressTracker};
 use crate::size::{SampleError, SizeChooser};
 use crate::temp::TempFile;
 use crate::{MAX_JOBS, default_jobs, metadata, parallel_write};
@@ -89,6 +90,7 @@ pub struct Generator {
     sizes: SizeChooser,
     jobs: NonZeroUsize,
     write_threads: NonZeroUsize,
+    progress: Option<ProgressCallback>,
 }
 
 impl Generator {
@@ -139,6 +141,8 @@ impl Generator {
 
         let max_files = self.max_files.unwrap_or(u64::MAX);
         let max_disk_usage = self.max_disk_usage.unwrap_or(u64::MAX);
+        let (total_bytes, total_files) = self.progress_totals();
+        let progress = ProgressTracker::new(self.progress.clone(), total_bytes, total_files);
         let mut buffer = vec![0_u8; BLOCK_SIZE];
         let mut created_dirs = HashSet::new();
         let mut parent = Digest::ZERO;
@@ -151,9 +155,11 @@ impl Generator {
                 .next_size()
                 .map_err(GenerateError::size_selection)?;
             let file_size = requested.max(MIN_FILE_SIZE);
-            parent = self.write_file(parent, file_size, &mut buffer, &mut created_dirs)?;
+            parent =
+                self.write_file(parent, file_size, &mut buffer, &mut created_dirs, &progress)?;
             files_created += 1;
             bytes_written = bytes_written.saturating_add(file_size);
+            progress.finish_file();
         }
 
         metadata::write_chain_tip(&self.env, &self.root, parent)?;
@@ -167,6 +173,32 @@ impl Generator {
         })
     }
 
+    /// Returns the best byte/file totals known before generation starts.
+    /// A fixed chooser makes the exact stopping point calculable; sampled
+    /// sizes retain their configured limits instead.
+    fn progress_totals(&self) -> (Option<u64>, Option<u64>) {
+        let Some(file_size) = self.sizes.fixed_size().map(|size| size.max(MIN_FILE_SIZE)) else {
+            return (self.max_disk_usage, self.max_files);
+        };
+        let files_for_disk = self.max_disk_usage.map(|limit| {
+            if limit == 0 {
+                0
+            } else {
+                limit.div_ceil(file_size)
+            }
+        });
+        let total_files = match (self.max_files, files_for_disk) {
+            (Some(files), Some(for_disk)) => Some(files.min(for_disk)),
+            (files @ Some(_), None) => files,
+            (None, for_disk @ Some(_)) => for_disk,
+            (None, None) => None,
+        };
+        (
+            total_files.map(|files| files.saturating_mul(file_size)),
+            total_files,
+        )
+    }
+
     /// Writes one file: header, deterministic content, and hash-derived
     /// placement. Returns the file's identity (the next file's parent).
     fn write_file(
@@ -175,6 +207,7 @@ impl Generator {
         file_size: u64,
         buffer: &mut [u8],
         created_dirs: &mut HashSet<PathBuf>,
+        progress: &ProgressTracker,
     ) -> Result<Digest, GenerateError> {
         let seed =
             ContentSeed::from_bytes(self.env.random_array().map_err(GenerateError::randomness)?);
@@ -193,9 +226,15 @@ impl Generator {
         // Both paths produce the same bytes and the same identity; only
         // the thread count differs.
         let digest = if use_parallel_path(file_size, self.jobs) {
-            parallel_write::write_content(&temp, &header, self.jobs, self.write_threads)?
+            parallel_write::write_content(
+                &temp,
+                &header,
+                self.jobs,
+                self.write_threads,
+                Some(progress),
+            )?
         } else {
-            write_content_serial(&mut temp, &header, buffer)?
+            write_content_serial(&mut temp, &header, buffer, progress)?
         };
 
         let final_path = hash_to_path(&self.root, digest);
@@ -235,6 +274,7 @@ impl GeneratorBuilder {
                 sizes: SizeChooser::fixed(DEFAULT_FILE_SIZE),
                 jobs: default_jobs(),
                 write_threads: DEFAULT_WRITE_THREADS,
+                progress: None,
             },
         }
     }
@@ -294,6 +334,18 @@ impl GeneratorBuilder {
         self
     }
 
+    /// Reports byte and file progress while generation runs.
+    ///
+    /// The callback may run on any generation worker thread and should
+    /// return quickly. It receives an initial zero snapshot, updates after
+    /// content writes, and a snapshot after each completed file. Omitting a
+    /// callback has no effect on generated data or reports.
+    #[must_use]
+    pub fn progress(mut self, report: impl Fn(OperationProgress) + Send + Sync + 'static) -> Self {
+        self.generator.progress = Some(ProgressCallback::new(report));
+        self
+    }
+
     /// Writes parallel-generated content on `count` threads (default 4).
     ///
     /// Writer threads submit filled blocks to the operating system and
@@ -330,9 +382,10 @@ fn write_content_serial(
     temp: &mut TempFile,
     header: &Header,
     buffer: &mut [u8],
+    progress: &ProgressTracker,
 ) -> Result<Digest, GenerateError> {
     if header.format() == Format::V3 {
-        return write_v3_content_serial(temp, header, buffer);
+        return write_v3_content_serial(temp, header, buffer, progress);
     }
 
     let mut hasher = Hasher::new();
@@ -341,6 +394,7 @@ fn write_content_serial(
         .write_all(&encoded)
         .map_err(|source| GenerateError::io("writing the header", temp.path(), source))?;
     hasher.update(encoded);
+    progress.add_bytes(encoded.len() as u64);
 
     // One reusable block-sized buffer streams SHAKE generation, file
     // writing, and BLAKE2b hashing; the reader squeezes only the bytes
@@ -358,6 +412,7 @@ fn write_content_serial(
             .write_all(chunk)
             .map_err(|source| GenerateError::io("writing content", temp.path(), source))?;
         hasher.update(chunk);
+        progress.add_bytes(take as u64);
         remaining -= take as u64;
     }
     Ok(hasher.finalize())
@@ -368,6 +423,7 @@ fn write_v3_content_serial(
     temp: &mut TempFile,
     header: &Header,
     buffer: &mut [u8],
+    progress: &ProgressTracker,
 ) -> Result<Digest, GenerateError> {
     debug_assert_eq!(header.format(), Format::V3);
     let encoded = header.encode();
@@ -404,6 +460,7 @@ fn write_v3_content_serial(
         temp.file_mut()
             .write_all(block)
             .map_err(|source| GenerateError::io("writing content", temp.path(), source))?;
+        progress.add_bytes(len as u64);
     }
 
     Ok(Digest::from_bytes(

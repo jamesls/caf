@@ -5,17 +5,21 @@
 //! file size is 4,096 bytes; sizes below the 60-byte header are clamped
 //! up by the library. `--jobs` defaults to a CPU-aware worker budget and
 //! rejects values below one; it changes only how fast a large file is
-//! written, never what is written. `gen` prints nothing on success.
+//! written, never what is written. `gen` shows live progress when
+//! standard error is a terminal and prints nothing when output is
+//! redirected.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use caf_format::Format;
 use caf_store::{Generator, ParseSizeError, SizeSpec, default_jobs, parse_byte_size};
 
 use crate::EXIT_FAILURE;
+use crate::progress::{Basis, ProgressBar};
 use crate::util::StoreRoot;
 
 /// Files generated when neither stopping option is given.
@@ -180,10 +184,14 @@ fn parse_file_size(value: &str) -> Result<SizeSpec, ParseSizeError> {
 
 /// Runs `caf gen`.
 pub fn run(args: &Args) -> ExitCode {
-    match generate(args) {
-        // Successful generation produces no output.
-        Ok(()) => ExitCode::SUCCESS,
+    let progress = ProgressBar::new("Generate", Basis::AnyLimit);
+    match generate(args, &progress) {
+        Ok(()) => {
+            progress.finish(true);
+            ExitCode::SUCCESS
+        }
         Err(err) => {
+            progress.clear();
             eprintln!("error: {err:#}");
             ExitCode::from(EXIT_FAILURE)
         }
@@ -191,7 +199,7 @@ pub fn run(args: &Args) -> ExitCode {
 }
 
 /// Generates the chain `args` describes.
-fn generate(args: &Args) -> Result<()> {
+fn generate(args: &Args, progress: &Arc<ProgressBar>) -> Result<()> {
     let directory = StoreRoot::from(args.directory.as_deref()).resolve()?;
     let mut builder = Generator::builder(directory);
 
@@ -218,11 +226,14 @@ fn generate(args: &Args) -> Result<()> {
         .chooser()
         .context("seeding the file size sampler")?;
 
-    builder
+    builder = builder
         .format(args.format.into())
         .file_sizes(sizes)
-        .jobs(args.jobs)
-        .build()
-        .generate()?;
+        .jobs(args.jobs);
+    if progress.enabled() {
+        let progress = Arc::clone(progress);
+        builder = builder.progress(move |snapshot| progress.update(snapshot));
+    }
+    builder.build().generate()?;
     Ok(())
 }

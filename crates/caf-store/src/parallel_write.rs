@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -46,6 +47,7 @@ use caf_format::{
 
 use crate::env::FileHandle;
 use crate::generate::GenerateError;
+use crate::progress::ProgressTracker;
 use crate::temp::TempFile;
 
 /// Buffers the pool holds per generator thread.
@@ -87,6 +89,7 @@ pub(crate) fn write_content(
     header: &Header,
     jobs: NonZeroUsize,
     write_threads: NonZeroUsize,
+    progress: Option<&ProgressTracker>,
 ) -> Result<Digest, GenerateError> {
     let plan = Plan::new(header);
     let generators = thread_count(jobs, plan.blocks);
@@ -102,7 +105,7 @@ pub(crate) fn write_content(
         buffer_count(generators, writers, plan.blocks),
         plan.buffer_capacity(),
     );
-    run(temp.file(), &plan, &pool, generators, writers)
+    run(temp.file(), &plan, &pool, generators, writers, progress)
         .map_err(|source| GenerateError::io("writing content", temp.path(), source))
 }
 
@@ -116,10 +119,11 @@ fn run(
     pool: &Pool,
     generators: usize,
     writers: usize,
+    progress: Option<&ProgressTracker>,
 ) -> Result<Digest, io::Error> {
     match plan.format {
-        Format::V2 => run_v2(file, plan, pool, generators, writers),
-        Format::V3 => run_v3(file, plan, pool, generators, writers),
+        Format::V2 => run_v2(file, plan, pool, generators, writers, progress),
+        Format::V3 => run_v3(file, plan, pool, generators, writers, progress),
     }
 }
 
@@ -130,8 +134,10 @@ fn run_v2(
     pool: &Pool,
     generators: usize,
     writers: usize,
+    progress: Option<&ProgressTracker>,
 ) -> Result<Digest, io::Error> {
     let failure = ErrorSlot::new();
+    let panicked = PanicSlot::new();
     let next_index = AtomicU64::new(0);
     let (hash_tx, hash_rx) = mpsc::channel();
     let (write_tx, write_rx) = mpsc::channel();
@@ -165,7 +171,9 @@ fn run_v2(
                 break;
             }
             spawned = thread::Builder::new()
-                .spawn_scoped(scope, || write(file, &write_rx, pool, &failure))
+                .spawn_scoped(scope, || {
+                    write(file, &write_rx, pool, &failure, &panicked, progress);
+                })
                 .map(drop);
         }
         // The generators hold the only remaining senders, so both queues
@@ -181,16 +189,21 @@ fn run_v2(
     });
 
     // The scope has joined the writers, so every write that was going to
-    // happen has happened. A failure outranks a completed hash: the
-    // hasher only reads buffers and can finish while a write is still
-    // failing, and a file is correct only once every block reaches the
-    // disk.
+    // happen has happened. A recorded panic resumes first — it is the
+    // caller's own callback unwinding, not a result to report — then a
+    // failure outranks a completed hash: the hasher only reads buffers
+    // and can finish while a write is still failing, and a file is
+    // correct only once every block reaches the disk.
+    if let Some(payload) = panicked.take() {
+        panic::resume_unwind(payload);
+    }
     if let Some(source) = failure.take() {
         return Err(source);
     }
     // The block stream ends early only when a cancellation cuts it
-    // short, and both causes — a failed write, a refused spawn — have
-    // returned above; a generator panic unwinds through the scope.
+    // short, and every cause — a failed write, a refused spawn, a
+    // panicking writer — has returned or resumed above; a generator
+    // panic unwinds through the scope.
     Ok(hashed?.expect("the block stream ends early only after a cancellation"))
 }
 
@@ -201,8 +214,10 @@ fn run_v3(
     pool: &Pool,
     generators: usize,
     writers: usize,
+    progress: Option<&ProgressTracker>,
 ) -> Result<Digest, io::Error> {
     let failure = ErrorSlot::new();
+    let panicked = PanicSlot::new();
     let next_index = AtomicU64::new(0);
     let completed = AtomicU64::new(0);
     let leaves = Mutex::new(allocate_leaves(plan.blocks)?);
@@ -230,7 +245,9 @@ fn run_v3(
                 break;
             }
             spawned = thread::Builder::new()
-                .spawn_scoped(scope, || write(file, &write_rx, pool, &failure))
+                .spawn_scoped(scope, || {
+                    write(file, &write_rx, pool, &failure, &panicked, progress);
+                })
                 .map(drop);
         }
         drop(write_tx);
@@ -241,6 +258,9 @@ fn run_v3(
         spawned
     });
 
+    if let Some(payload) = panicked.take() {
+        panic::resume_unwind(payload);
+    }
     if let Some(source) = failure.take() {
         return Err(source);
     }
@@ -414,15 +434,36 @@ fn write(
     queue: &Mutex<Receiver<Arc<Block<'_>>>>,
     pool: &Pool,
     failure: &ErrorSlot,
+    panicked: &PanicSlot,
+    progress: Option<&ProgressTracker>,
 ) {
-    while let Ok(block) = next_block(queue) {
-        if failure.outranks(block.index) {
-            continue;
+    // The progress callback is caller code and may panic. An unwinding
+    // writer stops draining the queue, and without a cancellation the
+    // generators would wait forever on a pool the retained blocks never
+    // refill, deadlocking the scope's implicit join. So the panic is
+    // caught, the pool cancelled, and the payload recorded; the caller
+    // resumes the unwind once the scope has drained out.
+    let worked = panic::catch_unwind(AssertUnwindSafe(|| {
+        while let Ok(block) = next_block(queue) {
+            if failure.outranks(block.index) {
+                continue;
+            }
+            match file.write_all_at(block.bytes(), block.offset) {
+                Ok(()) => {
+                    if let Some(progress) = progress {
+                        progress.add_bytes(block.bytes().len() as u64);
+                    }
+                }
+                Err(source) => {
+                    failure.record(block.index, source);
+                    pool.cancel();
+                }
+            }
         }
-        if let Err(source) = file.write_all_at(block.bytes(), block.offset) {
-            failure.record(block.index, source);
-            pool.cancel();
-        }
+    }));
+    if let Err(payload) = worked {
+        pool.cancel();
+        panicked.record(payload);
     }
 }
 
@@ -555,6 +596,37 @@ impl Pool {
     }
 }
 
+/// The first writer panic, held until the caller can resume it.
+///
+/// A writer's scoped join handle is dropped at spawn, so a panic that
+/// unwound out of the thread would surface from the scope as a generic
+/// payload. Recording it here lets the caller resume the original one.
+struct PanicSlot {
+    slot: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+impl PanicSlot {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    fn record(&self, payload: Box<dyn std::any::Any + Send>) {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(payload);
+        }
+    }
+
+    fn take(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
 /// The write failure a run reports.
 ///
 /// Keeping the lowest block index makes the reported error the one a
@@ -600,6 +672,7 @@ impl ErrorSlot {
 mod tests {
     use std::io::{self, Read as _, Write as _};
     use std::num::NonZeroUsize;
+    use std::panic::{self, AssertUnwindSafe};
     use std::path::Path;
 
     use caf_format::{
@@ -612,6 +685,7 @@ mod tests {
         buffer_count, run, thread_count, total_blocks, write_content,
     };
     use crate::env::{Env, MockCtrl};
+    use crate::progress::{ProgressCallback, ProgressTracker};
     use crate::temp::TempFile;
 
     /// Sizes that exercise every block boundary the writer has to get
@@ -655,7 +729,7 @@ mod tests {
     fn write_parallel(header: &Header, threads: usize) -> (Digest, Vec<u8>) {
         let (_env, ctrl) = Env::mocked();
         let temp = temp_in_store(&ctrl);
-        let digest = write_content(&temp, header, jobs(threads), jobs(threads))
+        let digest = write_content(&temp, header, jobs(threads), jobs(threads), None)
             .expect("the mocked writes succeed");
         let bytes = ctrl.read_file(temp.path()).expect("the file is readable");
         (digest, bytes)
@@ -850,7 +924,7 @@ mod tests {
         let (_env, ctrl) = Env::mocked();
         let temp = temp_in_store(&ctrl);
         let pool = Pool::new(buffers, plan.buffer_capacity());
-        run(temp.file(), &plan, &pool, 4, 2).expect("the mocked writes succeed");
+        run(temp.file(), &plan, &pool, 4, 2, None).expect("the mocked writes succeed");
         assert_eq!(pool.free(), buffers, "after a successful run");
 
         // Failing every write cancels the run partway through.
@@ -860,7 +934,7 @@ mod tests {
         ctrl.fail_write_at(3 * BLOCK_SIZE as u64, io::ErrorKind::StorageFull);
         ctrl.fail_write_at(4 * BLOCK_SIZE as u64, io::ErrorKind::StorageFull);
         let pool = Pool::new(buffers, plan.buffer_capacity());
-        let err = run(temp.file(), &plan, &pool, 4, 2).expect_err("every write fails");
+        let err = run(temp.file(), &plan, &pool, 4, 2, None).expect_err("every write fails");
         assert_eq!(err.kind(), io::ErrorKind::StorageFull);
         assert_eq!(pool.free(), buffers, "after a cancelled run");
     }
@@ -881,7 +955,7 @@ mod tests {
             ctrl.fail_write_at(BLOCK_SIZE as u64, io::ErrorKind::PermissionDenied);
             ctrl.fail_write_at(3 * BLOCK_SIZE as u64, io::ErrorKind::StorageFull);
             let pool = Pool::new(buffer_count(4, 4, plan.blocks), plan.buffer_capacity());
-            let err = run(temp.file(), &plan, &pool, 4, 4).expect_err("two writes fail");
+            let err = run(temp.file(), &plan, &pool, 4, 4, None).expect_err("two writes fail");
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         }
     }
@@ -900,12 +974,43 @@ mod tests {
         assert!(slot.take().is_none(), "the slot is emptied by take");
     }
 
+    /// A panicking progress callback unwinds the only writer. The writer
+    /// must cancel the pool on its way out, or the generators would wait
+    /// forever on buffers held by the undrained queue and this test
+    /// would hang instead of observing the panic.
+    #[test]
+    fn a_panicking_progress_callback_cancels_the_run() {
+        let (_env, ctrl) = Env::mocked();
+        let temp = temp_in_store(&ctrl);
+        // The tracker reports a zero-byte snapshot at construction; only
+        // the first written block trips the panic.
+        let tracker = ProgressTracker::new(
+            Some(ProgressCallback::new(|progress| {
+                assert!(
+                    progress.bytes_completed() == 0,
+                    "the progress callback panicked"
+                );
+            })),
+            None,
+            None,
+        );
+        let header = header_for(8 * BLOCK_SIZE as u64);
+        let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+            write_content(&temp, &header, jobs(4), jobs(1), Some(&tracker))
+        }))
+        .expect_err("the callback panic reaches the caller");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"the progress callback panicked")
+        );
+    }
+
     #[test]
     fn a_failed_preallocation_is_reported_with_the_temporary_path() {
         let (_env, ctrl) = Env::mocked();
         let temp = temp_in_store(&ctrl);
         ctrl.fail_set_len(io::ErrorKind::StorageFull);
-        let err = write_content(&temp, &header_for(4096), jobs(4), jobs(2))
+        let err = write_content(&temp, &header_for(4096), jobs(4), jobs(2), None)
             .expect_err("preallocation fails");
         assert!(err.is_io());
         assert_eq!(err.path(), Some(temp.path()));
@@ -924,8 +1029,14 @@ mod tests {
         let temp = temp_in_store(&ctrl);
         // Fail a block in the middle of the file, not the first one.
         ctrl.fail_write_at(2 * BLOCK_SIZE as u64, io::ErrorKind::PermissionDenied);
-        let err = write_content(&temp, &header_for(4 * BLOCK_SIZE as u64), jobs(4), jobs(2))
-            .expect_err("the write fails");
+        let err = write_content(
+            &temp,
+            &header_for(4 * BLOCK_SIZE as u64),
+            jobs(4),
+            jobs(2),
+            None,
+        )
+        .expect_err("the write fails");
         assert!(err.is_io());
         assert_eq!(err.path(), Some(temp.path()));
     }

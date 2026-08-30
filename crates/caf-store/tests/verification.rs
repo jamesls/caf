@@ -9,6 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use caf_format::{
     BLOCK_SIZE, ContentReader, ContentSeed, Digest, FileId, Format, HEADER_SIZE, Hasher, Header,
@@ -1282,6 +1283,74 @@ fn parallel_verification_matches_serial_on_a_clean_store() {
     for jobs in [1, 2, 4, 8] {
         assert_matches_serial(store.path(), &serial, jobs);
     }
+}
+
+#[test]
+fn parallel_verification_reports_exact_monotonic_progress() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let file_size = 4 * BLOCK_SIZE as u64;
+    generate(store.path(), 3, file_size);
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let reported = Arc::clone(&snapshots);
+
+    let report = Verifier::new(store.path())
+        .jobs(positive(4))
+        .progress(move |snapshot| {
+            reported.lock().expect("progress log").push(snapshot);
+        })
+        .verify()
+        .expect("verification runs");
+    assert!(report.success());
+
+    let snapshots = snapshots.lock().expect("progress log");
+    let first = snapshots.first().expect("an initial snapshot");
+    assert_eq!(first.bytes_completed(), 0);
+    assert_eq!(first.files_completed(), 0);
+    assert_eq!(first.total_bytes(), Some(3 * file_size));
+    assert_eq!(first.total_files(), Some(3));
+    let last = snapshots.last().expect("a final snapshot");
+    assert_eq!(last.bytes_completed(), 3 * file_size);
+    assert_eq!(last.files_completed(), 3);
+    assert!(
+        snapshots.len() > 5,
+        "large files report block-level updates"
+    );
+    assert!(snapshots.windows(2).all(|pair| {
+        pair[0].bytes_completed() <= pair[1].bytes_completed()
+            && pair[0].files_completed() <= pair[1].files_completed()
+    }));
+}
+
+/// A stray file whose path is not a store layout is counted by the
+/// preliminary byte total, so its bytes must also complete: otherwise a
+/// finished run would end short of 100% and skew percentages and ETAs
+/// throughout.
+#[test]
+fn stray_file_bytes_complete_the_progress_totals() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let file_size = 512_u64;
+    generate(store.path(), 1, file_size);
+    let stray = store.path().join("leftover-temporary");
+    let stray_size = 4096_usize;
+    fs::write(&stray, vec![0x5A; stray_size]).expect("write the stray file");
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let reported = Arc::clone(&snapshots);
+
+    let report = Verifier::new(store.path())
+        .progress(move |snapshot| {
+            reported.lock().expect("progress log").push(snapshot);
+        })
+        .verify()
+        .expect("verification runs");
+    assert!(!report.success(), "the stray file is diagnosed");
+
+    let snapshots = snapshots.lock().expect("progress log");
+    let last = snapshots.last().expect("a final snapshot");
+    let total = file_size + stray_size as u64;
+    assert_eq!(last.total_bytes(), Some(total));
+    assert_eq!(last.bytes_completed(), total);
+    assert_eq!(last.total_files(), Some(2));
+    assert_eq!(last.files_completed(), 2);
 }
 
 #[test]

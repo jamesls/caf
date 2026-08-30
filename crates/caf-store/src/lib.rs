@@ -60,6 +60,7 @@ mod metadata;
 mod parallel_verify;
 mod parallel_write;
 mod pipeline;
+mod progress;
 mod random;
 mod size;
 mod temp;
@@ -74,6 +75,8 @@ pub use env::MockCtrl;
 pub use generate::{
     DEFAULT_FILE_SIZE, GenerateError, GenerationReport, Generator, GeneratorBuilder,
 };
+#[doc(inline)]
+pub use progress::OperationProgress;
 #[doc(inline)]
 pub use size::{
     ParseSizeError, SampleError, SizeChooser, SizeSpec, SizeSpecError, parse_byte_size,

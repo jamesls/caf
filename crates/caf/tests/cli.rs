@@ -323,6 +323,15 @@ fn gen_default_is_100_files_of_4096_bytes() {
 }
 
 #[test]
+fn captured_generation_success_remains_silent() {
+    let dir = tempdir();
+    let output = generate(dir.path(), &["--max-files", "1"]);
+    assert_eq!(code(&output), 0);
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+}
+
+#[test]
 fn file_size_suffix_grammar() {
     for (spec, expected) in [
         ("8192", 8192),

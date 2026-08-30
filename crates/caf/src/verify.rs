@@ -8,10 +8,12 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use caf_store::{DEFAULT_ANALYSIS_CHUNK_SIZE, Verifier, default_jobs};
 
+use crate::progress::{Basis, ProgressBar};
 use crate::style::Style;
 use crate::util::{StoreRoot, commas};
 use crate::{EXIT_FAILURE, render};
@@ -85,10 +87,12 @@ fn parse_positive(value: &str) -> Result<NonZeroUsize> {
 pub fn run(args: &Args) -> ExitCode {
     let out = Style::for_stdout();
     let err = Style::for_stderr();
+    let progress = ProgressBar::new("Verify", Basis::Bytes);
 
-    let failed = match verify(args, out, err) {
+    let failed = match verify(args, out, err, &progress) {
         Ok(failed) => failed,
         Err(error) => {
+            progress.clear();
             // A store-level failure (not a store, unreadable file,
             // pathological nesting) fails verification; the not-a-store
             // message is the error's Display.
@@ -108,7 +112,7 @@ pub fn run(args: &Args) -> ExitCode {
 
 /// Verifies the store `args` names, rendering the report, and returns
 /// whether verification failed.
-fn verify(args: &Args, out: Style, err: Style) -> Result<bool> {
+fn verify(args: &Args, out: Style, err: Style, progress: &Arc<ProgressBar>) -> Result<bool> {
     let directory = StoreRoot::from(args.directory.as_deref()).resolve()?;
 
     println!(
@@ -123,10 +127,15 @@ fn verify(args: &Args, out: Style, err: Style) -> Result<bool> {
         ))
     );
 
-    let report = Verifier::new(&directory)
+    let mut verifier = Verifier::new(&directory)
         .analysis_chunk_size(args.chunk_size)
-        .jobs(args.jobs)
-        .verify()?;
+        .jobs(args.jobs);
+    if progress.enabled() {
+        let progress = Arc::clone(progress);
+        verifier = verifier.progress(move |snapshot| progress.update(snapshot));
+    }
+    let report = verifier.verify()?;
+    progress.finish(report.success());
     render::diagnostics(report.diagnostics(), err);
     render::error_analysis(&report, out);
     Ok(!report.success())

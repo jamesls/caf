@@ -40,6 +40,10 @@ caf gen --max-files 1 --file-size 4GB --jobs 8
 caf verify --jobs 8
 ```
 
+In an interactive terminal, both commands show live byte/file progress,
+throughput, and an estimated time remaining. Progress is rendered on standard
+error and is automatically disabled when output is redirected or captured.
+
 Run `caf gen --help` for size distributions and more examples. See the
 [file-format specification](docs/file-format.md) for the v2 and v3 header,
 content, identity, path, chain, and metadata rules.

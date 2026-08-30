@@ -455,6 +455,18 @@ impl SizeChooser {
         }
     }
 
+    /// Returns the one size this chooser always selects, when it is fixed.
+    pub(crate) fn fixed_size(&self) -> Option<u64> {
+        match &self.kind {
+            ChooserKind::Fixed(bytes) => Some(*bytes),
+            ChooserKind::Range { .. }
+            | ChooserKind::Normal { .. }
+            | ChooserKind::Gamma { .. }
+            | ChooserKind::LogNormal { .. }
+            | ChooserKind::Custom(_) => None,
+        }
+    }
+
     /// Returns the size in bytes for the next file.
     ///
     /// # Errors

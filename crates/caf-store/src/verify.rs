@@ -43,6 +43,7 @@ use caf_format::{
 use crate::analysis::{self, CorruptionReport, read_full};
 use crate::env::{DirEntry, Env, FileHandle};
 use crate::metadata::{ALL_FILE, METADATA_DIR, ROOTS_DIR};
+use crate::progress::{FileProgress, OperationProgress, ProgressCallback, ProgressTracker};
 use crate::{MAX_JOBS, default_jobs, parallel_verify, pipeline};
 
 /// Default corruption-analysis chunk size in bytes.
@@ -93,6 +94,7 @@ pub struct Verifier {
     root: PathBuf,
     analysis_chunk_size: NonZeroUsize,
     jobs: NonZeroUsize,
+    progress: Option<ProgressCallback>,
 }
 
 impl Verifier {
@@ -123,6 +125,7 @@ impl Verifier {
             root: root.into(),
             analysis_chunk_size: DEFAULT_ANALYSIS_CHUNK_SIZE,
             jobs: default_jobs(),
+            progress: None,
         }
     }
 
@@ -159,6 +162,19 @@ impl Verifier {
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.jobs = count.min(MAX_JOBS);
+        self
+    }
+
+    /// Reports byte and file progress while verification runs.
+    ///
+    /// The callback may run on any verification worker thread and should
+    /// return quickly. It receives an initial zero snapshot, block-level
+    /// updates while large files are read, and a snapshot after each
+    /// completed file. Omitting a callback does not add a preliminary file
+    /// size scan and has no effect on the report.
+    #[must_use]
+    pub fn progress(mut self, report: impl Fn(OperationProgress) + Send + Sync + 'static) -> Self {
+        self.progress = Some(ProgressCallback::new(report));
         self
     }
 
@@ -199,16 +215,30 @@ impl Verifier {
 
         let files = collect_data_files(&self.env, &self.root)?;
         let files_checked = files.len() as u64;
+        let total_bytes = self.progress.as_ref().map(|_callback| {
+            files.iter().fold(0_u64, |total, path| {
+                let size = self.env.metadata(path).map_or(0, crate::env::Metadata::len);
+                total.saturating_add(size)
+            })
+        });
+        let progress =
+            ProgressTracker::new(self.progress.clone(), total_bytes, Some(files_checked));
         let mut checks = StoreChecks::new(files.len());
         let analysis_memory = analysis::AnalysisMemory::new();
 
         if self.jobs == NonZeroUsize::MIN {
             let mut scratch = parallel_verify::ScanBuffers::new();
             for path in files {
-                checks.absorb(self.validate_file(path, 1, &mut scratch, &analysis_memory)?);
+                checks.absorb(self.validate_file(
+                    path,
+                    1,
+                    &mut scratch,
+                    &analysis_memory,
+                    &progress,
+                )?);
             }
         } else {
-            self.validate_files_parallel(&files, &mut checks, &analysis_memory)?;
+            self.validate_files_parallel(&files, &mut checks, &analysis_memory, &progress)?;
         }
 
         let mut diagnostics = checks.into_diagnostics(&marker_set, &self.root);
@@ -235,14 +265,15 @@ impl Verifier {
         files: &[PathBuf],
         checks: &mut StoreChecks,
         analysis_memory: &analysis::AnalysisMemory,
+        progress: &ProgressTracker,
     ) -> Result<(), VerifyError> {
         let jobs = self.jobs.get();
         let contended = parallel_verify::contended_prefix_len(files.len(), jobs);
 
         if contended > 0 {
-            self.validate_contended_files(&files[..contended], checks, analysis_memory)?;
+            self.validate_contended_files(&files[..contended], checks, analysis_memory, progress)?;
         }
-        self.validate_tail_files(&files[contended..], checks, analysis_memory)
+        self.validate_tail_files(&files[contended..], checks, analysis_memory, progress)
     }
 
     /// The existing file-level regime: fixed workers, no length planning,
@@ -252,6 +283,7 @@ impl Verifier {
         files: &[PathBuf],
         checks: &mut StoreChecks,
         analysis_memory: &analysis::AnalysisMemory,
+        progress: &ProgressTracker,
     ) -> Result<(), VerifyError> {
         pipeline::run(
             files.len(),
@@ -259,7 +291,13 @@ impl Verifier {
             || {
                 let mut scratch = parallel_verify::ScanBuffers::new();
                 move |index: usize| {
-                    self.validate_file(files[index].clone(), 1, &mut scratch, analysis_memory)
+                    self.validate_file(
+                        files[index].clone(),
+                        1,
+                        &mut scratch,
+                        analysis_memory,
+                        progress,
+                    )
                 }
             },
             |outcome| checks.absorb(outcome),
@@ -275,6 +313,7 @@ impl Verifier {
         files: &[PathBuf],
         checks: &mut StoreChecks,
         analysis_memory: &analysis::AnalysisMemory,
+        progress: &ProgressTracker,
     ) -> Result<(), VerifyError> {
         if files.is_empty() {
             return Ok(());
@@ -302,6 +341,7 @@ impl Verifier {
                     widths[index],
                     &mut scratch,
                     analysis_memory,
+                    progress,
                 )
             }));
             let message = match result {
@@ -358,16 +398,33 @@ impl Verifier {
     /// Validates one data file and returns everything it contributes to
     /// the report. Self-contained per file, so serial and parallel runs
     /// produce identical outcomes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear validation pipeline with shared early outcomes"
+    )]
     fn validate_file(
         &self,
         path: PathBuf,
         width: usize,
         scratch: &mut parallel_verify::ScanBuffers,
         analysis_memory: &analysis::AnalysisMemory,
+        progress: &ProgressTracker,
     ) -> Result<FileOutcome, VerifyError> {
         let mut diagnostics = Vec::new();
         let Ok(digest_from_path) = parse_hash_from_path(&path) else {
             diagnostics.push(Diagnostic::InvalidPathLayout { path: path.clone() });
+            // The preliminary scan counted this file's size in the byte
+            // total, so its bytes complete along with its file: a large
+            // stray file must not hold the reported bytes short of the
+            // total for the whole run.
+            if progress.enabled() {
+                let size = self
+                    .env
+                    .metadata(&path)
+                    .map_or(0, crate::env::Metadata::len);
+                progress.add_bytes(size);
+            }
+            progress.finish_file();
             return Ok(FileOutcome {
                 record: FileRecord {
                     path,
@@ -389,10 +446,12 @@ impl Verifier {
             .metadata()
             .map_err(|source| VerifyError::io("reading data-file metadata", &path, source))?
             .len();
+        let file_progress = FileProgress::new(progress, actual_size);
 
         let mut header_bytes = [0_u8; HEADER_SIZE];
         let header_len = read_full(&mut file, &mut header_bytes)
             .map_err(|source| VerifyError::io("reading a data-file header", &path, source))?;
+        file_progress.add_bytes(header_len as u64);
         let header = match Header::parse(&header_bytes[..header_len]) {
             Ok(header) => header,
             Err(source) => {
@@ -400,6 +459,7 @@ impl Verifier {
                     path: path.clone(),
                     source,
                 });
+                file_progress.finish();
                 return Ok(FileOutcome {
                     record: FileRecord {
                         path,
@@ -432,6 +492,7 @@ impl Verifier {
             actual_size,
             width,
             scratch,
+            &file_progress,
         )
         .map_err(|source| VerifyError::io("reading a data file", &path, source))?;
 
@@ -464,6 +525,7 @@ impl Verifier {
         } else {
             Some(header.parent())
         };
+        file_progress.finish();
         Ok(FileOutcome {
             record: FileRecord {
                 path,
@@ -512,24 +574,31 @@ fn hash_validated_file(
     actual_size: u64,
     width: usize,
     scratch: &mut parallel_verify::ScanBuffers,
+    progress: &FileProgress<'_>,
 ) -> io::Result<(Digest, bool)> {
     match header.format() {
         Format::V2 => {
             let digest = if width >= 2 {
-                parallel_verify::hash_file(file, header_bytes, actual_size, width)
+                parallel_verify::hash_file(file, header_bytes, actual_size, width, Some(progress))
             } else {
                 // A previous v3 file may have left the block buffer
                 // shorter; whole-file reads want the full block.
                 if scratch.block.len() < BLOCK_SIZE {
                     scratch.block.resize(BLOCK_SIZE, 0);
                 }
-                hash_whole_file(file, header_bytes, &mut scratch.block)
+                hash_whole_file(file, header_bytes, &mut scratch.block, Some(progress))
             }?;
             Ok((digest, true))
         }
         Format::V3 => {
-            let result =
-                parallel_verify::hash_v3_file(file, header, actual_size, width.max(1), scratch)?;
+            let result = parallel_verify::hash_v3_file(
+                file,
+                header,
+                actual_size,
+                width.max(1),
+                scratch,
+                Some(progress),
+            )?;
             Ok((result.digest, result.content_matches))
         }
     }
@@ -713,6 +782,7 @@ fn hash_whole_file(
     mut file: impl Read,
     header_bytes: &[u8],
     buffer: &mut [u8],
+    progress: Option<&FileProgress<'_>>,
 ) -> io::Result<Digest> {
     let mut hasher = Hasher::new();
     hasher.update(header_bytes);
@@ -724,6 +794,9 @@ fn hash_whole_file(
             Err(err) => return Err(err),
         };
         hasher.update(&buffer[..n]);
+        if let Some(progress) = progress {
+            progress.add_bytes(n as u64);
+        }
     }
     Ok(hasher.finalize())
 }

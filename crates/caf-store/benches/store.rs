@@ -240,18 +240,34 @@ fn corrupted_store(offset: u64) -> tempfile::TempDir {
 fn size_selection(c: &mut Criterion) {
     c.bench_function("size/parse-spec", |b| {
         b.iter(|| {
-            black_box("Type=lognormal,Mean=16,StdDev=1")
+            black_box("Type=lognormal,Median=1MB,Sigma=1,Max=1GB")
                 .parse::<SizeSpec>()
                 .expect("the spec parses")
         });
     });
 
     c.bench_function("size/sample-lognormal", |b| {
-        let mut sizes = SizeSpec::lognormal(16.0, 1.0)
+        let mut sizes = SizeSpec::lognormal(1 << 20, 1.0, 60..=(1 << 30))
             .expect("parameters are valid")
             .chooser()
             .expect("the random source works");
-        b.iter(|| sizes.next_size().expect("samples are finite"));
+        b.iter(|| {
+            sizes
+                .next_size()
+                .expect("the band holds nearly all of the mass")
+        });
+    });
+
+    c.bench_function("size/sample-pareto", |b| {
+        let mut sizes = SizeSpec::pareto(1.2, 4096..=(1 << 30))
+            .expect("parameters are valid")
+            .chooser()
+            .expect("the random source works");
+        b.iter(|| {
+            sizes
+                .next_size()
+                .expect("the band holds nearly all of the mass")
+        });
     });
 
     c.bench_function("size/sample-range", |b| {

@@ -4,8 +4,9 @@
 //! file has a zero parent, every later file names the preceding file's
 //! identity, and the last file's hex identity becomes the run's chain-tip
 //! marker. Both stopping
-//! conditions are checked before each file, sizes below
-//! the 60-byte header are silently clamped up, content is written
+//! conditions are checked before each file, fixed and range sizes below
+//! the 60-byte header are silently clamped up (sampled sizes arrive
+//! inside their band), content is written
 //! through a temporary file in the store root and renamed into its
 //! hash-derived location, and the run ends by writing the chain-tip
 //! marker and atomically replacing `.metadata/all`.
@@ -54,7 +55,7 @@ const DEFAULT_WRITE_THREADS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// Every file is at least its own 60-byte header; smaller requested
 /// sizes are silently clamped up.
-const MIN_FILE_SIZE: u64 = HEADER_SIZE as u64;
+pub(crate) const MIN_FILE_SIZE: u64 = HEADER_SIZE as u64;
 
 /// Generates one chain of content-addressable files in a store.
 ///
@@ -130,10 +131,10 @@ impl Generator {
     /// # Errors
     ///
     /// Returns a [`GenerateError`] if a filesystem operation fails, the
-    /// operating-system random source fails, or the size chooser reports
-    /// a non-finite sample. Data files already renamed into place stay
-    /// in the store, but a failed run writes no chain-tip marker, which
-    /// verification reports.
+    /// operating-system random source fails, or the size chooser finds
+    /// no size inside its band. Data files already renamed into place
+    /// stay in the store, but a failed run writes no chain-tip marker,
+    /// which verification reports.
     pub fn generate(mut self) -> Result<GenerationReport, GenerateError> {
         self.env
             .create_dir_all(&self.root)

@@ -1,45 +1,64 @@
 //! File-size grammar and selection for generation.
 //!
 //! The `--file-size` and `--max-disk-usage` grammar accepts plain byte
-//! counts, two-character `kb`/`mb`/`gb`/`tb` suffixes (case-insensitive),
-//! inclusive `START-END` ranges, and the `Type=…` distribution shorthand.
-//! [`SizeSpec`] is the parsed grammar; [`SizeChooser`] draws one size per
-//! file from it.
+//! counts, two-character `kb`/`mb`/`gb`/`tb` suffixes (case-insensitive)
+//! on an integer or decimal mantissa, inclusive `START-END` ranges, and
+//! the `Type=…` distribution shorthand. [`SizeSpec`] is the parsed
+//! grammar; [`SizeChooser`] draws one size per file from it.
 //!
-//! Random streams are not compatible across implementations. The grammar,
-//! parameter meaning, bounds, and statistical behavior are stable;
-//! lognormal parameters stay in log space. Unknown or
-//! missing distribution parameters are rejected at parse time rather than
-//! causing generation to fail later.
+//! Every distribution is sampled inside a closed band. Its lower edge is
+//! at least the 60-byte header and its upper edge is required, so no
+//! sampled file is ever smaller or larger than the band. A draw outside
+//! the band is discarded and redrawn, which leaves the named distribution
+//! conditioned on the band rather than piling rejected draws onto its
+//! edges. Random streams are not compatible across implementations. The
+//! grammar, parameter meaning, bounds, and statistical behavior are
+//! stable. Unknown or missing distribution parameters are rejected at
+//! parse time rather than causing generation to fail later.
 
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io;
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, RangeBounds, RangeInclusive};
 use std::str::FromStr;
 
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng};
-use rand_distr::{Distribution as _, Gamma, LogNormal, Normal};
+use rand_distr::{Distribution as _, Pareto, StandardNormal};
 
+use crate::generate::MIN_FILE_SIZE;
 use crate::random;
 
 /// Multipliers for the two-character size suffixes. The grammar
 /// matches them case-insensitively against the last two characters of a
-/// token; single-letter suffixes (`1k`, `100b`) are errors.
+/// token; single-letter suffixes (`1k`, `100b`) are errors. The spelling
+/// here is the one error messages print.
 const SUFFIXES: [(&str, u64); 4] = [
-    ("kb", 1 << 10),
-    ("mb", 1 << 20),
-    ("gb", 1 << 30),
-    ("tb", 1 << 40),
+    ("KB", 1 << 10),
+    ("MB", 1 << 20),
+    ("GB", 1 << 30),
+    ("TB", 1 << 40),
 ];
+
+/// Two to the sixty-fourth: the first value a decimal mantissa times its
+/// suffix may not reach, since it is one past `u64::MAX`.
+const U64_RANGE: f64 = 18_446_744_073_709_551_616.0;
+
+/// Require a conservative mass bound of half a percent before sampling.
+/// This limits expected rejection work to at most 200 draws per file.
+const MIN_SAMPLE_MASS: f64 = 0.005;
 
 /// Parses a byte count with an optional `kb`/`mb`/`gb`/`tb` suffix.
 ///
-/// This is the grammar `--max-disk-usage`, range endpoints, and
-/// distribution parameter values share: `4096`, `2kb`, `1MB`, `1tb`.
-/// Suffixes are case-insensitive.
+/// This is the grammar `--max-disk-usage`, range endpoints, and byte-valued
+/// distribution parameters share: `4096`, `2kb`, `1MB`, `1tb`, `1.5GB`.
+/// Suffixes are case-insensitive. A mantissa without a `.` is an exact
+/// unsigned integer. A mantissa with a `.` is ASCII digits around one
+/// point, needs a suffix, is multiplied by it, and truncates toward zero
+/// to whole bytes, so `0.1TB` is 109,951,162,777 bytes. Signs and
+/// exponent notation (`1.0e-3MB`) are rejected, so a `-` in a
+/// `--file-size` token is always the range separator.
 ///
 /// # Examples
 ///
@@ -49,25 +68,31 @@ const SUFFIXES: [(&str, u64); 4] = [
 /// assert_eq!(parse_byte_size("4096")?, 4096);
 /// assert_eq!(parse_byte_size("2Kb")?, 2048);
 /// assert_eq!(parse_byte_size("1tb")?, 1 << 40);
+/// assert_eq!(parse_byte_size("1.5MB")?, 1_572_864);
 /// # Ok::<(), caf_store::ParseSizeError>(())
 /// ```
 ///
 /// # Errors
 ///
 /// Returns a [`ParseSizeError`] if the token is not an unsigned integer
-/// with an optional known suffix, or if the suffixed value overflows the
+/// or a decimal with an optional known suffix, if a decimal has no
+/// suffix, a sign, or an exponent, or if the suffixed value reaches the
 /// 64-bit byte range.
 pub fn parse_byte_size(value: impl AsRef<str>) -> Result<u64, ParseSizeError> {
     let value = value.as_ref();
     match split_suffix(value) {
-        Some((prefix, multiplier)) => {
-            let count = parse_integer(prefix, value)?;
-            count.checked_mul(multiplier).ok_or_else(|| {
-                ParseSizeError::new(ParseSizeErrorKind::Overflow {
-                    input: value.to_owned(),
-                })
-            })
+        Some((mantissa, multiplier)) if mantissa.contains('.') => {
+            parse_decimal(mantissa, multiplier, value)
         }
+        Some((mantissa, multiplier)) => {
+            let count = parse_integer(mantissa, value)?;
+            count.checked_mul(multiplier).ok_or_else(|| overflow(value))
+        }
+        None if value.contains('.') => Err(ParseSizeError::new(
+            ParseSizeErrorKind::DecimalWithoutSuffix {
+                input: value.to_owned(),
+            },
+        )),
         None => parse_integer(value, value),
     }
 }
@@ -77,10 +102,9 @@ pub fn parse_byte_size(value: impl AsRef<str>) -> Result<u64, ParseSizeError> {
 fn split_suffix(value: &str) -> Option<(&str, u64)> {
     let split = value.len().checked_sub(2)?;
     let (prefix, suffix) = value.split_at_checked(split)?;
-    let suffix = suffix.to_ascii_lowercase();
     SUFFIXES
         .iter()
-        .find(|(known, _)| *known == suffix)
+        .find(|(known, _)| known.eq_ignore_ascii_case(suffix))
         .map(|(_, multiplier)| (prefix, *multiplier))
 }
 
@@ -95,12 +119,94 @@ fn parse_integer(token: &str, input: &str) -> Result<u64, ParseSizeError> {
     })
 }
 
+/// Parses a decimal `mantissa` and scales it by `multiplier`, reporting
+/// `input` (the full original token) on failure.
+///
+/// The mantissa is checked against the plain-decimal grammar before it
+/// is handed to the float parser, which would otherwise accept signs,
+/// exponents, and spellings such as `inf`.
+fn parse_decimal(mantissa: &str, multiplier: u64, input: &str) -> Result<u64, ParseSizeError> {
+    let invalid = || {
+        ParseSizeError::new(ParseSizeErrorKind::InvalidDecimal {
+            input: input.to_owned(),
+        })
+    };
+    if !is_plain_decimal(mantissa) {
+        return Err(invalid());
+    }
+    let mantissa: f64 = mantissa.parse().map_err(|_source| invalid())?;
+    // Only a mantissa with hundreds of digits rounds to infinity, and
+    // that is a value too large to hold, not a malformed one.
+    if !mantissa.is_finite() {
+        return Err(overflow(input));
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "suffix multipliers are powers of two far below 2^53"
+    )]
+    let bytes = mantissa * multiplier as f64;
+    if bytes >= U64_RANGE {
+        return Err(overflow(input));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the product is non-negative and below 2^64, so the cast truncates toward zero"
+    )]
+    Ok(bytes as u64)
+}
+
+/// Reports whether `mantissa` is ASCII digits around exactly one `.`,
+/// with at least one digit: `1.5`, `.5`, and `2.` qualify, while `+1.5`,
+/// `1.0e-3`, `1.2.3`, and `.` do not.
+fn is_plain_decimal(mantissa: &str) -> bool {
+    let mut points = 0;
+    let mut digits = 0;
+    for byte in mantissa.bytes() {
+        match byte {
+            b'0'..=b'9' => digits += 1,
+            b'.' => points += 1,
+            _ => return false,
+        }
+    }
+    points == 1 && digits > 0
+}
+
+fn overflow(input: &str) -> ParseSizeError {
+    ParseSizeError::new(ParseSizeErrorKind::Overflow {
+        input: input.to_owned(),
+    })
+}
+
+/// Parses the dimensionless `Sigma` and `Alpha` values: a finite number
+/// with no size suffix.
+fn parse_number(name: &'static str, value: &str) -> Result<f64, ParseSizeError> {
+    if split_suffix(value).is_some() {
+        return Err(ParseSizeError::new(ParseSizeErrorKind::NotAByteSize {
+            name,
+        }));
+    }
+    let invalid = || {
+        ParseSizeError::new(ParseSizeErrorKind::InvalidNumber {
+            name,
+            input: value.to_owned(),
+        })
+    };
+    let number: f64 = value.parse().map_err(|_source| invalid())?;
+    if !number.is_finite() {
+        return Err(invalid());
+    }
+    Ok(number)
+}
+
 /// A parsed `--file-size` specification.
 ///
 /// Parse one from the CLI grammar with [`FromStr`], or build one
 /// directly with the constructors. Every constructor validates its
 /// arguments, so a `SizeSpec` always describes a samplable distribution;
-/// [`SizeSpec::chooser`] then draws the sampler's random seed.
+/// [`SizeSpec::chooser`] then draws the sampler's random seed. The
+/// [`Display`] form is the canonical shorthand, which parses back to an
+/// equal spec.
 ///
 /// # Examples
 ///
@@ -110,8 +216,8 @@ fn parse_integer(token: &str, input: &str) -> Result<u64, ParseSizeError> {
 /// assert_eq!("4096".parse::<SizeSpec>()?, SizeSpec::fixed(4096));
 /// assert_eq!("1kb-2kb".parse::<SizeSpec>()?, SizeSpec::range(1024..=2048)?);
 /// assert_eq!(
-///     "Type=normal,Mean=1kb,StdDev=0".parse::<SizeSpec>()?,
-///     SizeSpec::normal(1024.0, 0.0)?,
+///     "Type=lognormal,Median=1kb,Sigma=0.5,Max=1mb".parse::<SizeSpec>()?,
+///     SizeSpec::lognormal(1024, 0.5, 60..=(1 << 20))?,
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -120,9 +226,9 @@ pub struct SizeSpec {
     kind: SpecKind,
 }
 
-/// The validated forms. Distributions are stored as their samplers:
-/// building one is how the parameters are checked, and the check happens
-/// once, in the constructor.
+/// The validated forms. Distributions keep the parameters the canonical
+/// form prints; the check happens once, in the constructor, so a spec
+/// always describes a samplable distribution.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SpecKind {
     Fixed(u64),
@@ -131,9 +237,54 @@ enum SpecKind {
         start: u64,
         end: u64,
     },
-    Normal(Normal<f64>),
-    Gamma(Gamma<f64>),
-    LogNormal(LogNormal<f64>),
+    /// Invariant: `median >= 1` and `sigma` is finite and non-negative.
+    LogNormal {
+        median: u64,
+        sigma: f64,
+        band: Band,
+    },
+    /// Invariant: `alpha` is finite and positive; the sampler's scale is
+    /// the band's lower edge.
+    Pareto {
+        alpha: f64,
+        band: Band,
+        dist: Pareto<f64>,
+    },
+}
+
+/// The closed `[min, max]` band a distribution is sampled inside.
+///
+/// Invariant: `MIN_FILE_SIZE <= min < max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Band {
+    min: u64,
+    max: u64,
+}
+
+impl Band {
+    fn new(range: RangeInclusive<u64>) -> Result<Self, SizeSpecError> {
+        let (min, max) = range.into_inner();
+        if min < MIN_FILE_SIZE {
+            return Err(SizeSpecError::new(SizeSpecErrorKind::BandTooLow));
+        }
+        if min >= max {
+            return Err(SizeSpecError::new(SizeSpecErrorKind::EmptyBand {
+                min,
+                max,
+            }));
+        }
+        Ok(Self { min, max })
+    }
+
+    /// Whether a truncated sample lies inside the band. The comparison
+    /// is exact for every size below 2^53 bytes (8 PiB).
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sizes this tool generates are far below 2^53"
+    )]
+    fn contains(self, bytes: f64) -> bool {
+        bytes >= self.min as f64 && bytes <= self.max as f64
+    }
 }
 
 impl SizeSpec {
@@ -185,51 +336,103 @@ impl SizeSpec {
         })
     }
 
-    /// Gaussian sizes in bytes with the given mean and standard deviation.
+    /// Lognormal sizes with the given `median` in bytes and `sigma`, the
+    /// standard deviation of the natural log of the size, sampled inside
+    /// `band`.
+    ///
+    /// `sigma` is dimensionless: `1.0` puts 68% of files within a factor
+    /// of e (2.72) of the median and 95% within a factor of e² (7.4);
+    /// `0.0` makes every sample the median. The median may lie outside
+    /// the band, which then selects one tail of the distribution. A band
+    /// with less than 0.5% conservatively bounded probability mass is not
+    /// a construction error; its first draw fails with a [`SampleError`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::SizeSpec;
+    ///
+    /// let spec = SizeSpec::lognormal(1 << 20, 1.0, 60..=(1 << 30))?;
+    /// assert_eq!(spec, "Type=lognormal,Median=1MB,Sigma=1,Max=1GB".parse()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns a [`SizeSpecError`] if the parameters are outside the
-    /// sampler's domain (a negative or non-finite standard deviation).
-    pub fn normal(mean: f64, std_dev: f64) -> Result<Self, SizeSpecError> {
-        let dist = Normal::new(mean, std_dev).map_err(|err| invalid_distribution("normal", err))?;
+    /// Returns a [`SizeSpecError`] if `median` is zero, `sigma` is
+    /// negative or not finite, the band starts below the 60-byte header,
+    /// or the band does not hold at least two sizes.
+    pub fn lognormal(
+        median: u64,
+        sigma: f64,
+        band: RangeInclusive<u64>,
+    ) -> Result<Self, SizeSpecError> {
+        if median == 0 {
+            return Err(SizeSpecError::invalid_parameter("Median", "at least 1"));
+        }
+        if !(sigma.is_finite() && sigma >= 0.0) {
+            return Err(SizeSpecError::invalid_parameter("Sigma", "at least zero"));
+        }
+        let band = Band::new(band)?;
         Ok(Self {
-            kind: SpecKind::Normal(dist),
+            kind: SpecKind::LogNormal {
+                median,
+                sigma,
+                band,
+            },
         })
     }
 
-    /// Gamma-distributed sizes: shape `alpha`, scale `beta` bytes
-    /// (mean = `alpha` × `beta`).
+    /// Pareto sizes with shape `alpha`, sampled inside `band`, whose start
+    /// is also the scale parameter: the smallest possible size.
+    ///
+    /// Smaller `alpha` means a heavier tail. Before truncation the
+    /// fraction of files larger than `x` is `(min / x) ^ alpha`, so with
+    /// `alpha = 1.2` and a 4 KiB start half the files are under 7.1 KiB
+    /// while about one in 800 exceeds 1 MiB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::SizeSpec;
+    ///
+    /// let spec = SizeSpec::pareto(1.2, 4096..=(1 << 30))?;
+    /// assert_eq!(spec, "Type=pareto,Min=4KB,Max=1GB,Alpha=1.2".parse()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns a [`SizeSpecError`] if the parameters are outside the
-    /// sampler's domain (a non-positive shape or scale).
-    pub fn gamma(alpha: f64, beta: f64) -> Result<Self, SizeSpecError> {
-        let dist = Gamma::new(alpha, beta).map_err(|err| invalid_distribution("gamma", err))?;
+    /// Returns a [`SizeSpecError`] if `alpha` is not a finite number
+    /// greater than zero, the band starts below the 60-byte header, or
+    /// the band does not hold at least two sizes.
+    pub fn pareto(alpha: f64, band: RangeInclusive<u64>) -> Result<Self, SizeSpecError> {
+        if !(alpha.is_finite() && alpha > 0.0) {
+            return Err(SizeSpecError::invalid_parameter(
+                "Alpha",
+                "greater than zero",
+            ));
+        }
+        let band = Band::new(band)?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the scale is a byte count; the sampler works in floating point"
+        )]
+        let scale = band.min as f64;
+        #[expect(
+            clippy::missing_panics_doc,
+            reason = "the scale is at least 60 and alpha is finite and positive, which is all the sampler checks"
+        )]
+        let dist = Pareto::new(scale, alpha).expect("a positive scale and a positive finite shape");
         Ok(Self {
-            kind: SpecKind::Gamma(dist),
-        })
-    }
-
-    /// Lognormal sizes; `mean` and `std_dev` parameterize the underlying
-    /// normal distribution (log space), not byte sizes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`SizeSpecError`] if the parameters are outside the
-    /// sampler's domain (a negative or non-finite standard deviation).
-    pub fn lognormal(mean: f64, std_dev: f64) -> Result<Self, SizeSpecError> {
-        let dist =
-            LogNormal::new(mean, std_dev).map_err(|err| invalid_distribution("lognormal", err))?;
-        Ok(Self {
-            kind: SpecKind::LogNormal(dist),
+            kind: SpecKind::Pareto { alpha, band, dist },
         })
     }
 
     /// Parses the `--file-size` grammar, trying shapes in this order:
     /// plain integer, distribution shorthand (contains
-    /// `,`), inclusive range (contains `-`), then suffixed fixed size.
+    /// `,`), inclusive range (contains `-`), then suffixed or decimal
+    /// fixed size.
     ///
     /// This is what [`FromStr`] parses, so `input.parse()` is equivalent.
     ///
@@ -254,12 +457,43 @@ impl SizeSpec {
             return Self::range(parse_byte_size(start)?..=parse_byte_size(end)?)
                 .map_err(ParseSizeError::invalid_spec);
         }
-        if split_suffix(input).is_some() {
+        // A bare decimal such as `1.5` is routed to the byte grammar so
+        // the error says a suffix is needed, not that the shape is unknown.
+        if split_suffix(input).is_some() || input.parse::<f64>().is_ok() {
             return Ok(Self::fixed(parse_byte_size(input)?));
         }
         Err(ParseSizeError::new(ParseSizeErrorKind::UnknownSpec {
             input: input.to_owned(),
         }))
+    }
+
+    /// Check mass deterministically, before the chooser can return any size.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "distribution sampling uses floating-point byte counts"
+    )]
+    fn supports_sampling(&self) -> bool {
+        let mass = match self.kind {
+            SpecKind::Fixed(_) | SpecKind::Range { .. } => return true,
+            SpecKind::LogNormal {
+                median,
+                sigma,
+                band,
+            } => {
+                if sigma == 0.0 {
+                    return band.contains(median as f64);
+                }
+                // Include the fractional bytes that truncate to the upper edge.
+                let lower = (band.min as f64 / median as f64).ln() / sigma;
+                let upper = ((band.max as f64 + 1.0) / median as f64).ln() / sigma;
+                normal_mass_lower_bound(lower, upper)
+            }
+            SpecKind::Pareto { alpha, band, .. } => {
+                // -expm1 avoids cancellation for small alpha or narrow bands.
+                -(alpha * (band.min as f64 / (band.max as f64 + 1.0)).ln()).exp_m1()
+            }
+        };
+        mass >= MIN_SAMPLE_MASS
     }
 
     /// Returns a sampler for this spec.
@@ -287,16 +521,22 @@ impl SizeSpec {
                 end,
                 rng: os_seeded_rng()?,
             },
-            SpecKind::Normal(dist) => ChooserKind::Normal {
-                dist,
+            SpecKind::LogNormal {
+                median,
+                sigma,
+                band,
+            } => ChooserKind::Sampled {
+                spec: self.clone(),
+                sampler: Sampler::lognormal(median, sigma),
+                supported: self.supports_sampling(),
+                band,
                 rng: os_seeded_rng()?,
             },
-            SpecKind::Gamma(dist) => ChooserKind::Gamma {
-                dist,
-                rng: os_seeded_rng()?,
-            },
-            SpecKind::LogNormal(dist) => ChooserKind::LogNormal {
-                dist,
+            SpecKind::Pareto { band, dist, .. } => ChooserKind::Sampled {
+                spec: self.clone(),
+                sampler: Sampler::Pareto(dist),
+                supported: self.supports_sampling(),
+                band,
                 rng: os_seeded_rng()?,
             },
         };
@@ -311,6 +551,39 @@ impl FromStr for SizeSpec {
         Self::parse(input)
     }
 }
+
+/// The canonical shorthand: byte values as integers, defaults filled
+/// in, and `Sigma` and `Alpha` in Rust's default `f64` formatting, so
+/// `2` prints as `2` and `1.5` as `1.5`. Parsing the output gives back
+/// an equal spec.
+impl Display for SizeSpec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            SpecKind::Fixed(bytes) => write!(f, "{bytes}"),
+            SpecKind::Range { start, end } => write!(f, "{start}-{end}"),
+            SpecKind::LogNormal {
+                median,
+                sigma,
+                band,
+                ..
+            } => write!(
+                f,
+                "Type=lognormal,Median={median},Sigma={sigma},Min={},Max={}",
+                band.min, band.max
+            ),
+            SpecKind::Pareto { alpha, band, .. } => write!(
+                f,
+                "Type=pareto,Min={},Max={},Alpha={alpha}",
+                band.min, band.max
+            ),
+        }
+    }
+}
+
+/// Keys each distribution accepts, in the order the canonical form
+/// prints them.
+const LOGNORMAL_KEYS: [&str; 4] = ["Median", "Sigma", "Min", "Max"];
+const PARETO_KEYS: [&str; 3] = ["Min", "Max", "Alpha"];
 
 /// Parses the `Type=<type>,Key=Value,…` distribution shorthand.
 fn parse_shorthand(input: &str) -> Result<SizeSpec, ParseSizeError> {
@@ -335,17 +608,30 @@ fn parse_shorthand(input: &str) -> Result<SizeSpec, ParseSizeError> {
         return Err(ParseSizeError::new(ParseSizeErrorKind::MissingType));
     };
     let spec = match type_name {
-        "normal" => {
-            let (mean, std_dev) = two_params("normal", &params, "Mean", "StdDev")?;
-            SizeSpec::normal(mean, std_dev)
+        "lognormal" => {
+            let params = Params::new("lognormal", &LOGNORMAL_KEYS, &params)?;
+            let median = params.bytes("Median")?;
+            let sigma = params.number("Sigma")?;
+            let max = params.bytes("Max")?;
+            let min = params.optional_bytes("Min")?.unwrap_or(MIN_FILE_SIZE);
+            SizeSpec::lognormal(median, sigma, min..=max)
+        }
+        "pareto" => {
+            let params = Params::new("pareto", &PARETO_KEYS, &params)?;
+            let min = params.optional_bytes("Min")?.unwrap_or(MIN_FILE_SIZE);
+            let max = params.bytes("Max")?;
+            let alpha = params.number("Alpha")?;
+            SizeSpec::pareto(alpha, min..=max)
         }
         "gamma" => {
-            let (alpha, beta) = two_params("gamma", &params, "Alpha", "Beta")?;
-            SizeSpec::gamma(alpha, beta)
+            return Err(ParseSizeError::new(ParseSizeErrorKind::RemovedType {
+                name: "gamma",
+            }));
         }
-        "lognormal" => {
-            let (mean, std_dev) = two_params("lognormal", &params, "Mean", "StdDev")?;
-            SizeSpec::lognormal(mean, std_dev)
+        "normal" => {
+            return Err(ParseSizeError::new(ParseSizeErrorKind::RemovedType {
+                name: "normal",
+            }));
         }
         other => {
             return Err(ParseSizeError::new(ParseSizeErrorKind::UnknownType {
@@ -356,56 +642,81 @@ fn parse_shorthand(input: &str) -> Result<SizeSpec, ParseSizeError> {
     spec.map_err(ParseSizeError::invalid_spec)
 }
 
-/// Extracts exactly the two named parameters. Unknown and missing names
-/// are errors; duplicates keep the last value.
-fn two_params(
+/// The `Key=Value` items of one shorthand, checked against the keys its
+/// distribution accepts. A repeated key keeps its last value.
+struct Params<'a> {
     type_name: &'static str,
-    params: &[(&str, &str)],
-    first: &'static str,
-    second: &'static str,
-) -> Result<(f64, f64), ParseSizeError> {
-    for &(name, _) in params {
-        if name != first && name != second {
+    items: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> Params<'a> {
+    /// Rejects the first key `accepted` does not list.
+    fn new(
+        type_name: &'static str,
+        accepted: &'static [&'static str],
+        items: &'a [(&'a str, &'a str)],
+    ) -> Result<Self, ParseSizeError> {
+        if let Some(&(name, _)) = items.iter().find(|(name, _)| !accepted.contains(name)) {
             return Err(ParseSizeError::new(ParseSizeErrorKind::UnknownParameter {
                 type_name,
                 name: name.to_owned(),
+                accepted,
             }));
         }
+        Ok(Self { type_name, items })
     }
-    let lookup = |wanted: &'static str| {
-        let &(_, value) = params
+
+    fn value(&self, name: &str) -> Option<&'a str> {
+        self.items
             .iter()
             .rev()
-            .find(|(name, _)| *name == wanted)
-            .ok_or_else(|| {
-                ParseSizeError::new(ParseSizeErrorKind::MissingParameter {
-                    type_name,
-                    name: wanted,
-                })
-            })?;
-        // Parameter values are integers in the grammar and become
-        // floating-point values inside the samplers, with precision loss
-        // above 2^53.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "matches Python's int-to-float conversion in the samplers"
-        )]
-        Ok(parse_byte_size(value)? as f64)
-    };
-    Ok((lookup(first)?, lookup(second)?))
+            .find(|(key, _)| *key == name)
+            .map(|&(_, value)| value)
+    }
+
+    fn required(&self, name: &'static str) -> Result<&'a str, ParseSizeError> {
+        self.value(name).ok_or_else(|| {
+            ParseSizeError::new(ParseSizeErrorKind::MissingParameter {
+                type_name: self.type_name,
+                name,
+            })
+        })
+    }
+
+    /// A required byte-valued key.
+    fn bytes(&self, name: &'static str) -> Result<u64, ParseSizeError> {
+        parse_byte_size(self.required(name)?)
+    }
+
+    /// An optional byte-valued key.
+    fn optional_bytes(&self, name: &'static str) -> Result<Option<u64>, ParseSizeError> {
+        self.value(name).map(parse_byte_size).transpose()
+    }
+
+    /// A required dimensionless key.
+    fn number(&self, name: &'static str) -> Result<f64, ParseSizeError> {
+        parse_number(name, self.required(name)?)
+    }
 }
 
-/// Builds a [`SizeSpecError`] for parameters a sampler rejects, keeping
-/// the sampler's own error as the cause. `rand_distr` is pre-1.0, so the
-/// error type stays erased instead of becoming part of this API.
-fn invalid_distribution(
-    type_name: &'static str,
-    source: impl Error + Send + Sync + 'static,
-) -> SizeSpecError {
-    SizeSpecError::new(SizeSpecErrorKind::InvalidDistribution {
-        type_name,
-        source: Box::new(source),
-    })
+/// Bound normal mass from below using rectangles under its density.
+/// Ignore tails beyond four standard deviations and partition the rest
+/// into 64 intervals. The density minimum is at the endpoint furthest
+/// from zero; summing those rectangles cannot overestimate the mass.
+/// This deliberately rejects borderline bands rather than relying on
+/// random trial draws to decide whether a band is supported.
+fn normal_mass_lower_bound(lower: f64, upper: f64) -> f64 {
+    let mut mass = 0.0;
+    for index in 0..64 {
+        let left = lower.max(-4.0 + f64::from(index) / 8.0);
+        let right = upper.min(-4.0 + f64::from(index + 1) / 8.0);
+        if left < right {
+            let furthest = left.abs().max(right.abs());
+            let density = (-0.5 * furthest * furthest).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            mass += (right - left) * density;
+        }
+    }
+    mass
 }
 
 /// Seeds the sampling RNG from the operating-system random source.
@@ -418,20 +729,68 @@ fn os_seeded_rng() -> io::Result<StdRng> {
 /// Draws one file size per call from a [`SizeSpec`] (or a custom
 /// closure via [`SizeChooser::from_fn`]).
 ///
-/// Distribution samples are truncated toward zero, then made non-negative.
-/// The generator later clamps every size below 60 bytes up to the header
-/// size, so choosers may return any value.
+/// Fixed and range sizes are returned as they are; the generator clamps
+/// any value below the 60-byte header up to it. Distribution samples are
+/// truncated toward zero and redrawn until one lands inside the spec's
+/// band, so they arrive already clamped. Custom choosers may return any
+/// value; no band applies to them.
 pub struct SizeChooser {
     kind: ChooserKind,
 }
 
 enum ChooserKind {
     Fixed(u64),
-    Range { start: u64, end: u64, rng: StdRng },
-    Normal { dist: Normal<f64>, rng: StdRng },
-    Gamma { dist: Gamma<f64>, rng: StdRng },
-    LogNormal { dist: LogNormal<f64>, rng: StdRng },
+    Range {
+        start: u64,
+        end: u64,
+        rng: StdRng,
+    },
+    Sampled {
+        /// The spec the sampler came from, for the unsupported-band error.
+        spec: SizeSpec,
+        sampler: Sampler,
+        supported: bool,
+        band: Band,
+        rng: StdRng,
+    },
     Custom(Box<dyn FnMut() -> u64 + Send>),
+}
+
+/// The distribution behind a sampled chooser.
+#[derive(Clone, Copy, Debug)]
+enum Sampler {
+    /// `median × e^(sigma × z)` for a standard normal `z`. This is the
+    /// lognormal with log-space mean `ln(median)`, computed without the
+    /// round trip through the logarithm, so `sigma = 0` gives the median
+    /// exactly instead of one bit below it.
+    LogNormal {
+        median: f64,
+        sigma: f64,
+    },
+    Pareto(Pareto<f64>),
+}
+
+impl Sampler {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the median is a byte count; the sampler works in floating point"
+    )]
+    fn lognormal(median: u64, sigma: f64) -> Self {
+        Self::LogNormal {
+            median: median as f64,
+            sigma,
+        }
+    }
+
+    fn sample(self, rng: &mut StdRng) -> f64 {
+        match self {
+            Self::LogNormal { median, sigma } => {
+                let z: f64 = StandardNormal.sample(rng);
+                median * (sigma * z).exp()
+            }
+            Self::Pareto(dist) => dist.sample(rng),
+        }
+    }
 }
 
 impl SizeChooser {
@@ -459,11 +818,9 @@ impl SizeChooser {
     pub(crate) fn fixed_size(&self) -> Option<u64> {
         match &self.kind {
             ChooserKind::Fixed(bytes) => Some(*bytes),
-            ChooserKind::Range { .. }
-            | ChooserKind::Normal { .. }
-            | ChooserKind::Gamma { .. }
-            | ChooserKind::LogNormal { .. }
-            | ChooserKind::Custom(_) => None,
+            ChooserKind::Range { .. } | ChooserKind::Sampled { .. } | ChooserKind::Custom(_) => {
+                None
+            }
         }
     }
 
@@ -471,14 +828,24 @@ impl SizeChooser {
     ///
     /// # Errors
     ///
-    /// Returns a [`SampleError`] if a distribution sample is not finite.
+    /// Returns a [`SampleError`] on the first and every subsequent call
+    /// if the band lacks a conservative probability mass of at least 0.5%.
     pub fn next_size(&mut self) -> Result<u64, SampleError> {
         match &mut self.kind {
             ChooserKind::Fixed(bytes) => Ok(*bytes),
             ChooserKind::Range { start, end, rng } => Ok(rng.random_range(*start..=*end)),
-            ChooserKind::Normal { dist, rng } => truncated_magnitude(dist.sample(rng)),
-            ChooserKind::Gamma { dist, rng } => truncated_magnitude(dist.sample(rng)),
-            ChooserKind::LogNormal { dist, rng } => truncated_magnitude(dist.sample(rng)),
+            ChooserKind::Sampled {
+                spec,
+                sampler,
+                supported,
+                band,
+                rng,
+            } => {
+                if !*supported {
+                    return Err(SampleError::unsupported_band(spec.clone(), *band));
+                }
+                Ok(sample_in_band(*sampler, *band, rng))
+            }
             ChooserKind::Custom(choose) => Ok(choose()),
         }
     }
@@ -491,27 +858,36 @@ impl Debug for SizeChooser {
             ChooserKind::Range { start, end, .. } => {
                 write!(f, "SizeChooser::Range({start}..={end})")
             }
-            ChooserKind::Normal { .. } => f.write_str("SizeChooser::Normal"),
-            ChooserKind::Gamma { .. } => f.write_str("SizeChooser::Gamma"),
-            ChooserKind::LogNormal { .. } => f.write_str("SizeChooser::LogNormal"),
+            ChooserKind::Sampled { spec, .. } => write!(f, "SizeChooser::Sampled({spec})"),
             ChooserKind::Custom(_) => f.write_str("SizeChooser::Custom"),
         }
     }
 }
 
-/// Truncates `sample` toward zero, then takes its magnitude. Finite
-/// values beyond the 64-bit range saturate to
-/// `u64::MAX`.
-fn truncated_magnitude(sample: f64) -> Result<u64, SampleError> {
-    if !sample.is_finite() {
-        return Err(SampleError::new());
+/// Draws from a supported band until a truncated sample lands inside it.
+/// Preflight bounds expected work; no per-file retry limit can fail later
+/// and leave a partially generated store.
+fn sample_in_band(sampler: Sampler, band: Band, rng: &mut StdRng) -> u64 {
+    loop {
+        let sample = sampler.sample(rng);
+        // A NaN compares false against both edges and would otherwise
+        // pass the band test, so finiteness comes first.
+        if !sample.is_finite() {
+            continue;
+        }
+        // Truncating before the comparison lets a draw of `max + 0.5`
+        // count as `max` instead of being rejected.
+        let bytes = sample.trunc();
+        if !band.contains(bytes) {
+            continue;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the value is a whole number inside a u64 band"
+        )]
+        return bytes as u64;
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "trunc().abs() is non-negative; the cast saturates by design"
-    )]
-    Ok(sample.trunc().abs() as u64)
 }
 
 /// Error parsing a size specification.
@@ -539,6 +915,14 @@ enum ParseSizeErrorKind {
         input: String,
         source: std::num::ParseIntError,
     },
+    /// A decimal mantissa that is not ASCII digits around one point.
+    InvalidDecimal {
+        input: String,
+    },
+    /// A decimal mantissa with nothing to scale it by.
+    DecimalWithoutSuffix {
+        input: String,
+    },
     Overflow {
         input: String,
     },
@@ -552,16 +936,30 @@ enum ParseSizeErrorKind {
     UnknownType {
         name: String,
     },
+    /// `Type=gamma` or `Type=normal`, which this grammar no longer has.
+    RemovedType {
+        name: &'static str,
+    },
     MalformedParameter {
         item: String,
     },
     UnknownParameter {
         type_name: &'static str,
         name: String,
+        accepted: &'static [&'static str],
     },
     MissingParameter {
         type_name: &'static str,
         name: &'static str,
+    },
+    /// A size suffix on a dimensionless key.
+    NotAByteSize {
+        name: &'static str,
+    },
+    /// A dimensionless key whose value is not a finite number.
+    InvalidNumber {
+        name: &'static str,
+        input: String,
     },
     /// The grammar was well formed, but the values it named do not
     /// describe a samplable spec.
@@ -590,7 +988,18 @@ impl ParseSizeError {
         matches!(self.inner.kind, ParseSizeErrorKind::InvalidInteger { .. })
     }
 
-    /// Returns `true` if a suffixed value overflowed 64 bits.
+    /// Returns `true` if a decimal token had no suffix to scale it, or
+    /// was negative or not finite.
+    #[must_use]
+    pub fn is_invalid_decimal(&self) -> bool {
+        matches!(
+            self.inner.kind,
+            ParseSizeErrorKind::InvalidDecimal { .. }
+                | ParseSizeErrorKind::DecimalWithoutSuffix { .. }
+        )
+    }
+
+    /// Returns `true` if a suffixed value reached 64 bits.
     #[must_use]
     pub fn is_overflow(&self) -> bool {
         matches!(self.inner.kind, ParseSizeErrorKind::Overflow { .. })
@@ -620,6 +1029,13 @@ impl ParseSizeError {
         matches!(self.inner.kind, ParseSizeErrorKind::UnknownType { .. })
     }
 
+    /// Returns `true` for `Type=gamma` or `Type=normal`, whose messages
+    /// name the replacement.
+    #[must_use]
+    pub fn is_removed_type(&self) -> bool {
+        matches!(self.inner.kind, ParseSizeErrorKind::RemovedType { .. })
+    }
+
     /// Returns `true` if a shorthand item was not `Key=Value`.
     #[must_use]
     pub fn is_malformed_parameter(&self) -> bool {
@@ -639,6 +1055,19 @@ impl ParseSizeError {
     #[must_use]
     pub fn is_missing_parameter(&self) -> bool {
         matches!(self.inner.kind, ParseSizeErrorKind::MissingParameter { .. })
+    }
+
+    /// Returns `true` if a dimensionless key such as `Sigma` or `Alpha`
+    /// carried a size suffix.
+    #[must_use]
+    pub fn is_not_a_byte_size(&self) -> bool {
+        matches!(self.inner.kind, ParseSizeErrorKind::NotAByteSize { .. })
+    }
+
+    /// Returns `true` if a dimensionless key was not a finite number.
+    #[must_use]
+    pub fn is_invalid_number(&self) -> bool {
+        matches!(self.inner.kind, ParseSizeErrorKind::InvalidNumber { .. })
     }
 
     /// Returns the [`SizeSpecError`] a well-formed specification was
@@ -661,6 +1090,15 @@ impl Display for ParseSizeError {
                     "invalid size specifier {input:?}: not an unsigned integer"
                 )
             }
+            ParseSizeErrorKind::InvalidDecimal { input } => write!(
+                f,
+                "invalid size specifier {input:?}: a decimal is digits around one point with no \
+                 sign or exponent, such as 1.5MB"
+            ),
+            ParseSizeErrorKind::DecimalWithoutSuffix { input } => write!(
+                f,
+                "invalid size specifier {input:?}: a decimal needs a size suffix such as 1.5MB"
+            ),
             ParseSizeErrorKind::Overflow { input } => {
                 write!(
                     f,
@@ -677,18 +1115,55 @@ impl Display for ParseSizeError {
             ParseSizeErrorKind::MissingType => {
                 f.write_str("missing Type=<type> in file size specifier")
             }
-            ParseSizeErrorKind::UnknownType { name } => write!(
+            ParseSizeErrorKind::UnknownType { name } => {
+                write!(f, "unknown Type {name:?}, must be one of: lognormal,pareto")
+            }
+            ParseSizeErrorKind::RemovedType { name: "gamma" } => f.write_str(
+                "Type gamma was removed; use Type=pareto,Min=<bytes>,Max=<bytes>,Alpha=<shape> \
+                 for a heavy tail",
+            ),
+            ParseSizeErrorKind::RemovedType { name } => write!(
                 f,
-                "unknown Type {name:?}, must be one of: normal,gamma,lognormal"
+                "Type {name} was removed; use a range such as 19MB-21MB, or \
+                 Type=lognormal,Median=<bytes>,Sigma=<number>,Max=<bytes> with Sigma set to \
+                 StdDev divided by Mean"
             ),
             ParseSizeErrorKind::MalformedParameter { item } => {
                 write!(f, "malformed size parameter {item:?}: expected Key=Value")
             }
-            ParseSizeErrorKind::UnknownParameter { type_name, name } => {
-                write!(f, "unknown parameter {name:?} for Type={type_name}")
+            ParseSizeErrorKind::UnknownParameter {
+                type_name,
+                name,
+                accepted,
+            } => {
+                write!(
+                    f,
+                    "unknown parameter {name:?} for Type={type_name}; {type_name} takes "
+                )?;
+                // The old log-space grammar is the likely source of a
+                // `Mean` key, so that one names its translation.
+                if *type_name == "lognormal" && name == "Mean" {
+                    return f.write_str(
+                        "Median=<bytes>,Sigma=<number>,Max=<bytes> \
+                         (Median=8.5MB matches the old Mean=16)",
+                    );
+                }
+                for (index, key) in accepted.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(key)?;
+                }
+                Ok(())
             }
             ParseSizeErrorKind::MissingParameter { type_name, name } => {
                 write!(f, "missing parameter {name} for Type={type_name}")
+            }
+            ParseSizeErrorKind::NotAByteSize { name } => {
+                write!(f, "{name} is a plain number, not a byte size")
+            }
+            ParseSizeErrorKind::InvalidNumber { name, input } => {
+                write!(f, "invalid {name} value {input:?}: not a finite number")
             }
             // The specification's own message is the whole story here.
             ParseSizeErrorKind::InvalidSpec { source } => Display::fmt(source, f),
@@ -727,9 +1202,17 @@ enum SizeSpecErrorKind {
     EmptyExclusiveStart,
     /// An excluded end of `0`: no size lies below it.
     EmptyExclusiveEnd,
-    InvalidDistribution {
-        type_name: &'static str,
-        source: Box<dyn Error + Send + Sync>,
+    /// A band starting below the 60-byte header.
+    BandTooLow,
+    /// A band holding at most one size.
+    EmptyBand {
+        min: u64,
+        max: u64,
+    },
+    /// A distribution parameter outside the sampler's domain.
+    InvalidParameter {
+        name: &'static str,
+        requirement: &'static str,
     },
 }
 
@@ -739,6 +1222,10 @@ impl SizeSpecError {
             kind,
             backtrace: Backtrace::capture(),
         }
+    }
+
+    fn invalid_parameter(name: &'static str, requirement: &'static str) -> Self {
+        Self::new(SizeSpecErrorKind::InvalidParameter { name, requirement })
     }
 
     /// Returns `true` if a range contained no sizes: its start
@@ -754,10 +1241,24 @@ impl SizeSpecError {
         )
     }
 
-    /// Returns `true` for parameters outside the sampler's domain.
+    /// Returns `true` if a distribution's band started below the
+    /// 60-byte header.
+    #[must_use]
+    pub fn is_band_too_low(&self) -> bool {
+        matches!(self.kind, SizeSpecErrorKind::BandTooLow)
+    }
+
+    /// Returns `true` if a distribution's band did not hold at least two
+    /// sizes: its lower edge was not strictly below its upper edge.
+    #[must_use]
+    pub fn is_empty_band(&self) -> bool {
+        matches!(self.kind, SizeSpecErrorKind::EmptyBand { .. })
+    }
+
+    /// Returns `true` for a parameter outside the sampler's domain.
     #[must_use]
     pub fn is_invalid_distribution(&self) -> bool {
-        matches!(self.kind, SizeSpecErrorKind::InvalidDistribution { .. })
+        matches!(self.kind, SizeSpecErrorKind::InvalidParameter { .. })
     }
 }
 
@@ -773,46 +1274,97 @@ impl Display for SizeSpecError {
             SizeSpecErrorKind::EmptyExclusiveEnd => {
                 f.write_str("empty size range: excluded end 0 admits no smaller size")
             }
-            SizeSpecErrorKind::InvalidDistribution { type_name, source } => {
-                write!(f, "invalid {type_name} distribution parameters: {source}")
+            SizeSpecErrorKind::BandTooLow => write!(
+                f,
+                "Min must be at least {MIN_FILE_SIZE} bytes, the header size"
+            ),
+            SizeSpecErrorKind::EmptyBand { min, max } if min == max => write!(
+                f,
+                "size band {min}..={max} holds one size; use --file-size {} instead",
+                ShortSize(*min)
+            ),
+            SizeSpecErrorKind::EmptyBand { min, max } => {
+                write!(f, "size band {min}..={max} is empty: Min exceeds Max")
+            }
+            SizeSpecErrorKind::InvalidParameter { name, requirement } => {
+                write!(f, "{name} must be {requirement}")
             }
         }
     }
 }
 
-impl Error for SizeSpecError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match &self.kind {
-            SizeSpecErrorKind::EmptyRange { .. }
-            | SizeSpecErrorKind::EmptyExclusiveStart
-            | SizeSpecErrorKind::EmptyExclusiveEnd => None,
-            SizeSpecErrorKind::InvalidDistribution { source, .. } => Some(&**source),
+impl Error for SizeSpecError {}
+
+/// Renders a byte count with the largest suffix that divides it exactly,
+/// so `1048576` prints as `1MB` and `4097` as `4097`.
+struct ShortSize(u64);
+
+impl Display for ShortSize {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let bytes = self.0;
+        let suffixed = SUFFIXES
+            .iter()
+            .rev()
+            .find(|(_, multiplier)| bytes != 0 && bytes % multiplier == 0);
+        match suffixed {
+            Some((suffix, multiplier)) => write!(f, "{}{suffix}", bytes / multiplier),
+            None => write!(f, "{bytes}"),
         }
     }
 }
 
 /// Error drawing a size from a [`SizeChooser`].
 ///
-/// A distribution produced a sample that is not finite. It happens while
-/// generating, so the CLI reports it as a run failure
-/// (exit 1) rather than a usage error.
+/// The band lacks a conservative probability mass of at least 0.5%.
+/// It happens while generating, so the CLI reports
+/// it as a run failure (exit 1) rather than a usage error; it surfaces
+/// on the first file, before anything is written.
 #[derive(Debug)]
 pub struct SampleError {
+    inner: Box<SampleErrorInner>,
+}
+
+/// Boxed so `Result<u64, SampleError>` stays small on the success path.
+#[derive(Debug)]
+struct SampleErrorInner {
+    spec: SizeSpec,
+    band: Band,
     #[expect(dead_code, reason = "surfaced through Debug output only")]
     backtrace: Backtrace,
 }
 
 impl SampleError {
-    fn new() -> Self {
+    fn unsupported_band(spec: SizeSpec, band: Band) -> Self {
         Self {
-            backtrace: Backtrace::capture(),
+            inner: Box::new(SampleErrorInner {
+                spec,
+                band,
+                backtrace: Backtrace::capture(),
+            }),
         }
+    }
+
+    /// The specification whose band cannot be sampled reliably.
+    #[must_use]
+    pub fn spec(&self) -> &SizeSpec {
+        &self.inner.spec
+    }
+
+    /// The unsupported band.
+    #[must_use]
+    pub fn band(&self) -> RangeInclusive<u64> {
+        self.inner.band.min..=self.inner.band.max
     }
 }
 
 impl Display for SampleError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str("file size sample is not finite (distribution overflow)")
+        let Band { min, max } = self.inner.band;
+        write!(
+            f,
+            "insufficient probability mass within {min}..={max} bytes for {}",
+            self.inner.spec
+        )
     }
 }
 
@@ -822,7 +1374,9 @@ impl Error for SampleError {}
 mod tests {
     use std::ops::Bound;
 
-    use super::{SizeChooser, SizeSpec, parse_byte_size};
+    use proptest::prelude::*;
+
+    use super::{ParseSizeError, SizeChooser, SizeSpec, SizeSpecError, parse_byte_size};
 
     fn spec(input: &str) -> SizeSpec {
         input
@@ -834,9 +1388,16 @@ mod tests {
         spec(input).chooser().unwrap().next_size().unwrap()
     }
 
+    fn parse_error(input: &str) -> ParseSizeError {
+        input
+            .parse::<SizeSpec>()
+            .expect_err("the specification is rejected")
+    }
+
     #[test]
     fn byte_size_suffix_grammar() {
-        // Two-character suffixes are case-insensitive.
+        // Two-character suffixes are case-insensitive; a decimal
+        // mantissa is scaled by its suffix and truncated to whole bytes.
         for (input, expected) in [
             ("8192", 8192),
             ("2kb", 2 * 1024),
@@ -847,6 +1408,13 @@ mod tests {
             ("1gb", 1 << 30),
             ("1tb", 1 << 40),
             ("0", 0),
+            ("1.5KB", 1536),
+            ("1.5mb", 1_572_864),
+            ("0.25GB", 1 << 28),
+            ("0.1TB", 109_951_162_777),
+            (".5KB", 512),
+            ("2.0kb", 2048),
+            ("0.0001KB", 0),
         ] {
             assert_eq!(parse_byte_size(input).unwrap(), expected, "{input}");
         }
@@ -862,13 +1430,85 @@ mod tests {
     }
 
     #[test]
+    fn decimal_byte_sizes_need_a_suffix_and_a_finite_mantissa() {
+        let err = parse_byte_size("1.5").unwrap_err();
+        assert!(err.is_invalid_decimal());
+        assert_eq!(
+            err.to_string(),
+            "invalid size specifier \"1.5\": a decimal needs a size suffix such as 1.5MB"
+        );
+        // The same rejection reaches `--file-size 1.5`.
+        assert!(parse_error("1.5").is_invalid_decimal());
+
+        // Signs and exponents are rejected along with malformed
+        // mantissas, so `1.0e-3MB` never reads as a range endpoint or a
+        // fixed size. `1e3MB` has no point and fails as an integer.
+        for input in [
+            "-1.5MB",
+            "+1.5MB",
+            "1.2.3MB",
+            ".MB",
+            "1.0e400MB",
+            "1.0e-3MB",
+            "1.0E3MB",
+            "x.yMB",
+            "1.5 MB",
+            "inf.MB",
+            "1.5\u{661}MB",
+        ] {
+            let err = parse_byte_size(input).unwrap_err();
+            assert!(err.is_invalid_decimal(), "{input}: {err}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "invalid size specifier {input:?}: a decimal is digits around one point with \
+                     no sign or exponent, such as 1.5MB"
+                )
+            );
+        }
+        assert!(parse_byte_size("1e3MB").unwrap_err().is_invalid_integer());
+        assert!(parse_byte_size("1e-3MB").unwrap_err().is_invalid_integer());
+    }
+
+    #[test]
+    fn exponent_notation_is_rejected_consistently_across_parsers() {
+        // The same token fails the same way as a `--file-size` fixed
+        // size, as either range endpoint, and as a distribution parameter.
+        assert!(parse_error("1.0e-3MB").is_invalid_decimal());
+        assert!(parse_error("1.0e3MB-5MB").is_invalid_decimal());
+        assert!(parse_error("1MB-1.0e3MB").is_invalid_decimal());
+        // A negative exponent inside a range splits on its sign and is
+        // reported as a malformed range; it is never a fixed size.
+        assert!(parse_error("1.0e-3MB-5MB").is_malformed_range());
+        assert!(parse_error("1MB-1.0e-3MB").is_malformed_range());
+        assert!(parse_error("Type=lognormal,Median=1.0e-3MB,Sigma=1,Max=1MB").is_invalid_decimal());
+        // Bare `1.0e3` reaches the byte grammar and asks for a suffix.
+        assert!(parse_error("1.0e3").is_invalid_decimal());
+    }
+
+    #[test]
+    fn decimal_mantissa_rounding_to_infinity_is_an_overflow() {
+        let input = format!("1{}.0KB", "0".repeat(400));
+        let err = parse_byte_size(&input).unwrap_err();
+        assert!(err.is_overflow(), "{err}");
+    }
+
+    #[test]
     fn byte_size_rejects_overflow() {
-        // 2^24 × 2^40 = 2^64, one past the representable range.
+        // 2^24 × 2^40 = 2^64, one past the representable range, for an
+        // integer or a decimal mantissa alike.
         let err = parse_byte_size("16777216tb").unwrap_err();
         assert!(err.is_overflow());
         assert_eq!(
             parse_byte_size("16777215tb").unwrap(),
             (1 << 40) * 16_777_215
+        );
+        let err = parse_byte_size("16777216.0tb").unwrap_err();
+        assert!(err.is_overflow());
+        // (2^24 - 0.5) × 2^40 = 2^64 - 2^39, the largest decimal below the edge.
+        assert_eq!(
+            parse_byte_size("16777215.5tb").unwrap(),
+            u64::MAX - (1 << 39) + 1
         );
     }
 
@@ -876,51 +1516,271 @@ mod tests {
     fn spec_shapes_parse_in_frozen_order() {
         assert_eq!(spec("4096"), SizeSpec::fixed(4096));
         assert_eq!(spec("2kb"), SizeSpec::fixed(2048));
+        assert_eq!(spec("1.5kb"), SizeSpec::fixed(1536));
         assert_eq!(spec("1kb-2kb"), SizeSpec::range(1024..=2048).unwrap());
+        assert_eq!(spec("1.5kb-2.5kb"), SizeSpec::range(1536..=2560).unwrap());
         assert_eq!(
-            spec("Type=normal,Mean=1kb,StdDev=0"),
-            SizeSpec::normal(1024.0, 0.0).unwrap()
+            spec("Type=lognormal,Median=1kb,Sigma=0,Max=2kb"),
+            SizeSpec::lognormal(1024, 0.0, 60..=2048).unwrap()
         );
         assert_eq!(
-            spec("Type=gamma,Alpha=2,Beta=2mb"),
-            SizeSpec::gamma(2.0, 2.0 * 1024.0 * 1024.0).unwrap()
+            spec("Type=lognormal,Median=1MB,Sigma=1.5,Min=4KB,Max=1GB"),
+            SizeSpec::lognormal(1 << 20, 1.5, 4096..=(1 << 30)).unwrap()
         );
         assert_eq!(
-            spec("Type=lognormal,Mean=16,StdDev=1"),
-            SizeSpec::lognormal(16.0, 1.0).unwrap()
+            spec("Type=pareto,Min=4KB,Max=1GB,Alpha=1.2"),
+            SizeSpec::pareto(1.2, 4096..=(1 << 30)).unwrap()
         );
     }
 
     #[test]
     fn spec_errors_match_the_behavior_matrix() {
-        type Check = fn(&super::ParseSizeError) -> bool;
+        type Check = fn(&ParseSizeError) -> bool;
         // Each case is a pinned usage error (exit 2 at the CLI).
-        let cases: [(&str, Check); 6] = [
-            ("bogus", super::ParseSizeError::is_unknown_spec),
-            ("1mb-2mb-3mb", super::ParseSizeError::is_malformed_range),
-            ("Mean=1,StdDev=1", super::ParseSizeError::is_missing_type),
-            ("Type=zipf,Mean=1", super::ParseSizeError::is_unknown_type),
-            // Parameter names are validated at parse time.
+        let cases: [(&str, Check); 9] = [
+            ("bogus", ParseSizeError::is_unknown_spec),
+            ("1mb-2mb-3mb", ParseSizeError::is_malformed_range),
+            ("Median=1,Sigma=1", ParseSizeError::is_missing_type),
+            ("Type=zipf,Mean=1", ParseSizeError::is_unknown_type),
             (
-                "Type=normal,Mean=1024,StdDev=0,Foo=2",
-                super::ParseSizeError::is_unknown_parameter,
+                "Type=gamma,Alpha=2,Beta=2MB",
+                ParseSizeError::is_removed_type,
             ),
             (
-                "Type=normal,Mean=1024",
-                super::ParseSizeError::is_missing_parameter,
+                "Type=normal,Mean=20MB,StdDev=1MB",
+                ParseSizeError::is_removed_type,
+            ),
+            // Parameter names are validated at parse time.
+            (
+                "Type=lognormal,Median=1kb,Sigma=0,Max=2kb,Foo=2",
+                ParseSizeError::is_unknown_parameter,
+            ),
+            (
+                "Type=lognormal,Median=1kb,Sigma=0",
+                ParseSizeError::is_missing_parameter,
+            ),
+            (
+                "Type=pareto,Min=4KB,Max=1GB,Alpha=1.2MB",
+                ParseSizeError::is_not_a_byte_size,
             ),
         ];
         for (input, matches) in cases {
-            let err = input.parse::<SizeSpec>().unwrap_err();
+            let err = parse_error(input);
             assert!(matches(&err), "{input}: {err}");
         }
     }
 
     #[test]
+    fn removed_types_name_their_replacement() {
+        assert_eq!(
+            parse_error("Type=gamma,Alpha=2,Beta=2MB").to_string(),
+            "Type gamma was removed; use Type=pareto,Min=<bytes>,Max=<bytes>,Alpha=<shape> \
+             for a heavy tail"
+        );
+        assert_eq!(
+            parse_error("Type=normal,Mean=20MB,StdDev=1MB").to_string(),
+            "Type normal was removed; use a range such as 19MB-21MB, or \
+             Type=lognormal,Median=<bytes>,Sigma=<number>,Max=<bytes> with Sigma set to \
+             StdDev divided by Mean"
+        );
+        assert_eq!(
+            parse_error("Type=zipf,Mean=1").to_string(),
+            "unknown Type \"zipf\", must be one of: lognormal,pareto"
+        );
+    }
+
+    #[test]
+    fn unknown_parameters_list_the_accepted_keys() {
+        // The old log-space lognormal grammar gets its translation.
+        let err = parse_error("Type=lognormal,Mean=16,StdDev=1");
+        assert!(err.is_unknown_parameter());
+        assert_eq!(
+            err.to_string(),
+            "unknown parameter \"Mean\" for Type=lognormal; lognormal takes \
+             Median=<bytes>,Sigma=<number>,Max=<bytes> (Median=8.5MB matches the old Mean=16)"
+        );
+        assert_eq!(
+            parse_error("Type=lognormal,Median=1kb,Sigma=0,Max=2kb,Foo=2").to_string(),
+            "unknown parameter \"Foo\" for Type=lognormal; lognormal takes Median, Sigma, Min, Max"
+        );
+        assert_eq!(
+            parse_error("Type=pareto,Min=4KB,Max=1GB,Alpha=1.2,Beta=1").to_string(),
+            "unknown parameter \"Beta\" for Type=pareto; pareto takes Min, Max, Alpha"
+        );
+    }
+
+    #[test]
+    fn max_is_required_for_both_distributions() {
+        let err = parse_error("Type=pareto,Min=4KB,Alpha=1.2");
+        assert!(err.is_missing_parameter());
+        assert_eq!(err.to_string(), "missing parameter Max for Type=pareto");
+        let err = parse_error("Type=lognormal,Median=1MB,Sigma=1");
+        assert!(err.is_missing_parameter());
+        assert_eq!(err.to_string(), "missing parameter Max for Type=lognormal");
+    }
+
+    #[test]
+    fn dimensionless_keys_reject_suffixes_and_non_numbers() {
+        let err = parse_error("Type=pareto,Min=4KB,Max=1GB,Alpha=1.2MB");
+        assert!(err.is_not_a_byte_size());
+        assert_eq!(err.to_string(), "Alpha is a plain number, not a byte size");
+        let err = parse_error("Type=lognormal,Median=1MB,Sigma=1kb,Max=1GB");
+        assert!(err.is_not_a_byte_size());
+        assert_eq!(err.to_string(), "Sigma is a plain number, not a byte size");
+
+        for input in [
+            "Type=pareto,Min=4KB,Max=1GB,Alpha=abc",
+            "Type=pareto,Min=4KB,Max=1GB,Alpha=inf",
+            "Type=lognormal,Median=1MB,Sigma=nan,Max=1GB",
+            "Type=lognormal,Median=1MB,Sigma=,Max=1GB",
+        ] {
+            let err = parse_error(input);
+            assert!(err.is_invalid_number(), "{input}: {err}");
+        }
+        assert_eq!(
+            parse_error("Type=pareto,Min=4KB,Max=1GB,Alpha=abc").to_string(),
+            "invalid Alpha value \"abc\": not a finite number"
+        );
+    }
+
+    #[test]
+    fn parameters_are_validated_in_both_constructors() {
+        let err = parse_error("Type=pareto,Min=4KB,Max=1GB,Alpha=0");
+        assert!(
+            err.invalid_spec_error()
+                .is_some_and(SizeSpecError::is_invalid_distribution)
+        );
+        assert_eq!(err.to_string(), "Alpha must be greater than zero");
+        assert!(
+            SizeSpec::pareto(-1.0, 4096..=8192)
+                .unwrap_err()
+                .is_invalid_distribution()
+        );
+        assert!(
+            SizeSpec::pareto(f64::NAN, 4096..=8192)
+                .unwrap_err()
+                .is_invalid_distribution()
+        );
+        assert!(
+            SizeSpec::pareto(f64::INFINITY, 4096..=8192)
+                .unwrap_err()
+                .is_invalid_distribution()
+        );
+
+        let err = parse_error("Type=lognormal,Median=0,Sigma=1,Max=1GB");
+        assert_eq!(err.to_string(), "Median must be at least 1");
+        let err = parse_error("Type=lognormal,Median=1MB,Sigma=-1,Max=1GB");
+        assert_eq!(err.to_string(), "Sigma must be at least zero");
+        assert!(
+            SizeSpec::lognormal(1024, f64::NAN, 60..=2048)
+                .unwrap_err()
+                .is_invalid_distribution()
+        );
+        assert!(
+            SizeSpec::lognormal(1024, f64::INFINITY, 60..=2048)
+                .unwrap_err()
+                .is_invalid_distribution()
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::reversed_empty_ranges,
+        reason = "the inverted band is what this rejection test builds"
+    )]
+    fn bands_are_validated_in_both_constructors() {
+        let err = parse_error("Type=lognormal,Median=1MB,Sigma=0,Min=1MB,Max=1MB");
+        assert!(
+            err.invalid_spec_error()
+                .is_some_and(SizeSpecError::is_empty_band)
+        );
+        assert_eq!(
+            err.to_string(),
+            "size band 1048576..=1048576 holds one size; use --file-size 1MB instead"
+        );
+        assert_eq!(
+            parse_error("Type=pareto,Min=4097,Max=4097,Alpha=1").to_string(),
+            "size band 4097..=4097 holds one size; use --file-size 4097 instead"
+        );
+        let err = SizeSpec::pareto(1.0, 8192..=4096).unwrap_err();
+        assert!(err.is_empty_band());
+        assert_eq!(
+            err.to_string(),
+            "size band 8192..=4096 is empty: Min exceeds Max"
+        );
+
+        let err = parse_error("Type=lognormal,Median=1MB,Sigma=1,Min=10,Max=1GB");
+        assert!(
+            err.invalid_spec_error()
+                .is_some_and(SizeSpecError::is_band_too_low)
+        );
+        assert_eq!(
+            err.to_string(),
+            "Min must be at least 60 bytes, the header size"
+        );
+        assert!(
+            SizeSpec::pareto(1.0, 59..=4096)
+                .unwrap_err()
+                .is_band_too_low()
+        );
+        assert!(
+            SizeSpec::lognormal(1024, 1.0, 0..=4096)
+                .unwrap_err()
+                .is_band_too_low()
+        );
+
+        // The lowest allowed band edge is the header itself, and the
+        // median may sit outside the band.
+        assert_eq!(
+            SizeSpec::pareto(1.0, 60..=61).unwrap().to_string(),
+            "Type=pareto,Min=60,Max=61,Alpha=1"
+        );
+        assert_eq!(
+            SizeSpec::lognormal(1 << 40, 1.0, 60..=61)
+                .unwrap()
+                .to_string(),
+            "Type=lognormal,Median=1099511627776,Sigma=1,Min=60,Max=61"
+        );
+    }
+
+    #[test]
+    fn canonical_display_round_trips_through_parse() {
+        for (input, canonical) in [
+            ("4096", "4096"),
+            ("2kb", "2048"),
+            ("1kb-2kb", "1024-2048"),
+            (
+                "Type=lognormal,Median=20MB,Sigma=0.05,Max=10MB",
+                "Type=lognormal,Median=20971520,Sigma=0.05,Min=60,Max=10485760",
+            ),
+            (
+                "Type=lognormal,Median=1MB,Sigma=1.5,Min=4KB,Max=1GB",
+                "Type=lognormal,Median=1048576,Sigma=1.5,Min=4096,Max=1073741824",
+            ),
+            (
+                "Type=lognormal,Median=1MB,Sigma=2,Max=1GB",
+                "Type=lognormal,Median=1048576,Sigma=2,Min=60,Max=1073741824",
+            ),
+            (
+                "Type=pareto,Min=4KB,Max=1GB,Alpha=1.2",
+                "Type=pareto,Min=4096,Max=1073741824,Alpha=1.2",
+            ),
+            (
+                "Type=pareto,Max=1GB,Min=4KB,Alpha=2",
+                "Type=pareto,Min=4096,Max=1073741824,Alpha=2",
+            ),
+        ] {
+            let parsed = spec(input);
+            assert_eq!(parsed.to_string(), canonical, "{input}");
+            assert_eq!(spec(canonical), parsed, "{canonical}");
+        }
+    }
+
+    #[test]
     fn shorthand_item_without_equals_is_an_error() {
-        let err = "Type=normal,Mean".parse::<SizeSpec>().unwrap_err();
+        let err = parse_error("Type=lognormal,Median");
         assert!(err.is_malformed_parameter());
-        let err = "Type=normal,Mean=1=2".parse::<SizeSpec>().unwrap_err();
+        let err = parse_error("Type=lognormal,Median=1=2");
         assert!(err.is_malformed_parameter());
     }
 
@@ -928,8 +1788,8 @@ mod tests {
     fn shorthand_duplicate_parameter_keeps_the_last_value() {
         // A repeated key silently overwrites its previous value.
         assert_eq!(
-            spec("Type=normal,Mean=1,Mean=1kb,StdDev=0"),
-            SizeSpec::normal(1024.0, 0.0).unwrap()
+            spec("Type=lognormal,Median=1,Median=1kb,Sigma=0,Max=2kb"),
+            SizeSpec::lognormal(1024, 0.0, 60..=2048).unwrap()
         );
     }
 
@@ -962,7 +1822,7 @@ mod tests {
 
         // Parsing reports the same rejection, with the spec error as its
         // cause and its message.
-        let err = "2kb-1kb".parse::<SizeSpec>().unwrap_err();
+        let err = parse_error("2kb-1kb");
         let spec_err = err.invalid_spec_error().expect("the spec was rejected");
         assert!(spec_err.is_empty_range());
         assert_eq!(err.to_string(), spec_err.to_string());
@@ -1003,52 +1863,88 @@ mod tests {
     }
 
     #[test]
-    fn normal_with_zero_std_dev_is_exactly_the_mean() {
-        // Pinned by test_normal_distribution_grammar.
-        assert_eq!(one_size("Type=normal,Mean=1kb,StdDev=0"), 1024);
+    fn lognormal_with_zero_sigma_is_exactly_the_median() {
+        // Median is a byte size, so Sigma=0 gives exactly 1024 bytes.
+        assert_eq!(one_size("Type=lognormal,Median=1kb,Sigma=0,Max=2kb"), 1024);
+        // The sampler scales the median directly rather than computing
+        // e^ln(median), which lands one bit low for 1GB and would
+        // truncate to 1073741823.
+        assert_eq!(
+            one_size("Type=lognormal,Median=1GB,Sigma=0,Max=2GB"),
+            1 << 30
+        );
+        assert_eq!(
+            one_size("Type=lognormal,Median=1TB,Sigma=0,Max=2TB"),
+            1 << 40
+        );
     }
 
     #[test]
-    fn lognormal_parameters_stay_in_log_space() {
-        // StdDev=0 gives int(e^8) == 2980 bytes, not 8.
-        assert_eq!(one_size("Type=lognormal,Mean=8,StdDev=0"), 2980);
-    }
-
-    #[test]
-    fn gamma_samples_are_finite_and_nonzero() {
-        let mut sizes = spec("Type=gamma,Alpha=2,Beta=1kb").chooser().unwrap();
-        for _ in 0..64 {
-            // Post-processing guarantees a non-negative integer; the
-            // generator, not the chooser, clamps to the 60-byte minimum.
-            let _size = sizes.next_size().unwrap();
+    fn pareto_samples_start_at_min_and_stay_below_max() {
+        let mut sizes = spec("Type=pareto,Min=4KB,Max=8KB,Alpha=1")
+            .chooser()
+            .unwrap();
+        for _ in 0..256 {
+            let size = sizes.next_size().unwrap();
+            assert!((4096..=8192).contains(&size), "{size}");
         }
     }
 
     #[test]
-    fn gamma_rejects_non_positive_shape() {
-        let err = SizeSpec::gamma(0.0, 1024.0).unwrap_err();
-        assert!(err.is_invalid_distribution());
-        // The sampler's own error stays reachable, not just its text.
-        assert!(std::error::Error::source(&err).is_some());
+    fn pareto_min_defaults_to_the_header_size() {
+        assert_eq!(
+            spec("Type=pareto,Max=4KB,Alpha=1.2"),
+            SizeSpec::pareto(1.2, 60..=4096).unwrap()
+        );
     }
 
     #[test]
-    fn samples_use_abs_after_truncation() {
-        // A negative mean with zero deviation yields the positive
-        // magnitude after truncation and absolute-value conversion.
-        let mut sizes = SizeSpec::normal(-100.9, 0.0).unwrap().chooser().unwrap();
-        assert_eq!(sizes.next_size().unwrap(), 100);
+    fn low_mass_bands_never_return_a_size() {
+        for input in [
+            "Type=lognormal,Median=3KB,Sigma=1,Max=100",
+            "Type=lognormal,Median=3KB,Sigma=0,Max=100",
+            "Type=pareto,Min=60,Max=61,Alpha=0.001",
+        ] {
+            let mut sizes = spec(input).chooser().unwrap();
+            for _ in 0..100 {
+                let error = sizes
+                    .next_size()
+                    .expect_err("reject before returning any size");
+                assert_eq!(error.spec(), &spec(input));
+            }
+        }
     }
 
     #[test]
-    fn lognormal_overflow_is_a_reported_error() {
-        // This input overflows the exponential; the sampler reports a
-        // non-finite sample instead of crashing.
-        let mut sizes = SizeSpec::lognormal(1e6, 0.0).unwrap().chooser().unwrap();
+    fn supported_tail_and_narrow_bands_keep_sampling() {
+        for input in [
+            "Type=lognormal,Median=3KB,Sigma=1,Max=400",
+            "Type=lognormal,Median=3KB,Sigma=1,Min=3000,Max=3100",
+            "Type=pareto,Min=60,Max=61,Alpha=1",
+        ] {
+            let mut sizes = spec(input).chooser().unwrap();
+            for _ in 0..1000 {
+                sizes.next_size().expect("supported band keeps sampling");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_band_is_a_reported_error() {
+        // The band holds 6e-44 of the mass, so the first file fails.
+        let parsed = spec("Type=lognormal,Median=20MB,Sigma=0.05,Max=10MB");
+        let mut sizes = parsed.chooser().unwrap();
         let err = sizes.next_size().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "file size sample is not finite (distribution overflow)"
+            "insufficient probability mass within 60..=10485760 bytes for \
+             Type=lognormal,Median=20971520,Sigma=0.05,Min=60,Max=10485760"
+        );
+        assert_eq!(err.spec(), &parsed);
+        assert_eq!(err.band(), 60..=10_485_760);
+        assert_eq!(
+            format!("{sizes:?}"),
+            "SizeChooser::Sampled(Type=lognormal,Median=20971520,Sigma=0.05,Min=60,Max=10485760)"
         );
     }
 
@@ -1061,5 +1957,51 @@ mod tests {
             format!("{:?}", SizeChooser::fixed(7)),
             "SizeChooser::Fixed(7)"
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// With the median inside the band, the band holds at least an
+        /// eighth of the mass, so 1,000 draws never exhaust it and every
+        /// one lands inside it.
+        #[test]
+        fn lognormal_samples_stay_inside_the_band(
+            min in 60_u64..=(1 << 30),
+            factor in 2_u64..=1024,
+            median_factor in 1_u64..=1024,
+            sigma in 0.0_f64..=2.0,
+        ) {
+            let max = min * factor;
+            let median = min * median_factor.min(factor);
+            let mut sizes = SizeSpec::lognormal(median, sigma, min..=max)
+                .expect("the parameters are valid")
+                .chooser()
+                .expect("the random source works");
+            for _ in 0..1000 {
+                let size = sizes.next_size().expect("the band holds enough mass");
+                prop_assert!((min..=max).contains(&size), "{size} outside {min}..={max}");
+            }
+        }
+
+        /// A band spanning at least a factor of two holds at least
+        /// `1 - 2^-alpha` of a Pareto's mass, so no draw is ever
+        /// rejected often enough to fail.
+        #[test]
+        fn pareto_samples_stay_inside_the_band(
+            min in 60_u64..=(1 << 30),
+            factor in 2_u64..=1024,
+            alpha in 0.1_f64..=5.0,
+        ) {
+            let max = min * factor;
+            let mut sizes = SizeSpec::pareto(alpha, min..=max)
+                .expect("the parameters are valid")
+                .chooser()
+                .expect("the random source works");
+            for _ in 0..1000 {
+                let size = sizes.next_size().expect("the band holds enough mass");
+                prop_assert!((min..=max).contains(&size), "{size} outside {min}..={max}");
+            }
+        }
     }
 }

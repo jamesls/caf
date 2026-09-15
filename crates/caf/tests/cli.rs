@@ -277,7 +277,7 @@ fn invalid_range_spec_is_usage_error() {
 fn shorthand_missing_type_is_usage_error() {
     let dir = tempdir();
     assert_eq!(
-        code(&generate(dir.path(), &["--file-size", "Mean=1,StdDev=1"])),
+        code(&generate(dir.path(), &["--file-size", "Median=1,Sigma=1"])),
         2
     );
 }
@@ -296,8 +296,100 @@ fn shorthand_unknown_parameter_is_usage_error() {
     // Parameter names are validated at parse time (exit 2) instead of
     // crashing during generation.
     let dir = tempdir();
-    let spec = "Type=normal,Mean=1kb,StdDev=0,Foo=2";
+    let spec = "Type=lognormal,Median=1kb,Sigma=0,Max=2kb,Foo=2";
     assert_eq!(code(&generate(dir.path(), &["--file-size", spec])), 2);
+}
+
+#[test]
+fn removed_distribution_types_name_their_replacement() {
+    let dir = tempdir();
+    let output = generate(dir.path(), &["--file-size", "Type=gamma,Alpha=2,Beta=2MB"]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains(
+            "Type gamma was removed; use Type=pareto,Min=<bytes>,Max=<bytes>,Alpha=<shape>"
+        ),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = generate(
+        dir.path(),
+        &["--file-size", "Type=normal,Mean=20MB,StdDev=1MB"],
+    );
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains(
+            "Type normal was removed; use a range such as 19MB-21MB, or \
+             Type=lognormal,Median=<bytes>,Sigma=<number>,Max=<bytes>"
+        ),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = generate(
+        dir.path(),
+        &["--file-size", "Type=lognormal,Mean=16,StdDev=1"],
+    );
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("Median=8.5MB matches the old Mean=16"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn distribution_without_max_is_usage_error() {
+    let dir = tempdir();
+    let output = generate(
+        dir.path(),
+        &["--file-size", "Type=pareto,Min=4KB,Alpha=1.2"],
+    );
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("missing parameter Max for Type=pareto"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn unsupported_band_is_a_run_failure() {
+    // The band is valid grammar, so it is not a usage error; it fails
+    // on the first file (exit 1) with the canonical spec in the message.
+    let dir = tempdir();
+    let output = generate(
+        dir.path(),
+        &[
+            "--file-size",
+            "Type=lognormal,Median=20MB,Sigma=0.05,Max=10MB",
+        ],
+    );
+    assert_eq!(code(&output), 1);
+    assert!(
+        stderr(&output).contains(
+            "insufficient probability mass within 60..=10485760 bytes for \
+             Type=lognormal,Median=20971520,Sigma=0.05,Min=60,Max=10485760"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(data_files(dir.path()).is_empty());
+}
+
+#[test]
+fn low_mass_bands_fail_before_writing_files() {
+    for input in [
+        "Type=lognormal,Median=3KB,Sigma=1,Max=100",
+        "Type=pareto,Min=60,Max=61,Alpha=0.001",
+    ] {
+        let dir = tempdir();
+        let output = generate(dir.path(), &["--max-files", "100", "--file-size", input]);
+        assert_eq!(code(&output), 1, "{}", stderr(&output));
+        assert!(stderr(&output).contains("insufficient probability mass"));
+        assert!(data_files(dir.path()).is_empty());
+    }
 }
 
 #[test]
@@ -340,6 +432,8 @@ fn file_size_suffix_grammar() {
         ("2Kb", 2 * 1024),
         ("1mb", 1024 * 1024),
         ("1MB", 1024 * 1024),
+        ("1.5KB", 1536),
+        ("0.5mb", 512 * 1024),
     ] {
         let (_dir, files) = store_with(&["--max-files", "1", "--file-size", spec]);
         assert_eq!(sizes_of(&files), vec![expected], "{spec}");
@@ -350,7 +444,7 @@ fn file_size_suffix_grammar() {
 fn max_disk_usage_large_suffixes_parse() {
     // Exercises gb/tb parsing without generating huge files: one small
     // file never reaches the budget.
-    for suffix in ["1gb", "1tb", "1GB", "1TB"] {
+    for suffix in ["1gb", "1tb", "1GB", "1TB", "1.5GB", "0.1tb"] {
         let (_dir, files) = store_with(&[
             "--max-files",
             "1",
@@ -390,41 +484,66 @@ fn file_size_below_header_is_clamped_to_60() {
 // --- distribution grammar ---------------------------------------------
 
 #[test]
-fn normal_distribution_grammar() {
-    // StdDev=0 makes the sample deterministic: exactly Mean.
+fn lognormal_distribution_grammar_is_byte_space() {
+    // Median is a byte size, so Sigma=0 makes every sample exactly the
+    // median: 1024 bytes, not e^1024 or ln(1024).
     let (_dir, files) = store_with(&[
         "--max-files",
         "2",
         "--file-size",
-        "Type=normal,Mean=1kb,StdDev=0",
+        "Type=lognormal,Median=1kb,Sigma=0,Max=2kb",
     ]);
     assert_eq!(sizes_of(&files), vec![1024, 1024]);
 }
 
 #[test]
-fn lognormal_distribution_grammar_is_log_space() {
-    // Mean and StdDev are log-space parameters, so StdDev=0
-    // gives int(e^8) == 2980 bytes, not 8 bytes.
+fn lognormal_distribution_grammar_stays_inside_the_band() {
     let (_dir, files) = store_with(&[
         "--max-files",
-        "1",
+        "5",
         "--file-size",
-        "Type=lognormal,Mean=8,StdDev=0",
+        "Type=lognormal,Median=2kb,Sigma=1.5,Min=1kb,Max=4kb",
     ]);
-    assert_eq!(sizes_of(&files), vec![2980]);
+    let sizes = sizes_of(&files);
+    assert_eq!(sizes.len(), 5);
+    assert!(
+        sizes.iter().all(|size| (1024..=4096).contains(size)),
+        "{sizes:?}"
+    );
 }
 
 #[test]
-fn gamma_distribution_grammar() {
+fn pareto_distribution_grammar_stays_inside_the_band() {
     let (_dir, files) = store_with(&[
         "--max-files",
-        "2",
+        "5",
         "--file-size",
-        "Type=gamma,Alpha=2,Beta=1kb",
+        "Type=pareto,Min=60,Max=4kb,Alpha=1.2",
     ]);
     let sizes = sizes_of(&files);
-    assert_eq!(sizes.len(), 2);
-    assert!(sizes.iter().all(|&size| size >= 60), "{sizes:?}");
+    assert_eq!(sizes.len(), 5);
+    assert!(
+        sizes.iter().all(|size| (60..=4096).contains(size)),
+        "{sizes:?}"
+    );
+}
+
+#[test]
+fn pareto_distribution_defaults_min_to_header_size() {
+    let (dir, files) = store_with(&[
+        "--max-files",
+        "100",
+        "--file-size",
+        "Type=pareto,Max=4KB,Alpha=1.2",
+    ]);
+    assert_eq!(files.len(), 100);
+    assert!(
+        sizes_of(&files)
+            .iter()
+            .all(|size| (60..=4096).contains(size))
+    );
+    let output = verify(dir.path(), &[]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
 }
 
 // --- stopping conditions ----------------------------------------------
@@ -1045,9 +1164,9 @@ fn help_examples_run_successfully() {
     for spec in [
         "4KB",
         "4048KB-10MB",
-        "Type=normal,Mean=20MB,StdDev=1MB",
-        "Type=gamma,Alpha=2,Beta=2MB",
-        "Type=lognormal,Mean=16,StdDev=1",
+        "Type=lognormal,Median=1MB,Sigma=1,Max=1GB",
+        "Type=lognormal,Median=20MB,Sigma=0.05,Max=30MB",
+        "Type=pareto,Min=4KB,Max=1GB,Alpha=1.2",
     ] {
         let dir = tempdir();
         let output = generate(dir.path(), &["--max-files", "1", "--file-size", spec]);

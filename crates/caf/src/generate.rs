@@ -2,8 +2,9 @@
 //!
 //! With no stopping option, exactly 100 files are generated. `--max-files`
 //! and `--max-disk-usage` are each checked before every file; the default
-//! file size is 4,096 bytes; sizes below the 60-byte header are clamped
-//! up by the library. `--jobs` defaults to a CPU-aware worker budget and
+//! file size is 4,096 bytes; fixed and range sizes below the 60-byte
+//! header are clamped up by the library, and distributions are sampled
+//! inside an explicit band. `--jobs` defaults to a CPU-aware worker budget and
 //! rejects values below one; it changes only how fast a large file is
 //! written, never what is written. `gen` shows live progress when
 //! standard error is a terminal and prints nothing when output is
@@ -62,25 +63,32 @@ files that have a random size between 4048KB and 10MB:
     caf gen --file-size 4048KB-10MB
 
 Instead of specifying a range of file sizes, you can also specify a
-random distribution that the file sizes should follow.  For example,
-if you want to generate files that follow a normal (Gaussian)
-distribution, you can specify the mean and the standard deviation by
-using:
+random distribution that the file sizes should follow.  Every
+distribution is sampled inside a band from Min to Max.  Min defaults
+to 60 bytes, the header size.  Max is required because both
+distributions have heavy tails.  A sample outside the band is redrawn,
+so no file is ever larger than Max.  Before sampling, a conservative
+probability bound must show that the band holds at least 0.5% of the
+distribution; unsupported bands fail before any files are written.
 
-    caf gen --file-size Type=normal,Mean=20MB,StdDev=1MB
+A lognormal distribution takes the median file size in bytes and Sigma,
+the spread in log space.  Sigma=1 puts 68% of files within a factor of
+2.7 of the median; a small Sigma such as 0.05 gives a tight bell curve
+around the median:
 
-You can also use a gamma distribution.  Alpha is the shape parameter
-and Beta is the scale parameter, so the mean file size is Alpha * Beta
-(4MB in this example):
+    caf gen --file-size Type=lognormal,Median=1MB,Sigma=1,Max=1GB
+    caf gen --file-size Type=lognormal,Median=20MB,Sigma=0.05,Max=30MB
 
-    caf gen --file-size Type=gamma,Alpha=2,Beta=2MB
+A Pareto distribution produces many small files and a few very large
+ones.  Min is the smallest file, Max the largest, and Alpha controls
+how fast the count falls off; smaller Alpha means more large files.
+The fraction of files larger than X is (Min / X) ^ Alpha.  This example
+keeps half the files under 7KB while about one in 800 exceeds 1MB:
 
-And finally a lognormal distribution.  Note that Mean and StdDev are
-the parameters of the underlying normal distribution (log space), not
-byte sizes.  This example produces a median file size of e^16, which
-is roughly 8.9MB:
+    caf gen --file-size Type=pareto,Min=4KB,Max=1GB,Alpha=1.2
 
-    caf gen --file-size Type=lognormal,Mean=16,StdDev=1
+Parameter values accept decimals with a size suffix (1.5MB) and plain
+decimals for Sigma and Alpha.
 
 Writing one very large file is normally limited by the single core
 generating its content.  The --jobs option spreads that work over
@@ -120,7 +128,9 @@ pub struct Args {
 
     /// The size of the files that are generated.  Value is either in
     /// bytes or can be suffixed with kb, mb, gb, etc.  Suffix is case
-    /// insensitive (we know what you mean).
+    /// insensitive (we know what you mean).  A random distribution
+    /// (Type=lognormal or Type=pareto) is sampled between Min and Max;
+    /// see --help for the full grammar.
     #[arg(
         long,
         value_name = "FILESIZE",

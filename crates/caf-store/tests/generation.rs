@@ -484,9 +484,10 @@ fn every_size_mode_produces_a_structurally_valid_store() {
         "60",
         "1kb-2kb",
         "60-60",
-        "Type=normal,Mean=2kb,StdDev=1kb",
-        "Type=gamma,Alpha=2,Beta=1kb",
-        "Type=lognormal,Mean=8,StdDev=1",
+        "1.5kb-2.5kb",
+        "Type=lognormal,Median=2kb,Sigma=1,Max=64kb",
+        "Type=lognormal,Median=2kb,Sigma=0.5,Min=1kb,Max=4kb",
+        "Type=pareto,Min=60,Max=64kb,Alpha=1.2",
     ];
     for mode in modes {
         let store = tempfile::tempdir().expect("create temp store");
@@ -503,22 +504,31 @@ fn every_size_mode_produces_a_structurally_valid_store() {
 }
 
 #[test]
-fn size_selection_failure_reports_before_writing_anything() {
-    // A lognormal overflow surfaces as a structured error before any
-    // file or metadata write.
+fn low_mass_band_fails_before_writing_anything() {
+    // The band holds 6e-44 of the distribution's mass, so the first
+    // size draw fails, as a structured error, before any file or
+    // metadata write.
     let store = tempfile::tempdir().expect("create temp store");
-    let chooser = SizeSpec::lognormal(1e6, 0.0)
-        .expect("the parameters are inside the sampler's domain")
+    let chooser = "Type=lognormal,Median=20MB,Sigma=0.05,Max=10MB"
+        .parse::<SizeSpec>()
+        .expect("the band is a sampling-time problem, not a parse error")
         .chooser()
-        .expect("construction parameters are valid");
+        .expect("the random source works");
     let err = Generator::builder(store.path())
         .max_files(1)
         .file_sizes(chooser)
         .build()
         .generate()
-        .expect_err("the first sample overflows");
+        .expect_err("the first draw rejects the unsupported band");
 
     assert!(err.is_size_selection());
+    assert_eq!(err.to_string(), "selecting the next file size failed");
+    let cause = std::error::Error::source(&err).expect("the sample error is the cause");
+    assert_eq!(
+        cause.to_string(),
+        "insufficient probability mass within 60..=10485760 bytes for \
+         Type=lognormal,Median=20971520,Sigma=0.05,Min=60,Max=10485760"
+    );
     let leftovers: Vec<_> = fs::read_dir(store.path())
         .expect("store root is readable")
         .collect();
@@ -526,6 +536,56 @@ fn size_selection_failure_reports_before_writing_anything() {
         leftovers.is_empty(),
         "nothing may be written: {leftovers:?}"
     );
+}
+
+/// Draws `count` sizes from `spec` and returns them sorted.
+fn sorted_samples(spec: &str, count: usize) -> Vec<u64> {
+    let mut sizes = spec
+        .parse::<SizeSpec>()
+        .unwrap_or_else(|err| panic!("{spec}: {err}"))
+        .chooser()
+        .expect("the random source works");
+    let mut samples: Vec<u64> = (0..count)
+        .map(|_| {
+            sizes
+                .next_size()
+                .expect("the band holds nearly all of the mass")
+        })
+        .collect();
+    samples.sort_unstable();
+    samples
+}
+
+#[test]
+fn pareto_samples_have_the_closed_form_median_and_respect_max() {
+    // The median of Pareto(4KB, 1.2) is 4KB * 2^(1/1.2) = 7.1KB. The
+    // sample median of 20,000 draws has a standard error near 40 bytes,
+    // so a 6KB..9KB window cannot flake, yet catches swapped parameters
+    // or a scale mistaken for a shape.
+    let samples = sorted_samples("Type=pareto,Min=4KB,Max=1GB,Alpha=1.2", 20_000);
+    let median = samples[samples.len() / 2];
+    assert!(
+        (6 * 1024..=9 * 1024).contains(&median),
+        "sample median {median} is not near 7.1KB"
+    );
+    assert!(*samples.first().expect("20,000 samples") >= 4096);
+    assert!(*samples.last().expect("20,000 samples") <= 1 << 30);
+}
+
+#[test]
+fn lognormal_samples_have_the_requested_median_and_respect_max() {
+    // Median is a byte size, not a log-space mean: the sample median of
+    // 20,000 draws lies within 1% of 1MB with overwhelming probability,
+    // so a 0.8MB..1.25MB window cannot flake but catches a log-space
+    // regression (e^1048576 or ln(1MB) = 13.9 bytes).
+    let samples = sorted_samples("Type=lognormal,Median=1MB,Sigma=1,Max=1GB", 20_000);
+    let median = samples[samples.len() / 2];
+    assert!(
+        (838_860..=1_310_720).contains(&median),
+        "sample median {median} is not near 1MB"
+    );
+    assert!(*samples.first().expect("20,000 samples") >= 60);
+    assert!(*samples.last().expect("20,000 samples") <= 1 << 30);
 }
 
 #[cfg(unix)]

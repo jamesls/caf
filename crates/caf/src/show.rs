@@ -209,6 +209,51 @@ fn read_raw_header(path: &Path) -> Result<RawHeader> {
     Ok(RawHeader::from_bytes(buffer)?)
 }
 
+/// Human-readable name of the v3 file-identity algorithm.
+const V3_FILE_ID_SCHEME: &str = "CAF-Merkle-BLAKE3-160";
+
+/// Human-readable name of the content algorithm, shared by both formats.
+const CONTENT_SCHEME: &str = "indexed SHAKE-128";
+
+/// Placeholder for descriptor values a valid header never carries.
+const UNRECOGNIZED: &str = "unrecognized";
+
+/// Names the format a descriptor marker selects.
+fn describe_marker(marker: &[u8]) -> &'static str {
+    if marker == b"CAF\x03" {
+        "CAF v3"
+    } else {
+        UNRECOGNIZED
+    }
+}
+
+/// Names a v3 file-ID scheme byte.
+fn describe_file_id_scheme(scheme: u8) -> &'static str {
+    if scheme == 1 {
+        V3_FILE_ID_SCHEME
+    } else {
+        UNRECOGNIZED
+    }
+}
+
+/// Names a v3 content scheme byte.
+fn describe_content_scheme(scheme: u8) -> &'static str {
+    if scheme == 1 {
+        CONTENT_SCHEME
+    } else {
+        UNRECOGNIZED
+    }
+}
+
+/// Renders a block-size log2 byte as a byte count.
+fn describe_block_size(log_2: u8) -> String {
+    if u32::from(log_2) < u64::BITS {
+        commas(1_u64 << log_2)
+    } else {
+        UNRECOGNIZED.to_owned()
+    }
+}
+
 /// Prints the header-diagnostics block.
 fn print_header_diagnostics(
     path: &Path,
@@ -231,6 +276,11 @@ fn print_header_diagnostics(
     }
     println!();
     println!("{} ({HEADER_SIZE} bytes):", style.bold("CAF header"));
+    match checks.format {
+        Some(Format::V2) => println!("  Format version: 2"),
+        Some(Format::V3) => println!("  Format version: 3"),
+        None => println!("  Format version: unknown"),
+    }
     println!("  Parent Hash (0:20): {}", raw.parent());
     println!("    Root: {}", yes_no(Answer::of(raw.is_root())));
     println!("  Content Seed (20:36): {}", raw.content_seed().to_hex());
@@ -242,11 +292,29 @@ fn print_header_diagnostics(
     if checks.format == Some(Format::V3) {
         let descriptor = raw.reserved();
         println!("  Format Descriptor (52:60): {}", hex(&descriptor));
-        println!("    Marker (52:56): {}", hex(&descriptor[..4]));
-        println!("    File-ID scheme (56): {}", descriptor[4]);
-        println!("    Content scheme (57): {}", descriptor[5]);
-        println!("    Block size log2 (58): {}", descriptor[6]);
-        println!("    Flags (59): {}", descriptor[7]);
+        println!(
+            "    Marker (52:56): {} ({})",
+            hex(&descriptor[..4]),
+            describe_marker(&descriptor[..4])
+        );
+        println!(
+            "    File-ID scheme (56): {} ({})",
+            descriptor[4],
+            describe_file_id_scheme(descriptor[4])
+        );
+        println!(
+            "    Content scheme (57): {} ({})",
+            descriptor[5],
+            describe_content_scheme(descriptor[5])
+        );
+        println!(
+            "    Block size log2 (58): {} ({} bytes)",
+            descriptor[6],
+            describe_block_size(descriptor[6])
+        );
+        let flags = descriptor[7];
+        let flags_note = if flags == 0 { "none set" } else { UNRECOGNIZED };
+        println!("    Flags (59): {flags} ({flags_note})");
     } else {
         println!("  Reserved (52:60): {}", hex(&raw.reserved()));
         println!("    All zeros: {}", yes_no(checks.reserved_zero));

@@ -928,6 +928,26 @@ fn dev_show_prints_header_info() {
         assert!(report.contains(field), "missing {field:?}: {report}");
     }
     assert!(!report.contains("File ID ("), "{report}");
+    // The descriptor's scheme bytes are algorithm IDs, not versions, so
+    // the report names them and states the format version outright.
+    assert!(report.contains("Format version: 3"), "{report}");
+    assert!(
+        report.contains("Marker (52:56): 43414603 (CAF v3)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("File-ID scheme (56): 1 (CAF-Merkle-BLAKE3-160)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Content scheme (57): 1 (indexed SHAKE-128)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Block size log2 (58): 20 (1,048,576 bytes)"),
+        "{report}"
+    );
+    assert!(report.contains("Flags (59): 0 (none set)"), "{report}");
 }
 
 #[test]
@@ -987,6 +1007,7 @@ fn dev_show_preserves_v2_header_and_checksum_diagnostics() {
         report.contains("Reserved (52:60): 0000000000000000"),
         "{report}"
     );
+    assert!(report.contains("Format version: 2"), "{report}");
     assert!(report.contains("File checksum (BLAKE2b-160):"), "{report}");
     assert!(report.contains("Matches: yes"), "{report}");
 }

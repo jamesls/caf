@@ -23,6 +23,26 @@ use the older whole-file BLAKE2b-160 identity:
 caf gen --format v2 --max-disk-usage 10MB
 ```
 
+With CAF v3, use a seed to share a command that reproduces the same dataset:
+
+```console
+caf gen --seed blahblah --max-files 100 --file-size 4096 --format v3
+```
+
+In a fresh directory, the same seed and generation arguments produce the same
+file sizes, contents, relative paths, parent links, and CAF metadata across
+releases. The directory and worker count may differ. Seed text is exact UTF-8,
+including whitespace and case; an empty seed is a usage error. Omitting `--seed`
+chooses fresh randomness. Filesystem timestamps, ownership, inode numbers, and
+physical allocation are outside this guarantee. Generation appends to existing
+stores, so reproducing an existing store also requires identical starting
+contents and invocation history.
+
+`--seed` requires CAF v3, the default format; combining it with `--format v2`
+is a usage error. [Seeded dataset generation](docs/generation.md) specifies
+the CAF v3 behavior, including exact statistical size sequences.
+`dev corrupt-file --seed` continues to take an integer.
+
 `caf verify` detects v2 and v3 from each file's 60-byte header. A store may
 contain chains of both versions, but every file in one chain must use the same
 version. Both versions use the same 40-character IDs, sharded data paths,

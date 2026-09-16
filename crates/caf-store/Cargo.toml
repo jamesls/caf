@@ -18,10 +18,11 @@ publish = false
 test-util = []
 
 [dependencies]
+blake3 = { workspace = true }
 caf-format = { workspace = true }
 getrandom = { workspace = true }
-rand = { workspace = true }
-rand_distr = { workspace = true }
+libm = { workspace = true }
+rand_chacha = { workspace = true }
 
 [dev-dependencies]
 # The `examples/` binaries are applications, so they report errors with
@@ -35,6 +36,7 @@ criterion = { workspace = true }
 # Decodes the golden vectors' hex payloads in tests.
 hex = { workspace = true }
 proptest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 

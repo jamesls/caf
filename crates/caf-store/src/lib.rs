@@ -56,12 +56,14 @@
 mod analysis;
 mod env;
 mod generate;
+mod generation_seed;
 mod metadata;
 mod parallel_verify;
 mod parallel_write;
 mod pipeline;
 mod progress;
 mod random;
+mod sampling;
 mod size;
 mod temp;
 mod verify;
@@ -75,6 +77,8 @@ pub use env::MockCtrl;
 pub use generate::{
     DEFAULT_FILE_SIZE, GenerateError, GenerationReport, Generator, GeneratorBuilder,
 };
+#[doc(inline)]
+pub use generation_seed::{GenerationSeed, GenerationSeedError};
 #[doc(inline)]
 pub use progress::OperationProgress;
 #[doc(inline)]

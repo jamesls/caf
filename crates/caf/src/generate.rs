@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use caf_format::Format;
-use caf_store::{Generator, ParseSizeError, SizeSpec, default_jobs, parse_byte_size};
+use caf_store::{
+    GenerationSeed, Generator, ParseSizeError, SizeSpec, default_jobs, parse_byte_size,
+};
 
 use crate::EXIT_FAILURE;
 use crate::progress::{Basis, ProgressBar};
@@ -27,7 +29,7 @@ use crate::util::StoreRoot;
 const DEFAULT_MAX_FILES: u64 = 100;
 
 /// Long help for `caf gen`. Every example runs successfully.
-const LONG_ABOUT: &str = "\
+pub(super) const LONG_ABOUT: &str = "\
 Generate content addressable files.
 
 This command will generate a set of linked, content addressable files.
@@ -42,6 +44,13 @@ the maximum number of files to generate, and indicate that each file
 should be of an exact size:
 
     caf gen --directory /tmp/files --max-files 1000 --file-size 4KB
+
+Use --seed with CAF v3 to reproduce a dataset. In a fresh directory, identical generation
+arguments and seed text produce identical file sizes, contents, relative paths,
+and CAF metadata across releases. Directory and worker count may differ.
+Seed text is used exactly as given; an empty seed or --format v2 is a usage error:
+
+    caf gen --seed blahblah --max-files 100 --file-size 4096 --format v3
 
 The --max-files is one of two stopping conditions.  A stopping
 condition is what indicates when this command should stop generating
@@ -103,7 +112,6 @@ least two 1MB blocks per worker.";
 
 /// Arguments of `caf gen`. There are no short options.
 #[derive(Debug, clap::Args)]
-#[command(long_about = LONG_ABOUT)]
 pub struct Args {
     /// The directory where files will be generated.
     #[arg(long, value_name = "DIRECTORY")]
@@ -112,6 +120,10 @@ pub struct Args {
     /// CAF file format to generate. Version 3 is the default.
     #[arg(long, value_enum, default_value = "v3")]
     format: FormatArg,
+
+    /// Reproduce a CAF v3 dataset from exact, nonempty UTF-8 seed text.
+    #[arg(long, value_name = "TEXT")]
+    seed: Option<GenerationSeed>,
 
     /// The maximum number of files to generate.
     #[arg(
@@ -194,6 +206,13 @@ fn parse_file_size(value: &str) -> Result<SizeSpec, ParseSizeError> {
 
 /// Runs `caf gen`.
 pub fn run(args: &Args) -> ExitCode {
+    if args.seed.is_some() && matches!(args.format, FormatArg::V2) {
+        clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--seed requires --format v3",
+        )
+        .exit();
+    }
     let progress = ProgressBar::new("Generate", Basis::AnyLimit);
     match generate(args, &progress) {
         Ok(()) => {
@@ -231,10 +250,14 @@ fn generate(args: &Args, progress: &Arc<ProgressBar>) -> Result<()> {
     // The spec was validated when it parsed; seeding the sampler can
     // still fail if the operating-system random source does, which is a
     // run failure (exit 1), not a bad value.
-    let sizes = args
-        .file_size
-        .chooser()
-        .context("seeding the file size sampler")?;
+    let sizes = if let Some(seed) = &args.seed {
+        builder = builder.seed(seed.clone());
+        args.file_size.chooser_seeded(seed)
+    } else {
+        args.file_size
+            .chooser()
+            .context("seeding the file size sampler")?
+    };
 
     builder = builder
         .format(args.format.into())

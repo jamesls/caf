@@ -11,9 +11,9 @@
 //! sampled file is ever smaller or larger than the band. A draw outside
 //! the band is discarded and redrawn, which leaves the named distribution
 //! conditioned on the band rather than piling rejected draws onto its
-//! edges. Random streams are not compatible across implementations. The
-//! grammar, parameter meaning, bounds, and statistical behavior are
-//! stable. Unknown or missing distribution parameters are rejected at
+//! edges. Seeded streams follow the CAF v3 generation
+//! contract in `docs/generation.md`, including exact size sequences.
+//! Unknown or missing distribution parameters are rejected at
 //! parse time rather than causing generation to fail later.
 
 use std::backtrace::Backtrace;
@@ -23,12 +23,11 @@ use std::io;
 use std::ops::{Bound, RangeBounds, RangeInclusive};
 use std::str::FromStr;
 
-use rand::rngs::StdRng;
-use rand::{Rng as _, SeedableRng};
-use rand_distr::{Distribution as _, Pareto, StandardNormal};
+use rand_chacha::ChaCha12Rng;
+use rand_chacha::rand_core::SeedableRng;
 
 use crate::generate::MIN_FILE_SIZE;
-use crate::random;
+use crate::{GenerationSeed, random, sampling};
 
 /// Multipliers for the two-character size suffixes. The grammar
 /// matches them case-insensitively against the last two characters of a
@@ -248,7 +247,6 @@ enum SpecKind {
     Pareto {
         alpha: f64,
         band: Band,
-        dist: Pareto<f64>,
     },
 }
 
@@ -414,18 +412,8 @@ impl SizeSpec {
             ));
         }
         let band = Band::new(band)?;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "the scale is a byte count; the sampler works in floating point"
-        )]
-        let scale = band.min as f64;
-        #[expect(
-            clippy::missing_panics_doc,
-            reason = "the scale is at least 60 and alpha is finite and positive, which is all the sampler checks"
-        )]
-        let dist = Pareto::new(scale, alpha).expect("a positive scale and a positive finite shape");
         Ok(Self {
-            kind: SpecKind::Pareto { alpha, band, dist },
+            kind: SpecKind::Pareto { alpha, band },
         })
     }
 
@@ -481,16 +469,17 @@ impl SizeSpec {
                 band,
             } => {
                 if sigma == 0.0 {
-                    return band.contains(median as f64);
+                    // The zero-sigma sampler returns the exact integer median.
+                    return band.min <= median && median <= band.max;
                 }
                 // Include the fractional bytes that truncate to the upper edge.
-                let lower = (band.min as f64 / median as f64).ln() / sigma;
-                let upper = ((band.max as f64 + 1.0) / median as f64).ln() / sigma;
+                let lower = libm::log(band.min as f64 / median as f64) / sigma;
+                let upper = libm::log((band.max as f64 + 1.0) / median as f64) / sigma;
                 normal_mass_lower_bound(lower, upper)
             }
             SpecKind::Pareto { alpha, band, .. } => {
                 // -expm1 avoids cancellation for small alpha or narrow bands.
-                -(alpha * (band.min as f64 / (band.max as f64 + 1.0)).ln()).exp_m1()
+                -libm::expm1(alpha * libm::log(band.min as f64 / (band.max as f64 + 1.0)))
             }
         };
         mass >= MIN_SAMPLE_MASS
@@ -514,33 +503,61 @@ impl SizeSpec {
     /// reported while seeding the sampler. The spec's parameters were
     /// validated when it was built.
     pub fn chooser(&self) -> io::Result<SizeChooser> {
+        if let SpecKind::Fixed(bytes) = self.kind {
+            return Ok(SizeChooser::fixed(bytes));
+        }
+        Ok(self.chooser_with_rng(os_seeded_rng()?))
+    }
+
+    /// Returns a CAF v3'size sampler without drawing operating-system randomness.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::{GenerationSeed, SizeSpec};
+    /// let seed = GenerationSeed::new("example")?;
+    /// let spec = SizeSpec::range(60..=100)?;
+    /// let mut first = spec.chooser_seeded(&seed);
+    /// let mut second = spec.chooser_seeded(&seed);
+    /// assert_eq!(first.next_size()?, second.next_size()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn chooser_seeded(&self, seed: &GenerationSeed) -> SizeChooser {
+        self.chooser_with_rng(ChaCha12Rng::from_seed(seed.size_rng_seed()))
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "distribution sampling uses floating-point byte counts"
+    )]
+    fn chooser_with_rng(&self, rng: ChaCha12Rng) -> SizeChooser {
         let kind = match self.kind {
             SpecKind::Fixed(bytes) => ChooserKind::Fixed(bytes),
-            SpecKind::Range { start, end } => ChooserKind::Range {
-                start,
-                end,
-                rng: os_seeded_rng()?,
-            },
+            SpecKind::Range { start, end } => ChooserKind::Range { start, end, rng },
             SpecKind::LogNormal {
                 median,
                 sigma,
                 band,
             } => ChooserKind::Sampled {
                 spec: self.clone(),
-                sampler: Sampler::lognormal(median, sigma),
+                sampler: Sampler::LogNormal { median, sigma },
                 supported: self.supports_sampling(),
                 band,
-                rng: os_seeded_rng()?,
+                rng,
             },
-            SpecKind::Pareto { band, dist, .. } => ChooserKind::Sampled {
+            SpecKind::Pareto { alpha, band } => ChooserKind::Sampled {
                 spec: self.clone(),
-                sampler: Sampler::Pareto(dist),
+                sampler: Sampler::Pareto {
+                    min: band.min as f64,
+                    inv_neg_alpha: -1.0 / alpha,
+                },
                 supported: self.supports_sampling(),
                 band,
-                rng: os_seeded_rng()?,
+                rng,
             },
         };
-        Ok(SizeChooser { kind })
+        SizeChooser { kind }
     }
 }
 
@@ -712,7 +729,8 @@ fn normal_mass_lower_bound(lower: f64, upper: f64) -> f64 {
         let right = upper.min(-4.0 + f64::from(index + 1) / 8.0);
         if left < right {
             let furthest = left.abs().max(right.abs());
-            let density = (-0.5 * furthest * furthest).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            let density =
+                libm::exp(-0.5 * furthest * furthest) / libm::sqrt(2.0 * std::f64::consts::PI);
             mass += (right - left) * density;
         }
     }
@@ -720,10 +738,10 @@ fn normal_mass_lower_bound(lower: f64, upper: f64) -> f64 {
 }
 
 /// Seeds the sampling RNG from the operating-system random source.
-fn os_seeded_rng() -> io::Result<StdRng> {
-    let mut seed = <StdRng as SeedableRng>::Seed::default();
+fn os_seeded_rng() -> io::Result<ChaCha12Rng> {
+    let mut seed = <ChaCha12Rng as SeedableRng>::Seed::default();
     random::fill(&mut seed)?;
-    Ok(StdRng::from_seed(seed))
+    Ok(ChaCha12Rng::from_seed(seed))
 }
 
 /// Draws one file size per call from a [`SizeSpec`] (or a custom
@@ -743,7 +761,7 @@ enum ChooserKind {
     Range {
         start: u64,
         end: u64,
-        rng: StdRng,
+        rng: ChaCha12Rng,
     },
     Sampled {
         /// The spec the sampler came from, for the unsupported-band error.
@@ -751,7 +769,7 @@ enum ChooserKind {
         sampler: Sampler,
         supported: bool,
         band: Band,
-        rng: StdRng,
+        rng: ChaCha12Rng,
     },
     Custom(Box<dyn FnMut() -> u64 + Send>),
 }
@@ -764,10 +782,13 @@ enum Sampler {
     /// round trip through the logarithm, so `sigma = 0` gives the median
     /// exactly instead of one bit below it.
     LogNormal {
-        median: f64,
+        median: u64,
         sigma: f64,
     },
-    Pareto(Pareto<f64>),
+    Pareto {
+        min: f64,
+        inv_neg_alpha: f64,
+    },
 }
 
 impl Sampler {
@@ -775,20 +796,13 @@ impl Sampler {
         clippy::cast_precision_loss,
         reason = "the median is a byte count; the sampler works in floating point"
     )]
-    fn lognormal(median: u64, sigma: f64) -> Self {
-        Self::LogNormal {
-            median: median as f64,
-            sigma,
-        }
-    }
-
-    fn sample(self, rng: &mut StdRng) -> f64 {
+    fn sample(self, rng: &mut impl rand_chacha::rand_core::RngCore) -> f64 {
         match self {
             Self::LogNormal { median, sigma } => {
-                let z: f64 = StandardNormal.sample(rng);
-                median * (sigma * z).exp()
+                let z = sampling::normal(rng);
+                median as f64 * libm::exp(sigma * z)
             }
-            Self::Pareto(dist) => dist.sample(rng),
+            Self::Pareto { min, inv_neg_alpha } => sampling::pareto(rng, min, inv_neg_alpha),
         }
     }
 }
@@ -833,7 +847,7 @@ impl SizeChooser {
     pub fn next_size(&mut self) -> Result<u64, SampleError> {
         match &mut self.kind {
             ChooserKind::Fixed(bytes) => Ok(*bytes),
-            ChooserKind::Range { start, end, rng } => Ok(rng.random_range(*start..=*end)),
+            ChooserKind::Range { start, end, rng } => Ok(sampling::uniform(rng, *start, *end)),
             ChooserKind::Sampled {
                 spec,
                 sampler,
@@ -867,7 +881,14 @@ impl Debug for SizeChooser {
 /// Draws from a supported band until a truncated sample lands inside it.
 /// Preflight bounds expected work; no per-file retry limit can fail later
 /// and leave a partially generated store.
-fn sample_in_band(sampler: Sampler, band: Band, rng: &mut StdRng) -> u64 {
+fn sample_in_band(
+    sampler: Sampler,
+    band: Band,
+    rng: &mut impl rand_chacha::rand_core::RngCore,
+) -> u64 {
+    if let Sampler::LogNormal { median, sigma: 0.0 } = sampler {
+        return median;
+    }
     loop {
         let sample = sampler.sample(rng);
         // A NaN compares false against both edges and would otherwise
@@ -1386,6 +1407,122 @@ mod tests {
 
     fn one_size(input: &str) -> u64 {
         spec(input).chooser().unwrap().next_size().unwrap()
+    }
+
+    #[test]
+    fn seeded_v3_size_sequences() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/golden/generation-v3.json"))
+                .expect("valid generation vectors");
+        let seed = crate::GenerationSeed::new(vectors["seed"].as_str().expect("seed text"))
+            .expect("nonempty seed");
+        for sequence in vectors["sequences"].as_array().expect("sequences") {
+            let spec = spec(sequence["spec"].as_str().expect("size spec"));
+            let mut chooser = spec.chooser_seeded(&seed);
+            for expected in sequence["sizes"].as_array().expect("expected sizes") {
+                assert_eq!(
+                    chooser.next_size().expect("supported band"),
+                    expected.as_u64().expect("size"),
+                    "{spec}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_truncates_before_testing_the_band_and_rejects_infinity() {
+        use super::{Band, Sampler, sample_in_band};
+        use crate::sampling::tests::Words;
+
+        let band = Band { min: 61, max: 81 };
+        let mut words = Words(vec![((3_u64 << 51) - 1) << 11].into_iter());
+        // U=3/4 gives 81.333..., which must be accepted as 81.
+        assert_eq!(
+            sample_in_band(
+                Sampler::Pareto {
+                    min: 61.0,
+                    inv_neg_alpha: -1.0
+                },
+                band,
+                &mut words
+            ),
+            81
+        );
+        let mut words = Words(vec![0, u64::MAX].into_iter());
+        assert_eq!(
+            sample_in_band(
+                Sampler::Pareto {
+                    min: 61.0,
+                    inv_neg_alpha: -f64::MAX
+                },
+                band,
+                &mut words
+            ),
+            61
+        );
+        assert_eq!(words.0.next(), None);
+    }
+
+    #[test]
+    fn zero_sigma_preserves_integer_precision_and_consumes_no_draws() {
+        use super::{Band, Sampler, sample_in_band};
+        use crate::sampling::tests::Words;
+
+        let mut words = Words(Vec::new().into_iter());
+        for median in [60, (1 << 53) + 1, u64::MAX] {
+            let spec = SizeSpec::lognormal(median, 0.0, 60..=u64::MAX).expect("valid band");
+            assert!(spec.supports_sampling());
+            assert_eq!(
+                sample_in_band(
+                    Sampler::LogNormal { median, sigma: 0.0 },
+                    Band {
+                        min: 60,
+                        max: u64::MAX
+                    },
+                    &mut words
+                ),
+                median
+            );
+        }
+    }
+
+    #[test]
+    fn zero_sigma_checks_integer_band_edges() {
+        let seed = crate::GenerationSeed::new("zero sigma").expect("nonempty seed");
+        for (median, band) in [
+            ((1 << 53) + 1, 60..=(1 << 53)),
+            (1 << 53, ((1 << 53) + 1)..=u64::MAX),
+            (u64::MAX, 60..=(u64::MAX - 1)),
+            (u64::MAX - 2, (u64::MAX - 1)..=u64::MAX),
+        ] {
+            let spec = SizeSpec::lognormal(median, 0.0, band).expect("valid band");
+            for mut chooser in [
+                spec.chooser().expect("OS randomness"),
+                spec.chooser_seeded(&seed),
+            ] {
+                chooser
+                    .next_size()
+                    .expect_err("integer median lies outside the band");
+            }
+        }
+
+        for (median, band) in [
+            ((1 << 53) + 1, ((1 << 53) + 1)..=((1 << 53) + 2)),
+            ((1 << 53) + 1, (1 << 53)..=((1 << 53) + 1)),
+            (u64::MAX - 1, (u64::MAX - 1)..=u64::MAX),
+            (u64::MAX, (u64::MAX - 1)..=u64::MAX),
+        ] {
+            let spec = SizeSpec::lognormal(median, 0.0, band).expect("valid band");
+            for mut chooser in [
+                spec.chooser().expect("OS randomness"),
+                spec.chooser_seeded(&seed),
+            ] {
+                assert_eq!(
+                    chooser.next_size().expect("median lies on a band edge"),
+                    median
+                );
+            }
+        }
     }
 
     fn parse_error(input: &str) -> ParseSizeError {

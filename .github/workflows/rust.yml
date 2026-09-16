@@ -47,6 +47,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+      # Build without test/benchmark dependencies, then execute this exact
+      # binary against the same fixed recipes used by the library tests.
+      - run: cargo build --release --locked -p caf --bin caf
+      - name: Verify production generation vectors
+        run: CAF_RELEASE_BIN="$PWD/target/release/caf" cargo test --locked -p caf --test seeded_generation
 
   docs:
     runs-on: ubuntu-latest

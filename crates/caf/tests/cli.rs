@@ -201,6 +201,74 @@ fn generation_help_lists_both_formats_and_v3_default() {
 }
 
 #[test]
+fn generation_seed_help_and_empty_seed_usage_error() {
+    let help = stdout(&caf(["gen", "--help"]));
+    assert!(help.contains("--seed <TEXT>"));
+    assert!(help.contains("fresh directory"));
+    assert!(help.contains("caf gen --seed blahblah"));
+    let dir = tempdir();
+    let output = generate(dir.path(), &["--seed", "", "--max-files", "1"]);
+    assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("generation seed must not be empty"));
+    assert_eq!(
+        fs::read_dir(dir.path()).expect("read empty store").count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_seed_rejects_invalid_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let output = caf([
+        OsStr::new("gen"),
+        OsStr::new("--seed"),
+        OsStr::from_bytes(b"\xff"),
+    ]);
+    assert_eq!(code(&output), 2);
+}
+
+#[test]
+fn generation_seed_rejects_v2_before_creating_the_directory() {
+    for args in [
+        ["--seed", "example", "--format", "v2", "--max-files", "1"],
+        ["--format", "v2", "--seed", "example", "--max-files", "0"],
+    ] {
+        let dir = tempdir();
+        let root = dir.path().join("must-not-exist");
+        let output = generate(&root, &args);
+        assert_eq!(code(&output), 2);
+        assert!(stderr(&output).contains("--seed requires --format v3"));
+        assert!(!root.exists());
+    }
+}
+
+#[test]
+fn seeded_runs_preserve_exact_text_and_unseeded_runs_remain_random() {
+    let mut contents = Vec::new();
+    for seed in [
+        Some("Seed"),
+        Some("seed"),
+        Some("seed "),
+        Some(" "),
+        Some("é"),
+        Some("e\u{301}"),
+        None,
+        None,
+    ] {
+        let mut args = vec!["--max-files", "1", "--file-size", "60"];
+        if let Some(seed) = seed {
+            args.extend(["--seed", seed]);
+        }
+        let (_dir, files) = store_with(&args);
+        let bytes = fs::read(&files[0]).expect("generated file");
+        assert!(!contents.contains(&bytes));
+        contents.push(bytes);
+    }
+}
+
+#[test]
 fn generation_and_verification_show_the_cpu_aware_jobs_default() {
     let expected = format!("default: {}", default_jobs());
     for command in ["gen", "verify"] {

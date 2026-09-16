@@ -10,8 +10,8 @@ use std::io;
 /// across concurrent processes without shared state. Generation and
 /// verification reach it through [`Env`](crate::env::Env), which a
 /// mocked run replaces; [`SizeSpec::chooser`](crate::SizeSpec::chooser)
-/// calls it directly, since deterministic size sequences already have
-/// [`SizeChooser::from_fn`](crate::SizeChooser::from_fn).
+/// calls it directly. Seeded sizes use
+/// [`SizeSpec::chooser_seeded`](crate::SizeSpec::chooser_seeded) instead.
 pub(crate) fn fill(bytes: &mut [u8]) -> io::Result<()> {
     getrandom::fill(bytes).map_err(io::Error::other)
 }

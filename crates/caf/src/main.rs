@@ -54,6 +54,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Generate content addressable files.
+    #[command(long_about = generate::LONG_ABOUT)]
     Gen(generate::Args),
     /// Verify content addressable files and analyze corruption.
     Verify(verify::Args),

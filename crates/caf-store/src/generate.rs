@@ -39,7 +39,7 @@ use crate::env::Env;
 use crate::progress::{OperationProgress, ProgressCallback, ProgressTracker};
 use crate::size::{SampleError, SizeChooser};
 use crate::temp::TempFile;
-use crate::{MAX_JOBS, default_jobs, metadata, parallel_write};
+use crate::{GenerationSeed, MAX_JOBS, default_jobs, metadata, parallel_write};
 
 /// Default size of generated files in bytes when none is configured.
 ///
@@ -89,9 +89,17 @@ pub struct Generator {
     max_files: Option<u64>,
     max_disk_usage: Option<u64>,
     sizes: SizeChooser,
+    content_seeds: ContentSeeds,
     jobs: NonZeroUsize,
     write_threads: NonZeroUsize,
     progress: Option<ProgressCallback>,
+}
+
+/// Content randomness is independent of size sampling and temporary names.
+#[derive(Debug)]
+enum ContentSeeds {
+    Random,
+    Seeded(GenerationSeed),
 }
 
 impl Generator {
@@ -132,10 +140,15 @@ impl Generator {
     ///
     /// Returns a [`GenerateError`] if a filesystem operation fails, the
     /// operating-system random source fails, or the size chooser finds
-    /// no size inside its band. Data files already renamed into place
+    /// no size inside its band. Seeded generation requires [`Format::V3`];
+    /// using a seed with another format fails before any filesystem access.
+    /// Data files already renamed into place
     /// stay in the store, but a failed run writes no chain-tip marker,
     /// which verification reports.
     pub fn generate(mut self) -> Result<GenerationReport, GenerateError> {
+        if self.format != Format::V3 && matches!(self.content_seeds, ContentSeeds::Seeded(_)) {
+            return Err(GenerateError::new(GenerateErrorKind::UnsupportedSeedFormat));
+        }
         self.env
             .create_dir_all(&self.root)
             .map_err(|source| GenerateError::io("creating the store root", &self.root, source))?;
@@ -156,8 +169,14 @@ impl Generator {
                 .next_size()
                 .map_err(GenerateError::size_selection)?;
             let file_size = requested.max(MIN_FILE_SIZE);
-            parent =
-                self.write_file(parent, file_size, &mut buffer, &mut created_dirs, &progress)?;
+            parent = self.write_file(
+                parent,
+                file_size,
+                files_created,
+                &mut buffer,
+                &mut created_dirs,
+                &progress,
+            )?;
             files_created += 1;
             bytes_written = bytes_written.saturating_add(file_size);
             progress.finish_file();
@@ -206,12 +225,17 @@ impl Generator {
         &self,
         parent: Digest,
         file_size: u64,
+        index: u64,
         buffer: &mut [u8],
         created_dirs: &mut HashSet<PathBuf>,
         progress: &ProgressTracker,
     ) -> Result<Digest, GenerateError> {
-        let seed =
-            ContentSeed::from_bytes(self.env.random_array().map_err(GenerateError::randomness)?);
+        let seed = match &self.content_seeds {
+            ContentSeeds::Random => {
+                ContentSeed::from_bytes(self.env.random_array().map_err(GenerateError::randomness)?)
+            }
+            ContentSeeds::Seeded(seed) => seed.content_seed(index),
+        };
         let header = match self.format {
             Format::V2 => Header::new(parent, seed, file_size),
             Format::V3 => Header::new_v3(FileId::from_bytes(parent.into_inner()), seed, file_size),
@@ -256,7 +280,7 @@ impl Generator {
 
 /// Configures a [`Generator`]; created by [`Generator::builder`].
 ///
-/// All three settings are optional: unset limits leave generation
+/// All settings are optional: unset limits leave generation
 /// unbounded and unset sizes use [`DEFAULT_FILE_SIZE`].
 #[derive(Debug)]
 pub struct GeneratorBuilder {
@@ -273,6 +297,7 @@ impl GeneratorBuilder {
                 max_files: None,
                 max_disk_usage: None,
                 sizes: SizeChooser::fixed(DEFAULT_FILE_SIZE),
+                content_seeds: ContentSeeds::Random,
                 jobs: default_jobs(),
                 write_threads: DEFAULT_WRITE_THREADS,
                 progress: None,
@@ -311,6 +336,30 @@ impl GeneratorBuilder {
     #[must_use]
     pub fn file_sizes(mut self, sizes: SizeChooser) -> Self {
         self.generator.sizes = sizes;
+        self
+    }
+
+    /// Derives CAF v3 content seeds by file index.
+    ///
+    /// For reproducible sizes, also use [`crate::SizeSpec::chooser_seeded`]
+    /// with the same seed. Temporary names still use independent randomness.
+    /// Generation fails if the selected format is not [`Format::V3`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::{GenerationSeed, Generator, SizeSpec};
+    /// let store = tempfile::tempdir()?;
+    /// let seed = GenerationSeed::new("example")?;
+    /// let sizes = SizeSpec::range(60..=100)?.chooser_seeded(&seed);
+    /// let report = Generator::builder(store.path())
+    ///     .seed(seed).file_sizes(sizes).max_files(2).build().generate()?;
+    /// assert_eq!(report.files_created(), 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn seed(mut self, seed: GenerationSeed) -> Self {
+        self.generator.content_seeds = ContentSeeds::Seeded(seed);
         self
     }
 
@@ -544,6 +593,7 @@ struct GenerateErrorInner {
 
 #[derive(Debug)]
 enum GenerateErrorKind {
+    UnsupportedSeedFormat,
     Io {
         action: &'static str,
         path: PathBuf,
@@ -601,12 +651,33 @@ impl GenerateError {
         matches!(self.inner.kind, GenerateErrorKind::SizeSelection { .. })
     }
 
+    /// Returns `true` if seeded generation was requested for a format other than CAF v3.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::{GenerationSeed, Generator};
+    /// let store = tempfile::tempdir()?;
+    /// let error = Generator::builder(store.path())
+    ///     .seed(GenerationSeed::new("example")?)
+    ///     .format(caf_format::Format::V2)
+    ///     .build().generate().expect_err("v2 does not support seeds");
+    /// assert!(error.is_unsupported_seed_format());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn is_unsupported_seed_format(&self) -> bool {
+        matches!(self.inner.kind, GenerateErrorKind::UnsupportedSeedFormat)
+    }
+
     /// Returns the file or directory involved in a filesystem failure.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.inner.kind {
             GenerateErrorKind::Io { path, .. } => Some(path),
-            GenerateErrorKind::Randomness { .. } | GenerateErrorKind::SizeSelection { .. } => None,
+            GenerateErrorKind::Randomness { .. }
+            | GenerateErrorKind::SizeSelection { .. }
+            | GenerateErrorKind::UnsupportedSeedFormat => None,
         }
     }
 }
@@ -614,6 +685,9 @@ impl GenerateError {
 impl Display for GenerateError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.inner.kind {
+            GenerateErrorKind::UnsupportedSeedFormat => {
+                f.write_str("seeded generation requires CAF v3")
+            }
             GenerateErrorKind::Io { action, path, .. } => {
                 write!(f, "{action} at {}", path.display())
             }
@@ -634,6 +708,7 @@ impl std::error::Error for GenerateError {
                 Some(source)
             }
             GenerateErrorKind::SizeSelection { source } => Some(source),
+            GenerateErrorKind::UnsupportedSeedFormat => None,
         }
     }
 }
@@ -712,6 +787,105 @@ mod mocked_tests {
 
     fn jobs(count: usize) -> NonZeroUsize {
         NonZeroUsize::new(count).expect("the tests use positive counts")
+    }
+
+    #[test]
+    fn seeded_v2_is_rejected_before_io_regardless_of_builder_order() {
+        use crate::GenerationSeed;
+        use caf_format::Format;
+
+        for seed_first in [false, true] {
+            for max_files in [0, 1] {
+                let (builder, ctrl) = Generator::builder_mocked("/store");
+                let seed = GenerationSeed::new("v3 only").expect("seed");
+                let builder = if seed_first {
+                    builder.seed(seed).format(Format::V2)
+                } else {
+                    builder.format(Format::V2).seed(seed)
+                };
+                let err = builder
+                    .max_files(max_files)
+                    .file_sizes(SizeChooser::from_fn(|| panic!("must not draw sizes")))
+                    .build()
+                    .generate()
+                    .expect_err("v2 cannot use a seed");
+                assert!(err.is_unsupported_seed_format());
+                assert_eq!(err.to_string(), "seeded generation requires CAF v3");
+                assert_eq!(err.path(), None);
+                assert!(std::error::Error::source(&err).is_none());
+                assert!(ctrl.paths().is_empty(), "no filesystem changes");
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_content_bypasses_mock_randomness_but_temporary_names_use_it() {
+        use crate::GenerationSeed;
+        use std::io;
+
+        let (builder, ctrl) = Generator::builder_mocked("/store");
+        let seed = GenerationSeed::new("mocked generation").expect("seed");
+        // The first four bytes must name the temporary, without a preceding
+        // 16-byte content-seed draw. Fault only this exact temporary path.
+        ctrl.push_random([0x11, 0x22, 0x33, 0x44]);
+        ctrl.fail(
+            "/store/000000000000000011223344",
+            io::ErrorKind::PermissionDenied,
+        );
+        let err = builder
+            .seed(seed)
+            .max_files(1)
+            .build()
+            .generate()
+            .expect_err("temporary creation uses the queued randomness");
+        assert!(err.is_io());
+        assert!(err.to_string().contains("creating a temporary file"));
+    }
+
+    #[test]
+    fn temporary_collision_does_not_change_seeded_output() {
+        use crate::{GenerationSeed, SizeSpec};
+
+        let seed = GenerationSeed::new("mocked generation").expect("seed");
+        let mut baseline = None;
+        for collision in [false, true] {
+            let (builder, ctrl) = Generator::builder_mocked("/store");
+            let existing = Path::new("/store/000000000000000011223344");
+            if collision {
+                ctrl.create_dir_all("/store").expect("root");
+                ctrl.write_file(existing, b"existing temporary".to_vec())
+                    .expect("collision");
+                ctrl.push_random([0x11, 0x22, 0x33, 0x44]);
+            }
+            let sizes = "Type=lognormal,Median=100,Sigma=1,Min=90,Max=110"
+                .parse::<SizeSpec>()
+                .expect("spec")
+                .chooser_seeded(&seed);
+            builder
+                .seed(seed.clone())
+                .file_sizes(sizes)
+                .max_files(3)
+                .build()
+                .generate()
+                .expect("generation");
+            if collision {
+                assert_eq!(
+                    ctrl.read_file(existing).expect("collision untouched"),
+                    b"existing temporary"
+                );
+            }
+            let files: Vec<_> = ctrl
+                .paths()
+                .into_iter()
+                .filter(|path| path != existing)
+                .filter_map(|path| Some((path.clone(), ctrl.read_file(path).ok()?)))
+                .collect();
+            if let Some(expected) = &baseline {
+                assert_eq!(expected, &files);
+            } else {
+                baseline = Some(files);
+            }
+        }
     }
 
     /// Eight blocks over four workers: past the dispatch threshold, so

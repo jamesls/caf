@@ -27,15 +27,17 @@ caf-store = { path = "crates/caf-store" }
 blake2 = "0.10"
 blake3 = "=1.8.2"
 sha3 = "0.10"
-# OS randomness supplies content seeds and temporary names. `rand` and
-# `rand_distr` implement size selection. `tempfile` creates temporary test
+# OS randomness supplies unseeded content seeds and temporary names.
+# ChaCha12 and software libm keep seeded CAF v3 size selection reproducible.
+# `rand` supports dev corruption; `tempfile` creates temporary test
 # stores. All are pure Rust, MIT OR Apache-2.0,
 # MSRV <= 1.85. `rand` stays on 0.9 and `getrandom` on 0.3 (the version
 # inside `rand`): the 0.10/0.4 pair would duplicate `cpufeatures` and
 # `getrandom` in the graph, which the cargo lint policy rejects.
 getrandom = { version = "0.3", features = ["std"] }
 rand = "0.9"
-rand_distr = "0.5"
+rand_chacha = "=0.9.0"
+libm = { version = "=0.2.16", features = ["force-soft-floats"] }
 # CLI parsing uses the `clap` derive interface. It is pure Rust, MIT OR
 # Apache-2.0, and supports Rust 1.74 or newer. Usage errors exit with
 # status 2. The 4.5 series is required because 4.6 currently publishes

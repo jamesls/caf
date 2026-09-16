@@ -1,8 +1,8 @@
 # Golden conformance fixtures
 
 These fixtures define the byte-level behavior of the CAF version 2 and
-version 3 file formats. They are the conformance contract for
-`caf-format` and `caf-store`.
+version 3 file formats and seeded CAF v3 generation. They are the conformance
+contract for `caf-format`, `caf-store`, and seeded CLI generation.
 
 ## Provenance
 
@@ -16,8 +16,20 @@ version 3 file formats. They are the conformance contract for
   3.14.4 and `blake3` 1.0.9 on Linux.
 - The `caf-format` and `caf-store` golden integration tests validate the
   committed artifacts.
+- `generation-v3.json` records outputs from the initial implementation of
+  [seeded CAF v3 generation](../../docs/generation.md), using BLAKE3 1.8.2,
+  ChaCha12 from `rand_chacha` 0.9.0, and `libm` 0.2.16 with
+  `force-soft-floats`. These fixed outputs must survive future implementation
+  and dependency updates; tests never regenerate them.
 
 ## Contents
+
+- `generation-v3.json`: seed derivation, raw size-generator words, exact
+  size sequences, and complete recipes for fixed, range, lognormal, and
+  Pareto sizes in CAF v3. Each recipe pins sizes in creation order,
+  the chain tip, and `.metadata/all`. Files are at least 4 MiB to exercise
+  parallel writing with two workers. `generation.rs` shares recipe loading
+  and store assertions between the library and CLI integration tests.
 
 - `vectors.json`: deterministic v2 file-format vectors. Every vector
   records the parent digest, content seed, file length, encoded 60-byte
@@ -66,3 +78,12 @@ consume them with:
 
     cargo test -p caf-format --test golden --test golden_v3 --test golden_store
     cargo test -p caf-store --test golden_store
+
+Check CAF v3 generation in unit and integration tests, then check the
+production executable built without development dependencies:
+
+```sh
+cargo test --workspace --locked
+cargo build --release --locked -p caf --bin caf
+CAF_RELEASE_BIN="$PWD/target/release/caf" cargo test --locked -p caf --test seeded_generation
+```

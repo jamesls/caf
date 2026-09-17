@@ -182,8 +182,9 @@ impl Verifier {
     ///
     /// Diagnostics appear in deterministic order: per-file
     /// findings in sorted data-file order (byte-wise on the path), then
-    /// orphaned files in the same order, then the chain-tip aggregate
-    /// check. The order does not depend on the [`Verifier::jobs`] count.
+    /// orphaned files in the same order, missing chain tips in digest
+    /// order, then the chain-tip aggregate check. The order does not
+    /// depend on the [`Verifier::jobs`] count.
     ///
     /// # Errors
     ///
@@ -685,7 +686,18 @@ impl StoreChecks {
         marker_set: &HashSet<Digest>,
         store_root: &Path,
     ) -> Vec<Diagnostic> {
-        let chain_findings = self.chain_findings(store_root);
+        let records: HashMap<Digest, Option<Format>> = self
+            .outcomes
+            .iter()
+            .filter_map(|outcome| {
+                let record = &outcome.record;
+                if !record.canonical_path {
+                    return None;
+                }
+                Some((record.digest?, record.format))
+            })
+            .collect();
+        let chain_findings = self.chain_findings(store_root, &records);
         let mut diagnostics = Vec::new();
         for (outcome, finding) in self.outcomes.iter_mut().zip(chain_findings) {
             diagnostics.append(&mut outcome.diagnostics);
@@ -701,6 +713,23 @@ impl StoreChecks {
                 diagnostics.push(Diagnostic::OrphanedFile { path: record.path });
             }
         }
+        // Zero marks an empty generation run, not a missing data file.
+        let mut missing_tips: Vec<Digest> = marker_set
+            .iter()
+            .copied()
+            .filter(|tip| !tip.is_zero() && !records.contains_key(tip))
+            .collect();
+        missing_tips.sort_unstable();
+        for tip in missing_tips {
+            diagnostics.push(Diagnostic::MissingChainTip {
+                path: store_root
+                    .join(METADATA_DIR)
+                    .join(ROOTS_DIR)
+                    .join(tip.to_hex()),
+                tip,
+                tip_path: hash_to_path(store_root, tip),
+            });
+        }
         diagnostics
     }
 
@@ -713,18 +742,11 @@ impl StoreChecks {
     /// full-path hash per child. Only records at their canonical path
     /// enter the map, so another accepted path that decodes to the same
     /// digest can never stand in for the parent.
-    fn chain_findings(&self, store_root: &Path) -> Vec<Option<Diagnostic>> {
-        let records: HashMap<Digest, Option<Format>> = self
-            .outcomes
-            .iter()
-            .filter_map(|outcome| {
-                let record = &outcome.record;
-                if !record.canonical_path {
-                    return None;
-                }
-                Some((record.digest?, record.format))
-            })
-            .collect();
+    fn chain_findings(
+        &self,
+        store_root: &Path,
+        records: &HashMap<Digest, Option<Format>>,
+    ) -> Vec<Option<Diagnostic>> {
         self.outcomes
             .iter()
             .map(|outcome| {
@@ -944,6 +966,16 @@ pub enum Diagnostic {
         /// Where the parent would live in this store.
         parent_path: PathBuf,
     },
+    /// A nonzero chain-tip marker names a missing data file
+    /// (severity `CORRUPTION`).
+    MissingChainTip {
+        /// The marker naming the missing chain tip.
+        path: PathBuf,
+        /// The missing chain tip's digest.
+        tip: Digest,
+        /// Where the chain tip would live in this store.
+        tip_path: PathBuf,
+    },
     /// A child and its resolved parent use different CAF versions
     /// (severity `ERROR`). Stores may contain both versions, but one
     /// chain must be homogeneous.
@@ -987,6 +1019,7 @@ impl Diagnostic {
             | Self::SizeMismatch { .. }
             | Self::DigestMismatch { .. }
             | Self::MissingParent { .. }
+            | Self::MissingChainTip { .. }
             | Self::RootsMismatch { .. } => Severity::Corruption,
             Self::OrphanedFile { .. } => Severity::Orphan,
         }
@@ -1000,6 +1033,7 @@ impl Diagnostic {
             | Self::InvalidHeader { path, .. }
             | Self::SizeMismatch { path, .. }
             | Self::MissingParent { path, .. }
+            | Self::MissingChainTip { path, .. }
             | Self::ChainFormatMismatch { path, .. }
             | Self::OrphanedFile { path }
             | Self::RootsMismatch { path, .. } => path,

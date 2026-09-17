@@ -701,6 +701,23 @@ fn verify_failure_after_deleting_a_file() {
 }
 
 #[test]
+fn verify_rejects_a_deleted_chain() {
+    for format in ["v2", "v3"] {
+        let (dir, files) = store_with(&["--format", format, "--max-files", "1"]);
+        fs::remove_file(&files[0]).expect("delete the chain's only file");
+
+        for jobs in ["1", "8"] {
+            let output = verify(dir.path(), &["--jobs", jobs]);
+            assert_eq!(code(&output), 1, "{format}: {}", stdout(&output));
+            assert!(stderr(&output).contains("CORRUPTION: Chain tip not found:"));
+            assert!(stderr(&output).contains(&files[0].display().to_string()));
+            assert!(stdout(&output).contains("Verification failed"));
+            assert!(!stdout(&output).contains("All files successfully verified"));
+        }
+    }
+}
+
+#[test]
 fn verify_non_store_directory_fails() {
     let dir = tempdir();
     let output = verify(dir.path(), &[]);

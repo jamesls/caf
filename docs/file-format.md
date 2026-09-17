@@ -272,4 +272,6 @@ A CAF data file is valid when all applicable checks pass:
 8. A nonzero parent identifies an existing file of the same CAF version.
 
 Store verification also checks chain-tip markers, unreferenced files, and the
-unchanged `.metadata/all` aggregate.
+unchanged `.metadata/all` aggregate. Every nonzero chain-tip marker must identify
+a data file at its canonical store path. An all-zero marker represents an empty
+generation run and requires no data file, even alongside nonempty chains.

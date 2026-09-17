@@ -72,6 +72,9 @@ fn message(diagnostic: &Diagnostic) -> String {
         Diagnostic::MissingParent { parent_path, .. } => {
             format!("Parent hash not found: {}", parent_path.display())
         }
+        Diagnostic::MissingChainTip { tip_path, .. } => {
+            format!("Chain tip not found: {}", tip_path.display())
+        }
         Diagnostic::ChainFormatMismatch {
             path,
             parent_path,

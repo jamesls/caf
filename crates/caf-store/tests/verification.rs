@@ -490,13 +490,17 @@ fn four_level_layout_is_reported_and_orphaned() {
     let report = verify(store.path());
     assert!(!report.success());
     assert_eq!(report.files_checked(), 1);
-    let [layout, orphan] = report.diagnostics() else {
-        panic!("exactly two diagnostics: {:?}", report.diagnostics());
+    let [layout, orphan, missing_tip] = report.diagnostics() else {
+        panic!("exactly three diagnostics: {:?}", report.diagnostics());
     };
     assert!(matches!(layout, Diagnostic::InvalidPathLayout { path } if path == &file));
     assert_eq!(layout.severity(), Severity::Error);
     assert!(matches!(orphan, Diagnostic::OrphanedFile { path } if path == &file));
     assert_eq!(orphan.severity(), Severity::Orphan);
+    assert!(
+        matches!(missing_tip, Diagnostic::MissingChainTip { tip, tip_path, .. }
+        if tip.to_hex() == hex && tip_path == &hash_to_path(store.path(), *tip))
+    );
 }
 
 #[test]
@@ -1171,6 +1175,75 @@ fn non_utf8_file_name_is_loudly_reported() {
 }
 
 #[test]
+fn deleted_chains_report_missing_tips_in_digest_order() {
+    for format in [Format::V2, Format::V3] {
+        for surviving_files in [0, 2] {
+            let store = tempfile::tempdir().expect("create temp store");
+            let mut tips = Vec::new();
+            for files in [1, 3] {
+                let generated = Generator::builder(store.path())
+                    .format(format)
+                    .max_files(files)
+                    .file_sizes(SizeChooser::fixed(512))
+                    .build()
+                    .generate()
+                    .expect("generation succeeds");
+                tips.push(generated.chain_tip());
+            }
+            assert!(verify(store.path()).success());
+            for path in data_files(store.path()) {
+                fs::remove_file(path).expect("delete both chains, preserving metadata");
+            }
+            generate(store.path(), surviving_files, 1024);
+            tips.sort_unstable();
+
+            let report = Verifier::new(store.path())
+                .jobs(positive(1))
+                .verify()
+                .expect("verification runs");
+            assert!(!report.success());
+            assert_eq!(report.files_checked(), surviving_files);
+            assert_eq!(report.diagnostics().len(), 2);
+            for (diagnostic, expected) in report.diagnostics().iter().zip(tips) {
+                let marker = store.path().join(".metadata/roots").join(expected.to_hex());
+                assert!(matches!(
+                    diagnostic,
+                    Diagnostic::MissingChainTip { path, tip, tip_path }
+                        if path == &marker && *tip == expected
+                            && tip_path == &hash_to_path(store.path(), expected)
+                ));
+                assert_eq!(diagnostic.path(), marker);
+                assert_eq!(diagnostic.severity(), Severity::Corruption);
+            }
+            assert_matches_serial(store.path(), &report, 8);
+        }
+    }
+}
+
+#[test]
+fn chain_tip_must_exist_at_its_canonical_path() {
+    let store = tempfile::tempdir().expect("create temp store");
+    let generated = generate(store.path(), 1, 512);
+    let tip = generated.chain_tip();
+    let canonical = hash_to_path(store.path(), tip);
+    let misplaced = store.path().join("nested").join(hash_to_relpath(tip));
+    fs::create_dir_all(misplaced.parent().expect("hash paths have parents"))
+        .expect("create nested shard directories");
+    fs::rename(&canonical, &misplaced).expect("move the chain tip");
+
+    let report = verify(store.path());
+    assert!(!report.success());
+    let [diagnostic] = report.diagnostics() else {
+        panic!("expected one missing tip: {:?}", report.diagnostics());
+    };
+    assert!(
+        matches!(diagnostic, Diagnostic::MissingChainTip { tip_path, .. }
+        if tip_path == &canonical)
+    );
+    assert_matches_serial(store.path(), &report, 8);
+}
+
+#[test]
 fn zero_file_store_verifies() {
     // The zero-file store (all-zero chain tip) is clean.
     let store = tempfile::tempdir().expect("create temp store");
@@ -1182,6 +1255,12 @@ fn zero_file_store_verifies() {
     let report = verify(store.path());
     assert!(report.success());
     assert_eq!(report.files_checked(), 0);
+
+    generate(store.path(), 2, 512);
+    let report = verify(store.path());
+    assert!(report.success(), "{:?}", report.diagnostics());
+    assert_eq!(report.files_checked(), 2);
+    assert_matches_serial(store.path(), &report, 8);
 }
 
 #[test]

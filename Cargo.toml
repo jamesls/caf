@@ -7,8 +7,7 @@ members = [
 ]
 
 [workspace.package]
-# CAF v3 is additive; the version 2 on-disk format remains unchanged.
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 # Rust 1.85 is the minimum version that supports edition 2024. CI builds
 # with it on every supported platform.

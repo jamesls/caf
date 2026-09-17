@@ -177,7 +177,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "caf"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "caf-format"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "blake2",
  "blake3",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "caf-store"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blake3",

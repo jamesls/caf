@@ -848,11 +848,12 @@ fn append_size_region(regions: &mut Vec<CorruptionRegion>, actual_size: u64, exp
 /// Appends `region`, merging it into the previous region when they are
 /// contiguous and carry an identical pattern. The earlier pattern is kept.
 fn push_region(regions: &mut Vec<CorruptionRegion>, region: CorruptionRegion) {
-    if let Some(last) = regions.last_mut() {
-        if last.end() == region.offset && last.pattern == region.pattern {
-            last.size += region.size;
-            return;
-        }
+    if let Some(last) = regions.last_mut()
+        && last.end() == region.offset
+        && last.pattern == region.pattern
+    {
+        last.size += region.size;
+        return;
     }
     regions.push(region);
 }
@@ -875,10 +876,10 @@ fn classify_chunk(actual: &[u8], expected: &[u8]) -> CorruptionPattern {
     if actual.iter().all(|&byte| byte == 0) {
         return CorruptionPattern::ZeroFilled;
     }
-    if let Some((&first, rest)) = actual.split_first() {
-        if rest.iter().all(|&byte| byte == first) {
-            return CorruptionPattern::RepeatedByte { value: first };
-        }
+    if let Some((&first, rest)) = actual.split_first()
+        && rest.iter().all(|&byte| byte == first)
+    {
+        return CorruptionPattern::RepeatedByte { value: first };
     }
 
     // Only the count and the first few positions are ever used, so the

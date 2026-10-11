@@ -165,7 +165,7 @@ fn parse_identity_from_path(path: impl AsRef<Path>) -> Result<[u8; Digest::SIZE]
     let (shards, tail) = bytes.split_at_mut(SHARD_LEVELS * SHARD_BYTES);
     for (index, (shard, slot)) in [s1, s2, s3]
         .into_iter()
-        .zip(shards.chunks_exact_mut(SHARD_BYTES))
+        .zip(shards.as_chunks_mut::<SHARD_BYTES>().0)
         .enumerate()
     {
         slot.copy_from_slice(&decode_component::<SHARD_BYTES>(shard, index)?);

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use caf_format::Format;
 use caf_store::{
     GenerationSeed, Generator, ParseSizeError, SizeSpec, default_jobs, parse_byte_size,
@@ -74,8 +74,8 @@ files that have a random size between 4048KB and 10MB:
 Instead of specifying a range of file sizes, you can also specify a
 random distribution that the file sizes should follow.  Every
 distribution is sampled inside a band from Min to Max.  Min defaults
-to 60 bytes, the header size.  Max is required because both
-distributions have heavy tails.  A sample outside the band is redrawn,
+to 60 bytes, the header size.  Max is required to bound file sizes.
+A sample outside the band is redrawn,
 so no file is ever larger than Max.  Before sampling, a conservative
 probability bound must show that the band holds at least 0.5% of the
 distribution; unsupported bands fail before any files are written.
@@ -98,6 +98,27 @@ keeps half the files under 7KB while about one in 800 exceeds 1MB:
 
 Parameter values accept decimals with a size suffix (1.5MB) and plain
 decimals for Sigma and Alpha.
+
+A normal distribution takes Mean and StdDev in bytes.  These describe
+the underlying normal; restricting it to Min and Max can shift the
+observed mean and spread.  StdDev=0 returns exactly Mean when in bounds:
+
+    caf gen --file-size Type=normal,Mean=128MB,StdDev=16MB,Max=256MB
+
+Repeat --file-size to mix any number of independently configured size
+distributions.  Each file selects one distribution, then samples it.
+Weights default to 1 (equal probability).  Set Weight to any finite,
+positive number to control relative probability by file count, not
+byte share or exact quotas.  Use Size for a weighted fixed size or range:
+
+    caf gen --file-size 128KB --file-size 128MB
+    caf gen --file-size Weight=9,Size=128KB --file-size Weight=1,Size=128MB
+    caf gen --file-size Weight=9,Size=128KB --file-size Weight=1,Type=normal,Mean=128MB,StdDev=16MB,Max=256MB
+
+Rejection sampling stays within the selected distribution; its bounds
+do not change the mixture weights.  Every component is checked before
+any files are written.  KB and MB mean KiB and MiB.  A 9:1 mix of exact
+128KB and 128MB files puts approximately 99.1% of bytes in large files.
 
 Writing one very large file is normally limited by the single core
 generating its content.  The --jobs option spreads that work over
@@ -141,15 +162,16 @@ pub struct Args {
     /// The size of the files that are generated.  Value is either in
     /// bytes or can be suffixed with kb, mb, gb, etc.  Suffix is case
     /// insensitive (we know what you mean).  A random distribution
-    /// (Type=lognormal or Type=pareto) is sampled between Min and Max;
-    /// see --help for the full grammar.
+    /// (Type=normal, Type=lognormal or Type=pareto) is sampled between Min and Max.
+    /// Repeat to form a mixture; optional Weight defaults to 1 per specification.
+    /// See --help for the full grammar.
     #[arg(
         long,
         value_name = "FILESIZE",
         default_value = "4096",
         value_parser = parse_file_size
     )]
-    file_size: SizeSpec,
+    file_size: Vec<FileSize>,
 
     /// Number of worker threads used to generate each file's content.
     /// Defaults to a CPU-aware worker budget; the files produced are
@@ -200,8 +222,43 @@ fn parse_disk_usage(value: &str) -> Result<u64, ParseSizeError> {
 
 /// Parses `--file-size` with the fixed, range, and distribution
 /// grammar; parse failures are usage errors (exit 2).
-fn parse_file_size(value: &str) -> Result<SizeSpec, ParseSizeError> {
-    value.parse()
+fn parse_file_size(value: &str) -> Result<FileSize> {
+    let mut weight = "1";
+    let mut size = None;
+    let mut distribution = Vec::new();
+    for item in value.split(',') {
+        if let Some(value) = item.strip_prefix("Weight=") {
+            weight = value;
+        } else if let Some(value) = item.strip_prefix("Size=") {
+            size = Some(value);
+        } else {
+            distribution.push(item);
+        }
+    }
+    let weight: f64 = weight
+        .parse()
+        .context("Weight must be a finite number greater than zero")?;
+    ensure!(
+        weight.is_finite() && weight > 0.0,
+        "Weight must be a finite number greater than zero"
+    );
+    let spec = if let Some(size) = size {
+        ensure!(
+            distribution.is_empty(),
+            "Size cannot be combined with distribution parameters"
+        );
+        size.parse()?
+    } else {
+        distribution.join(",").parse()?
+    };
+    Ok(FileSize { weight, spec })
+}
+
+/// One occurrence of --file-size and its relative mixture weight.
+#[derive(Clone, Debug)]
+struct FileSize {
+    weight: f64,
+    spec: SizeSpec,
 }
 
 /// Runs `caf gen`.
@@ -250,13 +307,16 @@ fn generate(args: &Args, progress: &Arc<ProgressBar>) -> Result<()> {
     // The spec was validated when it parsed; seeding the sampler can
     // still fail if the operating-system random source does, which is a
     // run failure (exit 1), not a bad value.
+    let spec = SizeSpec::mixture(
+        args.file_size
+            .iter()
+            .map(|size| (size.weight, size.spec.clone())),
+    )?;
     let sizes = if let Some(seed) = &args.seed {
         builder = builder.seed(seed.clone());
-        args.file_size.chooser_seeded(seed)
+        spec.chooser_seeded(seed)
     } else {
-        args.file_size
-            .chooser()
-            .context("seeding the file size sampler")?
+        spec.chooser().context("seeding the file size sampler")?
     };
 
     builder = builder

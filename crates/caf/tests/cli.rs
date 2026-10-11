@@ -387,10 +387,7 @@ fn removed_distribution_types_name_their_replacement() {
     );
     assert_eq!(code(&output), 2);
     assert!(
-        stderr(&output).contains(
-            "Type normal was removed; use a range such as 19MB-21MB, or \
-             Type=lognormal,Median=<bytes>,Sigma=<number>,Max=<bytes>"
-        ),
+        stderr(&output).contains("missing parameter Max for Type=normal"),
         "{}",
         stderr(&output)
     );
@@ -443,7 +440,7 @@ fn unsupported_band_is_a_run_failure() {
         "{}",
         stderr(&output)
     );
-    assert!(data_files(dir.path()).is_empty());
+    assert_eq!(data_files(dir.path()), [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -456,7 +453,7 @@ fn low_mass_bands_fail_before_writing_files() {
         let output = generate(dir.path(), &["--max-files", "100", "--file-size", input]);
         assert_eq!(code(&output), 1, "{}", stderr(&output));
         assert!(stderr(&output).contains("insufficient probability mass"));
-        assert!(data_files(dir.path()).is_empty());
+        assert_eq!(data_files(dir.path()), [] as [std::path::PathBuf; 0]);
     }
 }
 
@@ -550,6 +547,85 @@ fn file_size_below_header_is_clamped_to_60() {
 }
 
 // --- distribution grammar ---------------------------------------------
+
+#[test]
+fn repeated_file_sizes_mix_independent_populations() {
+    for specs in [
+        vec!["128KB", "256KB"],
+        vec![
+            "Weight=9,Size=128KB",
+            "Type=normal,Mean=256KB,StdDev=16KB,Min=200KB,Max=300KB",
+        ],
+        vec![
+            "Size=128KB,Weight=2",
+            "Weight=3,Size=200KB-220KB",
+            "Weight=1,Type=normal,Mean=280KB,StdDev=4KB,Min=260KB,Max=300KB",
+        ],
+    ] {
+        let mut args = vec!["--max-files", "100", "--seed", "mixture"];
+        for spec in &specs {
+            args.extend(["--file-size", spec]);
+        }
+        let (dir, files) = store_with(&args);
+        let sizes = sizes_of(&files);
+        assert_eq!(sizes.len(), 100);
+        assert!(sizes.contains(&131_072));
+        assert!(sizes.iter().any(|size| *size > 131_072));
+        assert!(
+            sizes
+                .iter()
+                .all(|size| *size == 131_072 || (200 * 1024..=300 * 1024).contains(size))
+        );
+        if specs.len() == 3 {
+            assert!(
+                sizes
+                    .iter()
+                    .any(|size| (200 * 1024..=220 * 1024).contains(size))
+            );
+            assert!(
+                sizes
+                    .iter()
+                    .any(|size| (260 * 1024..=300 * 1024).contains(size))
+            );
+        }
+        let output = verify(dir.path(), &[]);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+    }
+}
+
+#[test]
+fn invalid_mixture_components_fail_before_writing() {
+    for spec in [
+        "Weight=0,Size=128KB",
+        "Weight=-1,Size=128KB",
+        "Weight=NaN,Size=128KB",
+        "Weight=inf,Size=128KB",
+        "Weight=1MB,Size=128KB",
+        "Weight=1",
+        "Weight=1,Size=128KB,Type=normal",
+        "Size=128KB,Foo=1",
+    ] {
+        let dir = tempdir();
+        let output = generate(dir.path(), &["--file-size", "128KB", "--file-size", spec]);
+        assert_eq!(code(&output), 2, "{spec}: {}", stderr(&output));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    let dir = tempdir();
+    let output = generate(
+        dir.path(),
+        &[
+            "--seed",
+            "mixture",
+            "--file-size",
+            "128KB",
+            "--file-size",
+            "Weight=1e-100,Type=normal,Mean=128MB,StdDev=1KB,Max=1MB",
+        ],
+    );
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(stderr(&output).contains("insufficient probability mass"));
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
 
 #[test]
 fn lognormal_distribution_grammar_is_byte_space() {
@@ -1273,6 +1349,7 @@ fn help_examples_run_successfully() {
         "Type=lognormal,Median=1MB,Sigma=1,Max=1GB",
         "Type=lognormal,Median=20MB,Sigma=0.05,Max=30MB",
         "Type=pareto,Min=4KB,Max=1GB,Alpha=1.2",
+        "Type=normal,Mean=128MB,StdDev=16MB,Max=256MB",
     ] {
         let dir = tempdir();
         let output = generate(dir.path(), &["--max-files", "1", "--file-size", spec]);

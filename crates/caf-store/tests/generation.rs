@@ -304,7 +304,7 @@ fn zero_files_writes_the_zero_chain_tip() {
     assert_eq!(report.format(), Format::V3);
     assert_eq!(report.chain_tip(), Digest::ZERO);
     assert_eq!(report.chain_tip_file_id(), Some(FileId::ZERO));
-    assert!(data_files(store.path()).is_empty());
+    assert_eq!(data_files(store.path()), [] as [PathBuf; 0]);
     assert_eq!(chain_tip_markers(store.path()), vec!["0".repeat(40)]);
 
     let golden = golden_zero_file_all_digest();

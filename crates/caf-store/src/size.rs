@@ -6,7 +6,7 @@
 //! the `Type=…` distribution shorthand. [`SizeSpec`] is the parsed
 //! grammar; [`SizeChooser`] draws one size per file from it.
 //!
-//! Every distribution is sampled inside a closed band. Its lower edge is
+//! Continuous distributions are sampled inside a closed band. Its lower edge is
 //! at least the 60-byte header and its upper edge is required, so no
 //! sampled file is ever smaller or larger than the band. A draw outside
 //! the band is discarded and redrawn, which leaves the named distribution
@@ -14,7 +14,8 @@
 //! edges. Seeded streams follow the CAF v3 generation
 //! contract in `docs/generation.md`, including exact size sequences.
 //! Unknown or missing distribution parameters are rejected at
-//! parse time rather than causing generation to fail later.
+//! parse time rather than causing generation to fail later. Mixtures choose
+//! a weighted component first, then sample using that component's own bounds.
 
 use std::backtrace::Backtrace;
 use std::error::Error;
@@ -24,7 +25,7 @@ use std::ops::{Bound, RangeBounds, RangeInclusive};
 use std::str::FromStr;
 
 use rand_chacha::ChaCha12Rng;
-use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::rand_core::{RngCore, SeedableRng};
 
 use crate::generate::MIN_FILE_SIZE;
 use crate::{GenerationSeed, random, sampling};
@@ -204,8 +205,8 @@ fn parse_number(name: &'static str, value: &str) -> Result<f64, ParseSizeError> 
 /// directly with the constructors. Every constructor validates its
 /// arguments, so a `SizeSpec` always describes a samplable distribution;
 /// [`SizeSpec::chooser`] then draws the sampler's random seed. The
-/// [`Display`] form is the canonical shorthand, which parses back to an
-/// equal spec.
+/// [`Display`] form is the canonical shorthand for individual distributions.
+/// Mixtures display their weighted components for diagnostics, not parsing.
 ///
 /// # Examples
 ///
@@ -228,7 +229,7 @@ pub struct SizeSpec {
 /// The validated forms. Distributions keep the parameters the canonical
 /// form prints; the check happens once, in the constructor, so a spec
 /// always describes a samplable distribution.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum SpecKind {
     Fixed(u64),
     /// Invariant: `start <= end`.
@@ -248,6 +249,12 @@ enum SpecKind {
         alpha: f64,
         band: Band,
     },
+    Normal {
+        mean: u64,
+        std_dev: u64,
+        band: Band,
+    },
+    Mixture(Vec<(f64, SizeSpec)>),
 }
 
 /// The closed `[min, max]` band a distribution is sampled inside.
@@ -417,6 +424,84 @@ impl SizeSpec {
         })
     }
 
+    /// Normal sizes with byte-valued mean and standard deviation, conditioned on `band`.
+    ///
+    /// Bounds can shift the observed mean and standard deviation. A zero
+    /// standard deviation returns the exact mean if it lies inside the band.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::SizeSpec;
+    /// let spec = SizeSpec::normal(128 << 20, 16 << 20, 60..=(256 << 20))?;
+    /// assert_eq!(spec, "Type=normal,Mean=128MB,StdDev=16MB,Max=256MB".parse()?);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SizeSpecError`] if the band starts below 60 bytes or
+    /// does not contain at least two sizes. Insufficient acceptance mass
+    /// is reported by the chooser before returning any size.
+    pub fn normal(
+        mean: u64,
+        std_dev: u64,
+        band: RangeInclusive<u64>,
+    ) -> Result<Self, SizeSpecError> {
+        Ok(Self {
+            kind: SpecKind::Normal {
+                mean,
+                std_dev,
+                band: Band::new(band)?,
+            },
+        })
+    }
+
+    /// Selects a distribution independently for each file using relative weights.
+    ///
+    /// Weights describe file-count probabilities, not byte shares or quotas.
+    /// A single component is returned unchanged, preserving its seeded stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use caf_store::SizeSpec;
+    /// let spec = SizeSpec::mixture([
+    ///     (9.0, SizeSpec::fixed(128 << 10)),
+    ///     (1.0, SizeSpec::normal(128 << 20, 16 << 20, 60..=(256 << 20))?),
+    /// ])?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SizeSpecError`] for no components or a nonpositive or
+    /// nonfinite weight. Every component must support sampling before the
+    /// chooser can return any size, even components with very small weights.
+    pub fn mixture(
+        components: impl IntoIterator<Item = (f64, Self)>,
+    ) -> Result<Self, SizeSpecError> {
+        let components: Vec<_> = components.into_iter().collect();
+        if components.is_empty() {
+            return Err(SizeSpecError::invalid_parameter("Components", "nonempty"));
+        }
+        if components
+            .iter()
+            .any(|(weight, _)| !weight.is_finite() || *weight <= 0.0)
+        {
+            return Err(SizeSpecError::invalid_parameter(
+                "Weight",
+                "finite and greater than zero",
+            ));
+        }
+        if let [(_, spec)] = components.as_slice() {
+            return Ok(spec.clone());
+        }
+        Ok(Self {
+            kind: SpecKind::Mixture(components),
+        })
+    }
+
     /// Parses the `--file-size` grammar, trying shapes in this order:
     /// plain integer, distribution shorthand (contains
     /// `,`), inclusive range (contains `-`), then suffixed or decimal
@@ -463,6 +548,22 @@ impl SizeSpec {
     fn supports_sampling(&self) -> bool {
         let mass = match self.kind {
             SpecKind::Fixed(_) | SpecKind::Range { .. } => return true,
+            SpecKind::Mixture(ref components) => {
+                return components.iter().all(|(_, spec)| spec.supports_sampling());
+            }
+            SpecKind::Normal {
+                mean,
+                std_dev,
+                band,
+            } => {
+                if std_dev == 0 {
+                    return band.min <= mean && mean <= band.max;
+                }
+                normal_mass_lower_bound(
+                    (band.min as f64 - mean as f64) / std_dev as f64,
+                    (band.max as f64 + 1.0 - mean as f64) / std_dev as f64,
+                )
+            }
             SpecKind::LogNormal {
                 median,
                 sigma,
@@ -483,6 +584,22 @@ impl SizeSpec {
             }
         };
         mass >= MIN_SAMPLE_MASS
+    }
+
+    fn unsupported_band(&self) -> Option<(Self, Band)> {
+        match &self.kind {
+            SpecKind::Mixture(components) => components
+                .iter()
+                .find_map(|(_, spec)| spec.unsupported_band()),
+            SpecKind::Normal { band, .. }
+            | SpecKind::LogNormal { band, .. }
+            | SpecKind::Pareto { band, .. }
+                if !self.supports_sampling() =>
+            {
+                Some((self.clone(), *band))
+            }
+            _ => None,
+        }
     }
 
     /// Returns a sampler for this spec.
@@ -531,10 +648,47 @@ impl SizeSpec {
         clippy::cast_precision_loss,
         reason = "distribution sampling uses floating-point byte counts"
     )]
-    fn chooser_with_rng(&self, rng: ChaCha12Rng) -> SizeChooser {
+    fn chooser_with_rng(&self, mut rng: ChaCha12Rng) -> SizeChooser {
         let kind = match self.kind {
             SpecKind::Fixed(bytes) => ChooserKind::Fixed(bytes),
             SpecKind::Range { start, end } => ChooserKind::Range { start, end, rng },
+            SpecKind::Mixture(ref components) => {
+                // Scale before summing so finite weights cannot overflow the total.
+                let largest = components
+                    .iter()
+                    .map(|(weight, _)| *weight)
+                    .fold(0.0_f64, f64::max);
+                let mut total = 0.0;
+                let components = components
+                    .iter()
+                    .map(|(weight, spec)| {
+                        total += weight / largest;
+                        // Independent component streams; selection is unaffected by rejection.
+                        let mut seed = [0; 32];
+                        for chunk in seed.as_chunks_mut::<8>().0 {
+                            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+                        }
+                        (total, spec.chooser_with_rng(ChaCha12Rng::from_seed(seed)))
+                    })
+                    .collect();
+                ChooserKind::Mixture {
+                    components,
+                    total,
+                    unsupported: self.unsupported_band(),
+                    rng,
+                }
+            }
+            SpecKind::Normal {
+                mean,
+                std_dev,
+                band,
+            } => ChooserKind::Sampled {
+                spec: self.clone(),
+                sampler: Sampler::Normal { mean, std_dev },
+                supported: self.supports_sampling(),
+                band,
+                rng,
+            },
             SpecKind::LogNormal {
                 median,
                 sigma,
@@ -572,12 +726,31 @@ impl FromStr for SizeSpec {
 /// The canonical shorthand: byte values as integers, defaults filled
 /// in, and `Sigma` and `Alpha` in Rust's default `f64` formatting, so
 /// `2` prints as `2` and `1.5` as `1.5`. Parsing the output gives back
-/// an equal spec.
+/// an equal spec, except for mixtures, which display a diagnostic list.
 impl Display for SizeSpec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.kind {
             SpecKind::Fixed(bytes) => write!(f, "{bytes}"),
             SpecKind::Range { start, end } => write!(f, "{start}-{end}"),
+            SpecKind::Normal {
+                mean,
+                std_dev,
+                band,
+            } => write!(
+                f,
+                "Type=normal,Mean={mean},StdDev={std_dev},Min={},Max={}",
+                band.min, band.max
+            ),
+            SpecKind::Mixture(ref components) => {
+                f.write_str("Mixture[")?;
+                for (index, (weight, spec)) in components.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "Weight={weight},{spec}")?;
+                }
+                f.write_str("]")
+            }
             SpecKind::LogNormal {
                 median,
                 sigma,
@@ -601,6 +774,7 @@ impl Display for SizeSpec {
 /// prints them.
 const LOGNORMAL_KEYS: [&str; 4] = ["Median", "Sigma", "Min", "Max"];
 const PARETO_KEYS: [&str; 3] = ["Min", "Max", "Alpha"];
+const NORMAL_KEYS: [&str; 4] = ["Mean", "StdDev", "Min", "Max"];
 
 /// Parses the `Type=<type>,Key=Value,…` distribution shorthand.
 fn parse_shorthand(input: &str) -> Result<SizeSpec, ParseSizeError> {
@@ -646,9 +820,12 @@ fn parse_shorthand(input: &str) -> Result<SizeSpec, ParseSizeError> {
             }));
         }
         "normal" => {
-            return Err(ParseSizeError::new(ParseSizeErrorKind::RemovedType {
-                name: "normal",
-            }));
+            let params = Params::new("normal", &NORMAL_KEYS, &params)?;
+            SizeSpec::normal(
+                params.bytes("Mean")?,
+                params.bytes("StdDev")?,
+                params.optional_bytes("Min")?.unwrap_or(MIN_FILE_SIZE)..=params.bytes("Max")?,
+            )
         }
         other => {
             return Err(ParseSizeError::new(ParseSizeErrorKind::UnknownType {
@@ -758,6 +935,12 @@ pub struct SizeChooser {
 
 enum ChooserKind {
     Fixed(u64),
+    Mixture {
+        components: Vec<(f64, SizeChooser)>,
+        total: f64,
+        unsupported: Option<(SizeSpec, Band)>,
+        rng: ChaCha12Rng,
+    },
     Range {
         start: u64,
         end: u64,
@@ -777,6 +960,10 @@ enum ChooserKind {
 /// The distribution behind a sampled chooser.
 #[derive(Clone, Copy, Debug)]
 enum Sampler {
+    Normal {
+        mean: u64,
+        std_dev: u64,
+    },
     /// `median × e^(sigma × z)` for a standard normal `z`. This is the
     /// lognormal with log-space mean `ln(median)`, computed without the
     /// round trip through the logarithm, so `sigma = 0` gives the median
@@ -798,6 +985,7 @@ impl Sampler {
     )]
     fn sample(self, rng: &mut impl rand_chacha::rand_core::RngCore) -> f64 {
         match self {
+            Self::Normal { mean, std_dev } => mean as f64 + std_dev as f64 * sampling::normal(rng),
             Self::LogNormal { median, sigma } => {
                 let z = sampling::normal(rng);
                 median as f64 * libm::exp(sigma * z)
@@ -832,9 +1020,10 @@ impl SizeChooser {
     pub(crate) fn fixed_size(&self) -> Option<u64> {
         match &self.kind {
             ChooserKind::Fixed(bytes) => Some(*bytes),
-            ChooserKind::Range { .. } | ChooserKind::Sampled { .. } | ChooserKind::Custom(_) => {
-                None
-            }
+            ChooserKind::Range { .. }
+            | ChooserKind::Mixture { .. }
+            | ChooserKind::Sampled { .. }
+            | ChooserKind::Custom(_) => None,
         }
     }
 
@@ -848,6 +1037,22 @@ impl SizeChooser {
         match &mut self.kind {
             ChooserKind::Fixed(bytes) => Ok(*bytes),
             ChooserKind::Range { start, end, rng } => Ok(sampling::uniform(rng, *start, *end)),
+            ChooserKind::Mixture {
+                components,
+                total,
+                unsupported,
+                rng,
+            } => {
+                if let Some((spec, band)) = unsupported {
+                    return Err(SampleError::unsupported_band(spec.clone(), *band));
+                }
+                let draw = sampling::open_closed_unit(rng.next_u64()) * *total;
+                let index = components
+                    .iter()
+                    .position(|(limit, _)| draw <= *limit)
+                    .unwrap_or(components.len() - 1);
+                components[index].1.next_size()
+            }
             ChooserKind::Sampled {
                 spec,
                 sampler,
@@ -869,6 +1074,10 @@ impl Debug for SizeChooser {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.kind {
             ChooserKind::Fixed(bytes) => write!(f, "SizeChooser::Fixed({bytes})"),
+            ChooserKind::Mixture { components, .. } => f
+                .debug_tuple("SizeChooser::Mixture")
+                .field(components)
+                .finish(),
             ChooserKind::Range { start, end, .. } => {
                 write!(f, "SizeChooser::Range({start}..={end})")
             }
@@ -888,6 +1097,9 @@ fn sample_in_band(
 ) -> u64 {
     if let Sampler::LogNormal { median, sigma: 0.0 } = sampler {
         return median;
+    }
+    if let Sampler::Normal { mean, std_dev: 0 } = sampler {
+        return mean;
     }
     loop {
         let sample = sampler.sample(rng);
@@ -957,7 +1169,7 @@ enum ParseSizeErrorKind {
     UnknownType {
         name: String,
     },
-    /// `Type=gamma` or `Type=normal`, which this grammar no longer has.
+    /// `Type=gamma`, which this grammar no longer has.
     RemovedType {
         name: &'static str,
     },
@@ -1050,8 +1262,7 @@ impl ParseSizeError {
         matches!(self.inner.kind, ParseSizeErrorKind::UnknownType { .. })
     }
 
-    /// Returns `true` for `Type=gamma` or `Type=normal`, whose messages
-    /// name the replacement.
+    /// Returns `true` for `Type=gamma`, whose message names the replacement.
     #[must_use]
     pub fn is_removed_type(&self) -> bool {
         matches!(self.inner.kind, ParseSizeErrorKind::RemovedType { .. })
@@ -1137,17 +1348,15 @@ impl Display for ParseSizeError {
                 f.write_str("missing Type=<type> in file size specifier")
             }
             ParseSizeErrorKind::UnknownType { name } => {
-                write!(f, "unknown Type {name:?}, must be one of: lognormal,pareto")
+                write!(
+                    f,
+                    "unknown Type {name:?}, must be one of: normal,lognormal,pareto"
+                )
             }
-            ParseSizeErrorKind::RemovedType { name: "gamma" } => f.write_str(
-                "Type gamma was removed; use Type=pareto,Min=<bytes>,Max=<bytes>,Alpha=<shape> \
-                 for a heavy tail",
-            ),
             ParseSizeErrorKind::RemovedType { name } => write!(
                 f,
-                "Type {name} was removed; use a range such as 19MB-21MB, or \
-                 Type=lognormal,Median=<bytes>,Sigma=<number>,Max=<bytes> with Sigma set to \
-                 StdDev divided by Mean"
+                "Type {name} was removed; use Type=pareto,Min=<bytes>,Max=<bytes>,Alpha=<shape> \
+                 for a heavy tail"
             ),
             ParseSizeErrorKind::MalformedParameter { item } => {
                 write!(f, "malformed size parameter {item:?}: expected Key=Value")
@@ -1326,7 +1535,7 @@ impl Display for ShortSize {
         let suffixed = SUFFIXES
             .iter()
             .rev()
-            .find(|(_, multiplier)| bytes != 0 && bytes % multiplier == 0);
+            .find(|(_, multiplier)| bytes != 0 && bytes.is_multiple_of(*multiplier));
         match suffixed {
             Some((suffix, multiplier)) => write!(f, "{}{suffix}", bytes / multiplier),
             None => write!(f, "{bytes}"),
@@ -1685,7 +1894,7 @@ mod tests {
             ),
             (
                 "Type=normal,Mean=20MB,StdDev=1MB",
-                ParseSizeError::is_removed_type,
+                ParseSizeError::is_missing_parameter,
             ),
             // Parameter names are validated at parse time.
             (
@@ -1716,13 +1925,11 @@ mod tests {
         );
         assert_eq!(
             parse_error("Type=normal,Mean=20MB,StdDev=1MB").to_string(),
-            "Type normal was removed; use a range such as 19MB-21MB, or \
-             Type=lognormal,Median=<bytes>,Sigma=<number>,Max=<bytes> with Sigma set to \
-             StdDev divided by Mean"
+            "missing parameter Max for Type=normal"
         );
         assert_eq!(
             parse_error("Type=zipf,Mean=1").to_string(),
-            "unknown Type \"zipf\", must be one of: lognormal,pareto"
+            "unknown Type \"zipf\", must be one of: normal,lognormal,pareto"
         );
     }
 
@@ -1881,11 +2088,121 @@ mod tests {
     }
 
     #[test]
+    fn seeded_normal_and_mixture_sequences_are_stable() {
+        // Cross-checked against a separate implementation of the documented
+        // polar transform, child-seed construction, and 2:3:1 selection.
+        let seed = crate::GenerationSeed::new("mixture-sequence").unwrap();
+        let normal = SizeSpec::normal(10_000, 1000, 6000..=14_000).unwrap();
+        let mut chooser = normal.chooser_seeded(&seed);
+        for expected in [
+            9723, 9410, 10296, 11499, 11193, 9104, 9030, 8541, 9770, 9695, 10694, 10884,
+        ] {
+            assert_eq!(chooser.next_size().unwrap(), expected);
+        }
+        let mut chooser = SizeSpec::mixture([
+            (2.0, SizeSpec::fixed(128)),
+            (3.0, normal),
+            (1.0, SizeSpec::fixed(20_000)),
+        ])
+        .unwrap()
+        .chooser_seeded(&seed);
+        for expected in [
+            128, 10302, 128, 10279, 128, 128, 128, 20000, 8749, 10066, 11056, 11364, 20000, 128,
+            128, 128, 128, 20000, 128, 128, 10853, 20000, 10101, 128,
+        ] {
+            assert_eq!(chooser.next_size().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn normal_samples_have_byte_space_mean_and_spread() {
+        let seed = crate::GenerationSeed::new("normal moments").unwrap();
+        let mut chooser =
+            spec("Type=normal,Mean=100KB,StdDev=10KB,Max=200KB").chooser_seeded(&seed);
+        let mut sum = 0.0;
+        let mut squared = 0.0;
+        for _ in 0..10_000 {
+            let size = u32::try_from(chooser.next_size().unwrap()).unwrap();
+            assert!((60..=204_800).contains(&size));
+            let offset = f64::from(size) - 102_400.0;
+            sum += offset;
+            squared += offset * offset;
+        }
+        assert!((sum / 10_000.0).abs() < 400.0);
+        assert!((squared / 10_000.0 - 10_240.0_f64.powi(2)).abs() < 5_000_000.0);
+        for mean in [60, (1 << 53) + 1, u64::MAX] {
+            let mut exact = SizeSpec::normal(mean, 0, 60..=u64::MAX)
+                .unwrap()
+                .chooser_seeded(&seed);
+            assert_eq!(exact.next_size().unwrap(), mean);
+        }
+        for input in [
+            "Type=normal,Mean=128KB,StdDev=0,Max=64KB",
+            "Type=normal,Mean=128MB,StdDev=1KB,Max=1MB",
+        ] {
+            spec(input).chooser_seeded(&seed).next_size().unwrap_err();
+        }
+    }
+
+    #[test]
+    fn mixtures_preserve_weights_despite_component_rejection() {
+        let seed = crate::GenerationSeed::new("mixture populations").unwrap();
+        // The second component accepts only a small right tail. Reselecting
+        // the component during rejection would nearly eliminate this population.
+        let mixture = SizeSpec::mixture([
+            (6.0, SizeSpec::fixed(128)),
+            (
+                3.0,
+                SizeSpec::normal(10_000, 1000, 12_000..=13_000).unwrap(),
+            ),
+            (1.0, SizeSpec::range(20_000..=21_000).unwrap()),
+        ])
+        .unwrap();
+        let mut chooser = mixture.chooser_seeded(&seed);
+        let mut replay = mixture.chooser_seeded(&seed);
+        let mut counts = [0; 3];
+        for _ in 0..10_000 {
+            let size = chooser.next_size().unwrap();
+            assert_eq!(size, replay.next_size().unwrap());
+            match size {
+                128 => counts[0] += 1,
+                12_000..=13_000 => counts[1] += 1,
+                20_000..=21_000 => counts[2] += 1,
+                _ => panic!("unexpected size {size}"),
+            }
+        }
+        for (actual, expected) in counts.into_iter().zip([6000_i32, 3000, 1000]) {
+            assert!((actual - expected).abs() < 200, "{counts:?}");
+        }
+    }
+
+    #[test]
+    fn mixture_validation_and_single_component_compatibility() {
+        SizeSpec::mixture([]).unwrap_err();
+        for weight in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            SizeSpec::mixture([(weight, SizeSpec::fixed(128))]).unwrap_err();
+        }
+        let normal = SizeSpec::normal(128_000, 16_000, 60..=256_000).unwrap();
+        assert_eq!(SizeSpec::mixture([(9.0, normal.clone())]).unwrap(), normal);
+        let seed = crate::GenerationSeed::new("preflight all components").unwrap();
+        let unsupported = SizeSpec::normal(1_000_000, 1, 60..=100).unwrap();
+        let mut chooser =
+            SizeSpec::mixture([(1.0, SizeSpec::fixed(128)), (1e-100, unsupported.clone())])
+                .unwrap()
+                .chooser_seeded(&seed);
+        assert_eq!(chooser.next_size().unwrap_err().spec(), &unsupported);
+    }
+
+    #[test]
     fn canonical_display_round_trips_through_parse() {
         for (input, canonical) in [
             ("4096", "4096"),
             ("2kb", "2048"),
             ("1kb-2kb", "1024-2048"),
+            (
+                "Type=normal,Mean=128MB,StdDev=16MB,Max=256MB",
+                "Type=normal,Mean=134217728,StdDev=16777216,Min=60,Max=268435456",
+            ),
             (
                 "Type=lognormal,Median=20MB,Sigma=0.05,Max=10MB",
                 "Type=lognormal,Median=20971520,Sigma=0.05,Min=60,Max=10485760",
@@ -2098,6 +2415,22 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn relative_weights_are_scale_invariant(
+            weights in prop::array::uniform3(1_u32..1000),
+            exponent in -1000_i32..1000,
+        ) {
+            let seed = crate::GenerationSeed::new("relative weights").unwrap();
+            let scale = 2.0_f64.powi(exponent);
+            let components = |scale| weights.into_iter().zip([128, 1024, 8192])
+                .map(move |(weight, size)| (f64::from(weight) * scale, SizeSpec::fixed(size)));
+            let mut first = SizeSpec::mixture(components(1.0)).unwrap().chooser_seeded(&seed);
+            let mut scaled = SizeSpec::mixture(components(scale)).unwrap().chooser_seeded(&seed);
+            for _ in 0..100 {
+                prop_assert_eq!(first.next_size().unwrap(), scaled.next_size().unwrap());
+            }
+        }
 
         /// With the median inside the band, the band holds at least an
         /// eighth of the mass, so 1,000 draws never exhaust it and every

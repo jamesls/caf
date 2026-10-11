@@ -24,7 +24,7 @@ fn signed_unit(word: u64) -> f64 {
     clippy::cast_precision_loss,
     reason = "integers through 2^53 fit exactly in f64"
 )]
-fn open_closed_unit(word: u64) -> f64 {
+pub(crate) fn open_closed_unit(word: u64) -> f64 {
     ((word >> 11) + 1) as f64 * TWO_NEG_53
 }
 

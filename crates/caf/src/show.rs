@@ -335,15 +335,16 @@ fn print_header_diagnostics(
         yes_no(checks.length_minimum)
     );
 
-    if expected_hash.digest().is_some() && !raw.is_root() {
-        if let Some(store_root) = store_root_of(path) {
-            println!();
-            println!(
-                "{} {}",
-                style.bold("Parent path:"),
-                hash_to_path(store_root, raw.parent()).display()
-            );
-        }
+    if expected_hash.digest().is_some()
+        && !raw.is_root()
+        && let Some(store_root) = store_root_of(path)
+    {
+        println!();
+        println!(
+            "{} {}",
+            style.bold("Parent path:"),
+            hash_to_path(store_root, raw.parent()).display()
+        );
     }
 }
 

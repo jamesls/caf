@@ -136,7 +136,7 @@ impl ProgressTracker {
 
 /// Adds without wrapping at the edge of the counter's range.
 fn saturating_add(counter: &AtomicU64, amount: u64) {
-    let _previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _previous = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(amount))
     });
 }
@@ -166,7 +166,7 @@ impl<'tracker> FileProgress<'tracker> {
         let mut added = 0;
         let _previous =
             self.bytes_completed
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     let next = current.saturating_add(bytes).min(self.file_size);
                     added = next - current;
                     Some(next)

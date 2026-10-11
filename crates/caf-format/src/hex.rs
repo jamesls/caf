@@ -75,7 +75,7 @@ pub(crate) fn encode(bytes: &[u8]) -> String {
 /// allocating.
 pub(crate) fn encode_into<'a>(bytes: &[u8], out: &'a mut [u8]) -> &'a str {
     assert_eq!(out.len(), bytes.len() * 2, "hex needs two chars per byte");
-    for (byte, pair) in bytes.iter().zip(out.chunks_exact_mut(2)) {
+    for (byte, pair) in bytes.iter().zip(out.as_chunks_mut::<2>().0) {
         pair[0] = DIGITS[usize::from(byte >> 4)];
         pair[1] = DIGITS[usize::from(byte & 0x0f)];
     }
@@ -94,7 +94,7 @@ pub(crate) fn decode<const N: usize>(hex: &str) -> Result<[u8; N], ParseHexError
         ));
     }
     let mut out = [0_u8; N];
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = nibble(pair[0]).ok_or_else(|| bad_char::<N>(hex, i * 2))?;
         let lo = nibble(pair[1]).ok_or_else(|| bad_char::<N>(hex, i * 2 + 1))?;
         out[i] = (hi << 4) | lo;

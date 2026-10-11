@@ -353,7 +353,7 @@ mod tests {
             |index| collected.push(index),
         );
         result.expect("the pipeline succeeds");
-        assert!(collected.is_empty());
+        assert_eq!(collected, [] as [usize; 0]);
     }
 
     #[test]

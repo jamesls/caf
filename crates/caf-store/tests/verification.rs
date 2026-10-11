@@ -583,7 +583,11 @@ fn chunk_size_never_affects_success() {
     let [file] = &*data_files(store.path()) else {
         panic!("exactly one data file is generated");
     };
-    overwrite(file, 700, &[0xEE; 64]);
+    // Flip every byte: a fixed replacement can match the random original,
+    // leaving offset 700 unchanged and making the region assertion flaky.
+    let original = fs::read(file).expect("data file is readable");
+    let corrupted: Vec<_> = original[700..764].iter().map(|byte| byte ^ 0xFF).collect();
+    overwrite(file, 700, &corrupted);
     for chunk_size in [1, 256, 4096, 65536] {
         let report = verify_chunked(store.path(), chunk_size);
         assert!(!report.success(), "chunk size {chunk_size}");

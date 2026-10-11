@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn workspace_metadata_is_pinned() {
         assert_eq!(env!("CARGO_PKG_LICENSE"), "Apache-2.0");
-        assert_eq!(env!("CARGO_PKG_RUST_VERSION"), "1.85");
+        assert_eq!(env!("CARGO_PKG_RUST_VERSION"), "1.99");
     }
 
     #[test]

@@ -134,6 +134,63 @@ convert it to an open-closed unit value `U`, and compute
 
 ## Mathematics and truncation
 
+### Normal sizes
+
+`Type=normal,Mean=128MB,StdDev=16MB,Max=256MB` samples a normal with
+byte-valued mean and standard deviation, conditioned on its bounds. `Min`
+defaults to 60 bytes. Mean and standard deviation describe the untruncated
+normal; bounds can change the observed moments. With `StdDev=0`, return
+the exact integer mean without consuming RNG words, provided it is in bounds.
+Otherwise, draw a standard normal `Z` with the polar sampler above and compute
+`mean_f64 + std_dev_f64 * Z` (multiply, then add). Apply the same truncation
+and rejection rules as lognormal and Pareto below.
+
+### Weighted mixtures
+
+Repeat `--file-size` to mix any number of size distributions:
+
+```sh
+caf gen --seed example --max-files 1000 \
+  --file-size 'Weight=9,Size=128KB' \
+  --file-size 'Weight=1,Type=normal,Mean=128MB,StdDev=16MB,Max=256MB'
+```
+
+Every occurrence has its own parameters and bounds. `Weight` defaults to 1
+and must be a finite, positive binary64 number. `Size` accepts a fixed size
+or inclusive range; it cannot be combined with `Type` or distribution
+parameters. Unweighted fixed sizes and ranges retain their existing syntax:
+`--file-size 128KB --file-size 128MB` selects either with equal probability.
+The default 4096-byte specification applies only when none is supplied.
+
+Weights specify relative probabilities by file count, not byte shares or
+exact quotas. The example selects the small population with probability 0.9.
+For exact 128 KiB and 128 MiB sizes, a 9:1 file-count ratio puts approximately
+99.1% of bytes in the large population. KB and MB retain their binary meaning.
+
+All components undergo acceptance-mass checks before any size is returned.
+Choose a component first, then sample it; rejection stays within that
+component. A single component ignores its weight and preserves the original
+single-distribution seeded stream. Mixtures in the library can contain other
+mixtures; the CLI exposes only a flat list.
+
+For reproducible mixture sampling:
+
+1. Preserve component order. Divide each weight by the largest weight,
+   then accumulate binary64 cumulative weights in order. This avoids overflow
+   from adding large finite weights. Extremely small relative weights are
+   subject to binary64 and 53-bit random-draw resolution.
+2. In component order, draw four `u64` words from the mixture's RNG and
+   concatenate their little-endian bytes into a 32-byte seed for that
+   component's ChaCha12 RNG, including fixed components. Initialize nested
+   mixtures recursively from their own RNGs.
+3. For each file, draw one word from the mixture RNG and convert it to `(0, 1]`
+   using the conversion above. Multiply by the total cumulative weight.
+   Select the first component whose cumulative weight is at least that value.
+4. Sample only the selected component using its own RNG. Component sampling
+   never consumes mixture-selection words.
+
+### Floating-point operations
+
 Size sampling calls `libm` version 0.2.16, pinned exactly, with the
 `force-soft-floats` feature. All logarithms, exponentials, powers, square
 roots, and `exp(x) - 1` operations call `libm::log`, `libm::exp`,
@@ -147,7 +204,7 @@ The pinned backend defines the expected results; the specification does not
 require correctly rounded transcendental functions. A backend update must
 preserve the expected seeded CAF v3 outputs.
 
-For both sampled distributions:
+For normal, lognormal, and Pareto distributions:
 
 1. Generate a candidate.
 2. If it is not finite, reject it and redraw.
@@ -172,6 +229,11 @@ sampling error before CAF writes any data file or metadata.
 
 For zero sigma, validation checks `Min <= Median <= Max` using exact `u64`
 comparisons. This preserves band boundaries above `2^53`.
+For a normal with zero standard deviation, check the integer mean the same way.
+For a normal with positive standard deviation, use
+`lower = (min_f64 - mean_f64) / std_dev_f64` and
+`upper = (max_f64 + 1.0 - mean_f64) / std_dev_f64`, then apply the same
+normal-mass rectangle calculation below.
 
 For positive sigma, compute:
 
@@ -215,6 +277,9 @@ parameters keep their last value. `Type=lognormal` requires `Median`,
 `Sigma`, and `Max`. `Type=pareto` requires `Alpha` and `Max`. Both accept an
 optional `Min` and reject unknown keys. Dimensionless parameters accept
 finite binary64 numbers without byte suffixes.
+`Type=normal` requires byte-valued `Mean`, `StdDev`, and `Max`, and accepts
+optional `Min`. The CLI extracts optional `Weight` and `Size` before parsing
+each distribution; repeated keys keep the last value, as with other keys.
 
 The generator checks both stopping conditions before each file. The run stops
 when the completed file count reaches `--max-files` or the byte count reaches

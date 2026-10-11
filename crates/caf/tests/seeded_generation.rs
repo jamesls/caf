@@ -43,8 +43,8 @@ fn complete_recipes_match_seeded_v3() {
                 recipe.format,
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(output.stdout.is_empty());
-            assert!(output.stderr.is_empty());
+            assert_eq!(output.stdout, [] as [u8; 0]);
+            assert_eq!(output.stderr, [] as [u8; 0]);
             golden::assert_store(root.path(), &recipe, &seed);
             let actual = golden::snapshot(root.path());
             if let Some(expected) = &serial {

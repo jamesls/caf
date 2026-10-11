@@ -9,9 +9,8 @@ members = [
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
-# Rust 1.85 is the minimum version that supports edition 2024. CI builds
-# with it on every supported platform.
-rust-version = "1.85"
+# Keep the minimum supported compiler aligned with the CI version check.
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/jamesls/caf"
 authors = ["James Saryerwinnie <js@jamesls.com>"]
@@ -29,8 +28,8 @@ sha3 = "0.10"
 # OS randomness supplies unseeded content seeds and temporary names.
 # ChaCha12 and software libm keep seeded CAF v3 size selection reproducible.
 # `rand` supports dev corruption; `tempfile` creates temporary test
-# stores. All are pure Rust, MIT OR Apache-2.0,
-# MSRV <= 1.85. `rand` stays on 0.9 and `getrandom` on 0.3 (the version
+# stores. All are pure Rust, MIT OR Apache-2.0.
+# `rand` stays on 0.9 and `getrandom` on 0.3 (the version
 # inside `rand`): the 0.10/0.4 pair would duplicate `cpufeatures` and
 # `getrandom` in the graph, which the cargo lint policy rejects.
 getrandom = { version = "0.3", features = ["std"] }

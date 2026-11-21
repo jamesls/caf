@@ -155,8 +155,10 @@ impl Verifier {
     /// positional reads and corruption analysis. The report is identical
     /// to a serial run: results are folded back in sorted file order and
     /// store-level checks run after every file. Peak memory grows with the
-    /// worker count and, for v3, with the transient 32-byte Merkle leaf
-    /// stored for each 1 MiB file block. Every file's outcome is kept for
+    /// worker count: each worker checks v3 blocks in batches, with two
+    /// buffers of up to 8 MiB each on CPUs with AVX-512 (4 MiB with AVX2,
+    /// one block otherwise). A v3 file also keeps a transient 32-byte
+    /// Merkle leaf for each 1 MiB block. Every file's outcome is kept for
     /// the store-level checks at any count; outcomes that finish ahead of
     /// a slow file wait for it in that same form. Values above
     /// [`MAX_JOBS`] clamp to it. The CLI rejects values below one as a

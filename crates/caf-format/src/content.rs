@@ -108,6 +108,57 @@ pub fn fill_block_prefix_with_format(
     XofReader::read(&mut block_reader(format, seed, index), prefix);
 }
 
+/// Most consecutive blocks [`fill_block_prefixes_with_format`] accepts
+/// at once.
+pub const MAX_CONTENT_BATCH: usize = crate::multi_way::MAX_WAYS;
+
+/// Returns how many consecutive blocks this CPU generates fastest
+/// together: 8 with AVX-512, 4 with AVX2, otherwise 1.
+///
+/// Callers that regenerate many blocks should hand
+/// [`fill_block_prefixes_with_format`] batches of this size.
+#[must_use]
+pub fn content_batch() -> usize {
+    crate::multi_way::ways()
+}
+
+/// Fills `prefixes[i]` with the first bytes of the content block at
+/// `first_index + i`, for up to [`MAX_CONTENT_BATCH`] consecutive blocks.
+///
+/// The bytes are exactly those [`fill_block_prefix_with_format`] writes
+/// for each block. On x86-64 CPUs with AVX2 or AVX-512, a batch of
+/// [`content_batch`] blocks is squeezed in lockstep, several blocks per
+/// instruction; other batches and CPUs generate one block at a time.
+///
+/// # Panics
+///
+/// Panics if more than [`MAX_CONTENT_BATCH`] prefixes are given, or if a
+/// prefix is longer than its block.
+pub fn fill_block_prefixes_with_format(
+    format: Format,
+    seed: ContentSeed,
+    first_index: u64,
+    prefixes: &mut [&mut [u8]],
+) {
+    assert!(
+        prefixes.len() <= MAX_CONTENT_BATCH,
+        "at most {MAX_CONTENT_BATCH} blocks generate together",
+    );
+    for (index, prefix) in (first_index..).zip(prefixes.iter()) {
+        assert!(
+            prefix.len() <= block_len(index),
+            "content block {index} is at most {} bytes",
+            block_len(index),
+        );
+    }
+    if crate::multi_way::fill(format, seed, first_index, prefixes) {
+        return;
+    }
+    for (index, prefix) in (first_index..).zip(prefixes.iter_mut()) {
+        fill_block_prefix_with_format(format, seed, index, prefix);
+    }
+}
+
 /// Starts the SHAKE-128 XOF for one content block.
 ///
 /// SHAKE output is prefix-stable: squeezing a block incrementally yields
@@ -311,8 +362,8 @@ mod tests {
     use std::io::Read;
 
     use super::{
-        ContentReader, block_len, fill_block, fill_block_prefix, fill_block_prefix_with_format,
-        fill_block_with_format,
+        ContentReader, MAX_CONTENT_BATCH, block_len, fill_block, fill_block_prefix,
+        fill_block_prefix_with_format, fill_block_prefixes_with_format, fill_block_with_format,
     };
     use crate::{BLOCK_SIZE, ContentSeed, Format, HEADER_SIZE, hex};
 
@@ -488,5 +539,37 @@ mod tests {
         ContentReader::new_with_offset(seed(), u64::MAX)
             .read_exact(&mut actual)
             .unwrap();
+    }
+
+    /// Batched generation must equal one-block generation for every
+    /// batch size, both formats, starting at block 0 and later, and uneven
+    /// prefixes that end mid-lane and mid-rate-block. On x86-64 this
+    /// covers the AVX2 kernel (2 to 4 blocks) and the AVX-512 kernel (5 to
+    /// 8 blocks) on CPUs that have them.
+    #[test]
+    fn batched_blocks_match_single_block_generation() {
+        for format in [Format::V2, Format::V3] {
+            for first in [0_u64, 7] {
+                for count in 1..=MAX_CONTENT_BATCH {
+                    let lens: Vec<usize> = (first..)
+                        .take(count)
+                        .zip([4099, 17, 1000, 0, 169, 168, 8, 3 * 168 + 5])
+                        .map(|(index, len)| len.min(block_len(index)))
+                        .collect();
+                    let mut buffers: Vec<Vec<u8>> = lens.iter().map(|&len| vec![0; len]).collect();
+                    let mut prefixes: Vec<&mut [u8]> =
+                        buffers.iter_mut().map(Vec::as_mut_slice).collect();
+                    fill_block_prefixes_with_format(format, seed(), first, &mut prefixes);
+                    for (index, actual) in (first..).zip(&buffers) {
+                        let mut expected = vec![0; actual.len()];
+                        fill_block_prefix_with_format(format, seed(), index, &mut expected);
+                        assert!(
+                            *actual == expected,
+                            "{format} first {first} count {count} block {index}",
+                        );
+                    }
+                }
+            }
+        }
     }
 }

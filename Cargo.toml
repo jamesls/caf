@@ -57,9 +57,10 @@ hex = "0.4"
 # RUSTFLAGS="-D warnings" (.github/workflows/rust.yml). Every workspace
 # member sets `[lints] workspace = true`.
 [workspace.lints.rust]
-# The workspace forbids unsafe code. Any future exception requires its
-# own review.
-unsafe_code = "forbid"
+# The workspace denies unsafe code. The one exception is
+# `caf-format/src/multi_way.rs`, which calls runtime-detected AVX2 and
+# AVX-512 kernels; any further exception requires its own review.
+unsafe_code = "deny"
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"

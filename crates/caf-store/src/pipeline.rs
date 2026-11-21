@@ -1,40 +1,37 @@
-//! Bounded worker pipeline with deterministic in-order collection.
+//! Worker pool with deterministic in-order collection.
 //!
-//! [`run`] fans indexed tasks out to a fixed pool of worker threads and
-//! hands each result to a collector callback in index order, regardless
-//! of completion order. In-flight work is bounded: a worker claims an
-//! index
-//! only while it is within a fixed window of the collector, so buffered
-//! results never grow with the total number of tasks. The first task
-//! error in index order cancels the run — exactly the error a serial
-//! sweep would have stopped at — and a worker panic resumes on the
-//! calling thread, as it would have in a serial sweep. If the OS
-//! refuses every worker thread, the run completes as exactly that
-//! serial sweep on the calling thread; refusing only some narrows the
-//! pool.
+//! [`run`] fans indexed tasks out to a fixed pool of threads, the calling
+//! thread among them, and hands each result to a collector callback in
+//! index order, regardless of completion order. Claims never wait for the
+//! collector: a slow task holds back only collection, so the other workers
+//! keep claiming and their results wait in a reorder buffer until it
+//! finishes. The first task error in index order cancels the run —
+//! exactly the error a serial sweep would have stopped at — and a worker
+//! panic resumes on the calling thread, as it would have in a serial
+//! sweep. If the OS refuses every worker thread, the calling thread runs
+//! every task itself, which is exactly that serial sweep; refusing only
+//! some narrows the pool.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-/// Indices each worker may run ahead of the collector.
+/// Runs `total` indexed tasks on `jobs` threads, delivering results to
+/// `collect` in index order.
 ///
-/// The claim window is this value times the worker count. A larger
-/// window smooths over one slow task at the cost of more buffered
-/// results; memory stays `O(jobs)` either way, never `O(tasks)`.
-const WINDOW_PER_WORKER: usize = 4;
-
-/// Runs `total` indexed tasks on `jobs` worker threads, delivering
-/// results to `collect` in index order.
+/// The calling thread is one of the `jobs` workers, so the budget hides
+/// no extra coordinator thread. Each worker calls `make_worker` once and
+/// feeds the returned closure claimed indices, so per-worker state (such
+/// as a reusable read buffer) lives for the whole run. `collect` runs on
+/// the calling thread, between its own tasks and after them.
 ///
-/// Each worker thread calls `make_worker` once and feeds the returned
-/// closure claimed indices, so per-worker state (such as a reusable
-/// read buffer) lives for the whole run. `collect` runs on the calling
-/// thread. If the OS refuses every worker thread, the tasks run
-/// serially on the calling thread instead.
+/// Results that finish ahead of a slower, earlier task are buffered until
+/// it completes, so a single long task never idles the other workers. The
+/// buffer can hold up to `total` results; callers that keep every result
+/// anyway, as verification does, pay no extra memory order for it.
 ///
 /// # Errors
 ///
@@ -56,182 +53,168 @@ where
     E: Send,
     W: FnMut(usize) -> Result<T, E>,
 {
-    let jobs = jobs.get();
-    let window = jobs.saturating_mul(WINDOW_PER_WORKER);
-    let gate = Gate::new();
-    // Results ride a bounded channel sized to the claim window, so a
-    // send can only block while the collector is catching up.
-    let (sender, receiver) = mpsc::sync_channel::<(usize, Result<T, E>)>(window);
+    let claims = Claims::new(total);
+    let (sender, receiver) = mpsc::channel::<(usize, Result<T, E>)>();
+    let mut order = InOrder::new();
 
     thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(jobs);
-        for _ in 0..jobs {
+        let mut handles = Vec::with_capacity(jobs.get() - 1);
+        for _ in 1..jobs.get() {
             let sender = sender.clone();
-            let gate = &gate;
+            let claims = &claims;
             let make_worker = &make_worker;
             let spawned = thread::Builder::new().spawn_scoped(scope, move || {
                 let worked = panic::catch_unwind(AssertUnwindSafe(|| {
                     let mut work = make_worker();
-                    while let Some(index) = gate.claim(total, window) {
+                    while let Some(index) = claims.claim() {
                         let result = work(index);
-                        let failed = result.is_err();
-                        if sender.send((index, result)).is_err() {
-                            return;
-                        }
-                        if failed {
+                        if result.is_err() {
                             // Unrecoverable: stop handing out indices now
                             // rather than when the collector reaches this
                             // result.
-                            gate.cancel();
+                            claims.cancel();
+                        }
+                        if sender.send((index, result)).is_err() {
                             return;
                         }
                     }
                 }));
                 if let Err(payload) = worked {
-                    // Cancel so siblings blocked in `Gate::claim` are not
-                    // left waiting on a result that will never arrive.
-                    // Cancelling takes the gate lock, which a destructor
-                    // must not do, so the unwind is caught here and
-                    // resumed unchanged once the gate is closed.
-                    gate.cancel();
+                    // Cancel so siblings stop claiming, then resume the
+                    // unwind unchanged for the calling thread to join.
+                    claims.cancel();
                     panic::resume_unwind(payload);
                 }
             });
             match spawned {
                 Ok(handle) => handles.push(handle),
-                // The OS refused a thread; the workers that did start
-                // keep the run correct with a narrower pool.
+                // The OS refused a thread; the workers that did start,
+                // and the calling thread, keep the run correct.
                 Err(_refused) => break,
             }
         }
         drop(sender);
 
-        if handles.is_empty() {
-            // No worker could start at all: complete the run as a
-            // serial sweep on this thread rather than reporting an
-            // empty run as success.
+        // The calling thread works too, folding in whatever the other
+        // workers finished between its own tasks. Its receiver never
+        // parks while it has work, so senders rarely need to wake it.
+        let worked = panic::catch_unwind(AssertUnwindSafe(|| {
             let mut work = make_worker();
-            for index in 0..total {
-                collect(work(index)?);
-            }
-            return Ok(());
-        }
-
-        // Collect in index order through a reorder buffer. The buffer
-        // holds only in-flight results, which the claim window bounds.
-        let mut pending: BTreeMap<usize, Result<T, E>> = BTreeMap::new();
-        let mut next = 0_usize;
-        let mut failure: Option<E> = None;
-        for (index, result) in receiver {
-            if failure.is_some() {
-                // Already failed: drain so workers finish, discard.
-                continue;
-            }
-            pending.insert(index, result);
-            while let Some(result) = pending.remove(&next) {
-                next += 1;
-                match result {
-                    Ok(value) => {
-                        collect(value);
-                        gate.collected_one();
-                    }
-                    Err(error) => {
-                        gate.cancel();
-                        failure = Some(error);
-                        pending.clear();
-                        break;
-                    }
+            while let Some(index) = claims.claim() {
+                let result = work(index);
+                if result.is_err() {
+                    claims.cancel();
+                }
+                order.accept(index, result, &mut collect);
+                for (index, result) in receiver.try_iter() {
+                    order.accept(index, result, &mut collect);
                 }
             }
+        }));
+        if let Err(payload) = worked {
+            claims.cancel();
+            panic::resume_unwind(payload);
+        }
+        // The loop ends once every worker has exited and dropped its
+        // sender.
+        for (index, result) in &receiver {
+            order.accept(index, result, &mut collect);
         }
 
-        // Every worker has already exited here: the loop above ends only
-        // once the last sender is dropped. A worker panic is a
-        // programming error, so resume the unwind on this thread rather
-        // than reporting it as a run outcome; the scope joins whatever
-        // handles are left.
+        // A worker panic is a programming error, so resume the unwind on
+        // this thread rather than reporting it as a run outcome; the
+        // scope joins whatever handles are left.
         for handle in handles {
             if let Err(payload) = handle.join() {
                 panic::resume_unwind(payload);
             }
         }
-        debug_assert!(
-            failure.is_some() || next == total,
-            "a claimed index produced no result",
-        );
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        order.finish(total)
     })
 }
 
-/// Hands out task indices while bounding how far claims may run ahead
-/// of the collector.
-struct Gate {
-    state: Mutex<GateState>,
-    changed: Condvar,
+/// Hands out task indices in ascending order until they run out or the
+/// run is cancelled.
+///
+/// Claims are ascending, so when a task fails every lower index has
+/// already been claimed and will still report: the collector can always
+/// find the first error in index order.
+struct Claims {
+    next: AtomicUsize,
+    total: usize,
+    cancelled: AtomicBool,
 }
 
-struct GateState {
-    /// The next index to hand to a worker.
-    next_claim: usize,
-    /// Results the collector has consumed, in index order.
-    collected: usize,
-    /// Set on task error, worker panic, or collector shutdown.
-    cancelled: bool,
-}
-
-impl Gate {
-    fn new() -> Self {
+impl Claims {
+    fn new(total: usize) -> Self {
         Self {
-            state: Mutex::new(GateState {
-                next_claim: 0,
-                collected: 0,
-                cancelled: false,
-            }),
-            changed: Condvar::new(),
+            next: AtomicUsize::new(0),
+            total,
+            cancelled: AtomicBool::new(false),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, GateState> {
-        // The critical sections only move counters and cannot panic, so
-        // poisoning can only come from an unrelated unwind crossing a
-        // guard; the counters are still consistent, so keep going
-        // instead of double-panicking while cancelling for a panicking
-        // worker.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Claims the next index, blocking while the claim would run more
-    /// than `window` ahead of the collector. Returns `None` when the
-    /// indices are exhausted or the run is cancelled.
-    fn claim(&self, total: usize, window: usize) -> Option<usize> {
-        let mut state = self.lock();
-        loop {
-            if state.cancelled || state.next_claim >= total {
-                return None;
-            }
-            if state.next_claim < state.collected.saturating_add(window) {
-                let index = state.next_claim;
-                state.next_claim += 1;
-                return Some(index);
-            }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+    /// Claims the next index, or returns `None` when the indices are
+    /// exhausted or the run is cancelled.
+    fn claim(&self) -> Option<usize> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
         }
-    }
-
-    fn collected_one(&self) {
-        self.lock().collected += 1;
-        self.changed.notify_all();
+        // Each worker overshoots `total` at most once before it stops,
+        // so the counter cannot wrap.
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        (index < self.total).then_some(index)
     }
 
     fn cancel(&self) {
-        self.lock().cancelled = true;
-        self.changed.notify_all();
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reorders results into index order and records the first failure.
+struct InOrder<T, E> {
+    /// Results that finished ahead of `next`.
+    pending: BTreeMap<usize, Result<T, E>>,
+    /// The next index to hand to the collector.
+    next: usize,
+    failure: Option<E>,
+}
+
+impl<T, E> InOrder<T, E> {
+    fn new() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            next: 0,
+            failure: None,
+        }
+    }
+
+    /// Accepts one result and collects every result now in order. After
+    /// a failure, later results are discarded so workers can finish.
+    fn accept(&mut self, index: usize, result: Result<T, E>, collect: &mut impl FnMut(T)) {
+        if self.failure.is_some() {
+            return;
+        }
+        self.pending.insert(index, result);
+        while let Some(result) = self.pending.remove(&self.next) {
+            self.next += 1;
+            match result {
+                Ok(value) => collect(value),
+                Err(error) => {
+                    self.failure = Some(error);
+                    self.pending.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn finish(self, total: usize) -> Result<(), E> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        debug_assert_eq!(self.next, total, "a claimed index produced no result");
+        Ok(())
     }
 }
 
@@ -242,9 +225,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{WINDOW_PER_WORKER, run};
+    use super::run;
 
     fn jobs(count: usize) -> NonZeroUsize {
         NonZeroUsize::new(count).expect("the tests use positive worker counts")
@@ -307,14 +290,20 @@ mod tests {
             || {
                 |index| {
                     started.fetch_add(1, Ordering::Relaxed);
-                    if index == 0 { Err("boom") } else { Ok(index) }
+                    if index == 0 {
+                        return Err("boom");
+                    }
+                    // Slow enough that a stalled cancellation would
+                    // have to lose a full second to reach the bound.
+                    thread::sleep(Duration::from_millis(1));
+                    Ok(index)
                 }
             },
             |_| {},
         );
         assert!(matches!(result, Err("boom")));
-        // The exact count is timing-dependent, but cancellation plus
-        // the claim window keep it far below the total.
+        // The exact count is timing-dependent, but cancellation keeps it
+        // far below the total.
         assert!(started.load(Ordering::Relaxed) < 1000);
     }
 
@@ -369,21 +358,29 @@ mod tests {
         assert_eq!(collected, vec![0, 1, 2]);
     }
 
-    /// While the collector is stuck behind one slow task, other workers
-    /// may only run ahead by the claim window — never `O(total)`.
+    /// A slow first task holds back only collection: while it runs, the
+    /// other worker claims and finishes every later task, and the
+    /// results still collect in index order.
     #[test]
-    fn the_claim_window_bounds_run_ahead() {
-        let workers = jobs(2);
-        let window = workers.get() * WINDOW_PER_WORKER;
+    fn a_slow_task_does_not_hold_back_other_workers() {
+        const TOTAL: usize = 500;
         let finished_ahead = AtomicUsize::new(0);
         let observed = Mutex::new(None);
+        let mut collected = Vec::new();
         let result: Result<(), ()> = run(
-            500,
-            workers,
+            TOTAL,
+            jobs(2),
             || {
                 |index| {
                     if index == 0 {
-                        thread::sleep(Duration::from_millis(50));
+                        // The deadline turns a stalled pool into a
+                        // failure instead of a hang.
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while finished_ahead.load(Ordering::Relaxed) < TOTAL - 1
+                            && Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
                         *observed.lock().expect("no panics hold this lock") =
                             Some(finished_ahead.load(Ordering::Relaxed));
                     } else {
@@ -392,16 +389,14 @@ mod tests {
                     Ok(index)
                 }
             },
-            |_| {},
+            |index| collected.push(index),
         );
         result.expect("the pipeline succeeds");
         let ahead = observed
             .lock()
             .expect("no panics hold this lock")
             .expect("task 0 records the run-ahead");
-        assert!(
-            ahead < window,
-            "ran {ahead} tasks ahead, window is {window}"
-        );
+        assert_eq!(ahead, TOTAL - 1);
+        assert_eq!(collected, (0..TOTAL).collect::<Vec<_>>());
     }
 }

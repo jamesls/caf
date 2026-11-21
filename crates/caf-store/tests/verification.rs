@@ -1104,11 +1104,16 @@ fn unreadable_directory_is_an_io_error() {
         return;
     }
 
-    let err = Verifier::new(store.path())
-        .verify()
-        .expect_err("the directory is unreadable");
-    assert!(err.is_io());
-    assert_eq!(err.path(), Some(shard));
+    // A multi-job walk lists subtrees concurrently but reports the same
+    // error as the serial walk.
+    for jobs in [1, 4] {
+        let err = Verifier::new(store.path())
+            .jobs(positive(jobs))
+            .verify()
+            .expect_err("the directory is unreadable");
+        assert!(err.is_io(), "jobs {jobs}");
+        assert_eq!(err.path(), Some(shard), "jobs {jobs}");
+    }
     fs::set_permissions(shard, fs::Permissions::from_mode(0o755)).expect("restore permissions");
 }
 

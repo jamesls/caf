@@ -61,6 +61,8 @@ struct MockState {
     random_counter: u64,
     random_failure: Option<io::ErrorKind>,
     failures: BTreeMap<PathBuf, io::ErrorKind>,
+    /// Paths whose next operation fails; see [`MockCtrl::fail_once`].
+    one_shot_failures: BTreeMap<PathBuf, io::ErrorKind>,
     /// Positional writes whose byte range covers one of these offsets
     /// fail; see [`MockCtrl::fail_write_at`].
     write_failures: BTreeMap<u64, io::ErrorKind>,
@@ -100,6 +102,7 @@ impl MockCtrl {
                 random_counter: 0,
                 random_failure: None,
                 failures: BTreeMap::new(),
+                one_shot_failures: BTreeMap::new(),
                 write_failures: BTreeMap::new(),
                 read_failures: BTreeMap::new(),
                 read_delays: BTreeMap::new(),
@@ -220,6 +223,16 @@ impl MockCtrl {
         self.lock().failures.insert(path.as_ref().to_owned(), kind);
     }
 
+    /// Makes only the next operation on `path` fail with `kind`.
+    ///
+    /// This simulates a transient failure, such as one `EIO` from a
+    /// flaky disk, that a retry would not see.
+    pub fn fail_once(&self, path: impl AsRef<Path>, kind: io::ErrorKind) {
+        self.lock()
+            .one_shot_failures
+            .insert(path.as_ref().to_owned(), kind);
+    }
+
     /// Makes every later read of the random source fail with `kind`.
     pub fn fail_random(&self, kind: io::ErrorKind) {
         self.lock().random_failure = Some(kind);
@@ -276,6 +289,7 @@ impl MockCtrl {
     pub fn clear_failures(&self) {
         let mut state = self.lock();
         state.failures.clear();
+        state.one_shot_failures.clear();
         state.random_failure = None;
         state.write_failures.clear();
         state.read_failures.clear();
@@ -297,7 +311,7 @@ impl MockCtrl {
     }
 
     pub(crate) fn metadata(&self, path: &Path) -> io::Result<Metadata> {
-        let state = self.lock();
+        let mut state = self.lock();
         state.check_failure(path)?;
         match state.nodes.get(path) {
             Some(Node::Dir) => Ok(Metadata {
@@ -313,7 +327,7 @@ impl MockCtrl {
     }
 
     pub(crate) fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        let state = self.lock();
+        let mut state = self.lock();
         state.check_failure(path)?;
         match state.nodes.get(path) {
             Some(Node::Dir) => {}
@@ -335,7 +349,7 @@ impl MockCtrl {
     }
 
     pub(crate) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let state = self.lock();
+        let mut state = self.lock();
         state.check_failure(path)?;
         match state.nodes.get(path) {
             Some(Node::File(data)) => Ok(contents_of(data)),
@@ -345,7 +359,7 @@ impl MockCtrl {
     }
 
     pub(crate) fn open(&self, path: &Path) -> io::Result<MockFile> {
-        let state = self.lock();
+        let mut state = self.lock();
         state.check_failure(path)?;
         match state.nodes.get(path) {
             Some(Node::File(data)) => Ok(MockFile::new(self, path, Arc::clone(data), false)),
@@ -407,9 +421,13 @@ impl MockCtrl {
 }
 
 impl MockState {
-    fn check_failure(&self, path: &Path) -> io::Result<()> {
-        match self.failures.get(path) {
-            Some(kind) => Err(error(*kind, path)),
+    fn check_failure(&mut self, path: &Path) -> io::Result<()> {
+        let kind = self
+            .one_shot_failures
+            .remove(path)
+            .or_else(|| self.failures.get(path).copied());
+        match kind {
+            Some(kind) => Err(error(kind, path)),
             None => Ok(()),
         }
     }
@@ -524,7 +542,7 @@ impl MockFile {
     /// Resizes the file, zero-filling growth like the real call.
     pub(crate) fn set_len(&self, len: u64) -> io::Result<()> {
         {
-            let state = self.ctrl.lock();
+            let mut state = self.ctrl.lock();
             state.check_failure(&self.path)?;
             if let Some(kind) = state.set_len_failure {
                 return Err(io::Error::new(kind, "the mocked resize failed"));
@@ -545,7 +563,7 @@ impl MockFile {
     pub(crate) fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         let _activity = ActivityGuard::positional(&self.activity);
         {
-            let state = self.ctrl.lock();
+            let mut state = self.ctrl.lock();
             state.check_failure(&self.path)?;
             if let Some(kind) = state.write_failure_in(offset, buf.len() as u64) {
                 return Err(io::Error::new(

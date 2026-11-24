@@ -929,29 +929,37 @@ fn list_dir(
 /// on up to `jobs` threads, each claiming whole subtrees.
 ///
 /// Directory listings dominate the walk of a sparsely sharded store, and
-/// separate subtrees share nothing, so they parallelize cleanly. Any
-/// failure repeats the whole walk serially, so the reported error is
-/// exactly the one a single-job walk reports.
+/// separate subtrees share nothing, so they parallelize cleanly.
+///
+/// The serial walk pops subtrees off the end of the root listing and
+/// finishes each one before the next, so subtrees are claimed in that
+/// same order and each keeps its own result. The error returned is the
+/// first one in serial order: exactly the one a single-job walk reports,
+/// without listing any directory twice. After an error, subtrees not yet
+/// claimed come later in serial order and are skipped.
 fn walk_parallel(env: &Env, root: &Path, jobs: usize) -> Result<Vec<PathBuf>, VerifyError> {
     let mut files = Vec::new();
     let mut subtrees = Vec::new();
     list_dir(env, root, 0, &mut files, &mut subtrees)?;
 
-    let next_subtree = AtomicUsize::new(0);
+    let next_claim = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let walk_subtrees = || {
-        let mut found = Vec::new();
+        let mut walked = Vec::new();
         while !failed.load(Ordering::Relaxed) {
-            let Some(subtree) = subtrees.get(next_subtree.fetch_add(1, Ordering::Relaxed)) else {
+            let claim = next_claim.fetch_add(1, Ordering::Relaxed);
+            let Some(subtree) = subtrees.iter().rev().nth(claim) else {
                 break;
             };
-            match walk(env, vec![subtree.clone()]) {
-                Ok(mut subtree_files) => found.append(&mut subtree_files),
-                Err(_error) => failed.store(true, Ordering::Relaxed),
+            let result = walk(env, vec![subtree.clone()]);
+            if result.is_err() {
+                failed.store(true, Ordering::Relaxed);
             }
+            walked.push((claim, result));
         }
-        found
+        walked
     };
+    let mut walked = Vec::with_capacity(subtrees.len());
     thread::scope(|scope| {
         let walk_subtrees = &walk_subtrees;
         // A refused thread only narrows the walk: the calling thread
@@ -963,17 +971,20 @@ fn walk_parallel(env: &Env, root: &Path, jobs: usize) -> Result<Vec<PathBuf>, Ve
                     .ok()
             })
             .collect();
-        files.append(&mut walk_subtrees());
+        walked.append(&mut walk_subtrees());
         for handle in handles {
             match handle.join() {
-                Ok(mut found) => files.append(&mut found),
+                Ok(mut found) => walked.append(&mut found),
                 Err(payload) => panic::resume_unwind(payload),
             }
         }
     });
 
-    if failed.into_inner() {
-        return walk(env, vec![(root.to_path_buf(), 0)]);
+    // Claims are contiguous from zero, so sorting by claim puts every
+    // walked subtree in serial order with no gaps before an error.
+    walked.sort_unstable_by_key(|&(claim, _)| claim);
+    for (_claim, result) in walked {
+        files.append(&mut result?);
     }
     Ok(files)
 }

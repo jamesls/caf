@@ -111,7 +111,10 @@ debug = 1
 
 # Golden and property tests hash megabytes of SHAKE/BLAKE2b output; keep the
 # crypto cores optimized in dev builds so `cargo test` stays fast. Conformance
-# results are identical at every opt-level.
+# results are identical at every opt-level. `caf-format` holds the multi-way
+# SHAKE kernels, which are many times slower than scalar SHAKE unoptimized.
+[profile.dev.package.caf-format]
+opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 [profile.dev.package.blake3]

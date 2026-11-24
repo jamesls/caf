@@ -57,9 +57,10 @@ hex = "0.4"
 # RUSTFLAGS="-D warnings" (.github/workflows/rust.yml). Every workspace
 # member sets `[lints] workspace = true`.
 [workspace.lints.rust]
-# The workspace forbids unsafe code. Any future exception requires its
-# own review.
-unsafe_code = "forbid"
+# The workspace denies unsafe code. The one exception is
+# `caf-format/src/multi_way.rs`, which calls runtime-detected AVX2 and
+# AVX-512 kernels; any further exception requires its own review.
+unsafe_code = "deny"
 ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
@@ -110,7 +111,10 @@ debug = 1
 
 # Golden and property tests hash megabytes of SHAKE/BLAKE2b output; keep the
 # crypto cores optimized in dev builds so `cargo test` stays fast. Conformance
-# results are identical at every opt-level.
+# results are identical at every opt-level. `caf-format` holds the multi-way
+# SHAKE kernels, which are many times slower than scalar SHAKE unoptimized.
+[profile.dev.package.caf-format]
+opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 [profile.dev.package.blake3]

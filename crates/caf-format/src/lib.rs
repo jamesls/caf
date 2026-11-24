@@ -49,12 +49,13 @@ mod header;
 mod hex;
 mod merkle;
 mod metadata_digest;
+mod multi_way;
 mod path;
 mod seed;
 
 pub use content::{
-    ContentReader, block_len, fill_block, fill_block_prefix, fill_block_prefix_with_format,
-    fill_block_with_format,
+    ContentReader, MAX_CONTENT_BATCH, block_len, content_batch, fill_block, fill_block_prefix,
+    fill_block_prefix_with_format, fill_block_prefixes_with_format, fill_block_with_format,
 };
 pub use digest::{Digest, Hasher};
 pub use header::{Format, Header, HeaderError, RawHeader};

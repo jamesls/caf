@@ -15,14 +15,16 @@
 //! Results are structured ([`VerificationReport`], [`Diagnostic`]); nothing
 //! here prints or renders.
 //!
-//! [`Verifier::jobs`] is a global verification-worker budget. Contended
-//! stores use the existing bounded file pipeline; when lanes outnumber
-//! unstarted files, spare lanes read and analyze segments within large
-//! files. Serial and parallel runs produce identical reports: per-file
-//! work is order-independent, and collectors fold results back in sorted
-//! file order before the store-level checks run. A worker thread the OS
-//! refuses narrows a stage to the threads that did start, down to the
-//! calling thread alone; thread-resource pressure never fails a run.
+//! [`Verifier::jobs`] is a global verification-worker budget. The
+//! directory walk lists the root's subtrees concurrently. Contended
+//! stores use the file pipeline, where a slow file never holds back the
+//! other workers; when lanes outnumber unstarted files, spare lanes read
+//! and analyze segments within large files. Serial and parallel runs
+//! produce identical reports: per-file work is order-independent, and
+//! collectors fold results back in sorted file order before the
+//! store-level checks run. A worker thread the OS refuses narrows a stage
+//! to the threads that did start, down to the calling thread alone;
+//! thread-resource pressure never fails a run.
 
 use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -32,6 +34,7 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -152,13 +155,16 @@ impl Verifier {
     /// positional reads and corruption analysis. The report is identical
     /// to a serial run: results are folded back in sorted file order and
     /// store-level checks run after every file. Peak memory grows with the
-    /// worker count and, for v3, with the transient 32-byte Merkle leaf
-    /// stored for each 1 MiB file block. It does not grow with the number
-    /// of queued files. Values above [`MAX_JOBS`] clamp to it. The CLI
-    /// rejects values below one as a usage error. The count is a budget,
-    /// not a demand: if the OS refuses a worker thread, verification
-    /// proceeds on the threads that did start — down to the calling
-    /// thread alone — instead of failing.
+    /// worker count: each worker checks v3 blocks in batches, with two
+    /// buffers of up to 8 MiB each on CPUs with AVX-512 (4 MiB with AVX2,
+    /// one block otherwise). A v3 file also keeps a transient 32-byte
+    /// Merkle leaf for each 1 MiB block. Every file's outcome is kept for
+    /// the store-level checks at any count; outcomes that finish ahead of
+    /// a slow file wait for it in that same form. Values above
+    /// [`MAX_JOBS`] clamp to it. The CLI rejects values below one as a
+    /// usage error. The count is a budget, not a demand: if the OS refuses
+    /// a worker thread, verification proceeds on the threads that did
+    /// start — down to the calling thread alone — instead of failing.
     #[must_use]
     pub fn jobs(mut self, count: NonZeroUsize) -> Self {
         self.jobs = count.min(MAX_JOBS);
@@ -214,7 +220,7 @@ impl Verifier {
         let root_markers = read_marker_names(&self.env, &roots_dir)?;
         let marker_set = marker_digests(&root_markers);
 
-        let files = collect_data_files(&self.env, &self.root)?;
+        let files = collect_data_files(&self.env, &self.root, self.jobs)?;
         let files_checked = files.len() as u64;
         let total_bytes = self.progress.as_ref().map(|_callback| {
             files.iter().fold(0_u64, |total, path| {
@@ -277,8 +283,9 @@ impl Verifier {
         self.validate_tail_files(&files[contended..], checks, analysis_memory, progress)
     }
 
-    /// The existing file-level regime: fixed workers, no length planning,
-    /// and four claims of run-ahead per requested job.
+    /// The file-level regime: fixed workers and no length planning. A
+    /// worker on a large file holds back only collection; the others keep
+    /// claiming files.
     fn validate_contended_files(
         &self,
         files: &[PathBuf],
@@ -848,46 +855,137 @@ fn marker_digests(names: &[OsString]) -> HashSet<Digest> {
 ///
 /// The walk uses an explicit worklist, never recursion, so store
 /// nesting cannot translate into stack depth; directories deeper than
-/// [`MAX_WALK_DEPTH`] produce a structured error.
-fn collect_data_files(env: &Env, root: &Path) -> Result<Vec<PathBuf>, VerifyError> {
-    // (directory, its depth below the store root); the root is depth 0.
-    let mut pending: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    let mut files = Vec::new();
-    while let Some((dir, depth)) = pending.pop() {
-        let entries = env
-            .read_dir(&dir)
-            .map_err(|source| VerifyError::io("listing a store directory", &dir, source))?;
-        for entry in entries {
-            let file_type = entry.file_type();
-            if file_type.is_symlink() {
-                // Directory symlinks are invisible; file
-                // symlinks (and broken ones) verify like regular files.
-                match env.metadata(entry.path()) {
-                    Ok(target) if target.is_dir() => {}
-                    _ => files.push(entry.into_path()),
-                }
-            } else if file_type.is_dir() {
-                // Skip exactly the `.metadata` directory
-                // that is a direct child of the store root.
-                if depth == 0 && entry.file_name() == OsStr::new(METADATA_DIR) {
-                    continue;
-                }
-                if depth >= MAX_WALK_DEPTH {
-                    return Err(VerifyError::new(VerifyErrorKind::ExcessiveNesting {
-                        path: entry.into_path(),
-                    }));
-                }
-                pending.push((entry.into_path(), depth + 1));
-            } else {
-                files.push(entry.into_path());
-            }
-        }
-    }
+/// [`MAX_WALK_DEPTH`] produce a structured error. With more than one
+/// job, the root's subdirectories are walked concurrently.
+fn collect_data_files(
+    env: &Env,
+    root: &Path,
+    jobs: NonZeroUsize,
+) -> Result<Vec<PathBuf>, VerifyError> {
+    let mut files = if jobs == NonZeroUsize::MIN {
+        walk(env, vec![(root.to_path_buf(), 0)])?
+    } else {
+        walk_parallel(env, root, jobs.get())?
+    };
     files.sort_unstable_by(|a, b| {
         a.as_os_str()
             .as_encoded_bytes()
             .cmp(b.as_os_str().as_encoded_bytes())
     });
+    Ok(files)
+}
+
+/// Walks `pending` (directory, depth below the store root) depth-first
+/// and returns the files found, in walk order.
+fn walk(env: &Env, mut pending: Vec<(PathBuf, usize)>) -> Result<Vec<PathBuf>, VerifyError> {
+    let mut files = Vec::new();
+    while let Some((dir, depth)) = pending.pop() {
+        list_dir(env, &dir, depth, &mut files, &mut pending)?;
+    }
+    Ok(files)
+}
+
+/// Lists the directory `dir` at `depth` below the store root, adding its
+/// files to `files` and its subdirectories to `pending`.
+fn list_dir(
+    env: &Env,
+    dir: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+    pending: &mut Vec<(PathBuf, usize)>,
+) -> Result<(), VerifyError> {
+    let entries = env
+        .read_dir(dir)
+        .map_err(|source| VerifyError::io("listing a store directory", dir, source))?;
+    for entry in entries {
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            // Directory symlinks are invisible; file
+            // symlinks (and broken ones) verify like regular files.
+            match env.metadata(entry.path()) {
+                Ok(target) if target.is_dir() => {}
+                _ => files.push(entry.into_path()),
+            }
+        } else if file_type.is_dir() {
+            // Skip exactly the `.metadata` directory
+            // that is a direct child of the store root.
+            if depth == 0 && entry.file_name() == OsStr::new(METADATA_DIR) {
+                continue;
+            }
+            if depth >= MAX_WALK_DEPTH {
+                return Err(VerifyError::new(VerifyErrorKind::ExcessiveNesting {
+                    path: entry.into_path(),
+                }));
+            }
+            pending.push((entry.into_path(), depth + 1));
+        } else {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(())
+}
+
+/// Lists the root on the calling thread, then walks its subdirectories
+/// on up to `jobs` threads, each claiming whole subtrees.
+///
+/// Directory listings dominate the walk of a sparsely sharded store, and
+/// separate subtrees share nothing, so they parallelize cleanly.
+///
+/// The serial walk pops subtrees off the end of the root listing and
+/// finishes each one before the next, so subtrees are claimed in that
+/// same order and each keeps its own result. The error returned is the
+/// first one in serial order: exactly the one a single-job walk reports,
+/// without listing any directory twice. After an error, subtrees not yet
+/// claimed come later in serial order and are skipped.
+fn walk_parallel(env: &Env, root: &Path, jobs: usize) -> Result<Vec<PathBuf>, VerifyError> {
+    let mut files = Vec::new();
+    let mut subtrees = Vec::new();
+    list_dir(env, root, 0, &mut files, &mut subtrees)?;
+
+    let next_claim = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let walk_subtrees = || {
+        let mut walked = Vec::new();
+        while !failed.load(Ordering::Relaxed) {
+            let claim = next_claim.fetch_add(1, Ordering::Relaxed);
+            let Some(subtree) = subtrees.iter().rev().nth(claim) else {
+                break;
+            };
+            let result = walk(env, vec![subtree.clone()]);
+            if result.is_err() {
+                failed.store(true, Ordering::Relaxed);
+            }
+            walked.push((claim, result));
+        }
+        walked
+    };
+    let mut walked = Vec::with_capacity(subtrees.len());
+    thread::scope(|scope| {
+        let walk_subtrees = &walk_subtrees;
+        // A refused thread only narrows the walk: the calling thread
+        // below claims every remaining subtree itself.
+        let handles: Vec<_> = (1..jobs.min(subtrees.len()))
+            .map_while(|_| {
+                thread::Builder::new()
+                    .spawn_scoped(scope, walk_subtrees)
+                    .ok()
+            })
+            .collect();
+        walked.append(&mut walk_subtrees());
+        for handle in handles {
+            match handle.join() {
+                Ok(mut found) => walked.append(&mut found),
+                Err(payload) => panic::resume_unwind(payload),
+            }
+        }
+    });
+
+    // Claims are contiguous from zero, so sorting by claim puts every
+    // walked subtree in serial order with no gaps before an error.
+    walked.sort_unstable_by_key(|&(claim, _)| claim);
+    for (_claim, result) in walked {
+        files.append(&mut result?);
+    }
     Ok(files)
 }
 

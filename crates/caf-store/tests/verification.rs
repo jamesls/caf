@@ -6,7 +6,7 @@
 //! parallel equivalence, and the iterative-walk nesting bound.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1104,12 +1104,64 @@ fn unreadable_directory_is_an_io_error() {
         return;
     }
 
-    let err = Verifier::new(store.path())
-        .verify()
-        .expect_err("the directory is unreadable");
-    assert!(err.is_io());
-    assert_eq!(err.path(), Some(shard));
+    // A multi-job walk lists subtrees concurrently but reports the same
+    // error as the serial walk.
+    for jobs in [1, 4] {
+        let err = Verifier::new(store.path())
+            .jobs(positive(jobs))
+            .verify()
+            .expect_err("the directory is unreadable");
+        assert!(err.is_io(), "jobs {jobs}");
+        assert_eq!(err.path(), Some(shard), "jobs {jobs}");
+    }
     fs::set_permissions(shard, fs::Permissions::from_mode(0o755)).expect("restore permissions");
+}
+
+#[test]
+fn transient_directory_listing_failure_fails_every_walk() {
+    // A listing that fails once is an I/O error even though listing the
+    // directory again would succeed. With two failing subtrees, a
+    // parallel walk reports the one the serial walk reaches first.
+    let (generator, ctrl) = Generator::builder_mocked("/store");
+    generator
+        .max_files(8)
+        .file_sizes(SizeChooser::fixed(512))
+        .build()
+        .generate()
+        .expect("generation succeeds");
+    let subtrees: Vec<PathBuf> = ctrl
+        .paths()
+        .into_iter()
+        .filter(|path| path.parent() == Some(Path::new("/store")) && !path.ends_with(".metadata"))
+        .collect();
+    let [first, .., last] = &*subtrees else {
+        panic!("the store has at least two subtrees: {subtrees:?}");
+    };
+
+    let listing_error = |failing: &[&PathBuf], jobs| {
+        ctrl.clear_failures();
+        for path in failing {
+            ctrl.fail_once(path, io::ErrorKind::Other);
+        }
+        let err = ctrl
+            .verifier("/store")
+            .jobs(positive(jobs))
+            .verify()
+            .expect_err("the listing fails");
+        assert!(err.is_io(), "jobs {jobs}");
+        err.path().map(Path::to_path_buf)
+    };
+    for jobs in [1, 4] {
+        assert_eq!(
+            listing_error(&[first], jobs),
+            Some(first.clone()),
+            "jobs {jobs}"
+        );
+    }
+    assert_eq!(
+        listing_error(&[first, last], 4),
+        listing_error(&[first, last], 1)
+    );
 }
 
 #[cfg(unix)]

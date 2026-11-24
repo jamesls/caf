@@ -427,7 +427,7 @@ pub(crate) fn analyze_parallel(
         return Ok(regions);
     }
 
-    let chunks_per_task = (ANALYSIS_TASK_BYTES / chunk_size.get()).max(1);
+    let chunks_per_task = (ANALYSIS_TASK_BYTES / chunk_size).max(1);
     let task_len = chunks_per_task
         .checked_mul(chunk_size.get())
         .expect("analysis chunks are clamped to 64 MiB");

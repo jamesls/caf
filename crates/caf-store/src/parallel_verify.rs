@@ -18,8 +18,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use caf_format::{
-    BLOCK_SIZE, Digest, Format, HEADER_SIZE, Hasher, Header, MerkleHash,
-    fill_block_prefix_with_format, v3_file_id_from_leaves, v3_leaf_hash,
+    BLOCK_SIZE, Digest, Format, HEADER_SIZE, Hasher, Header, MAX_CONTENT_BATCH, MerkleHash,
+    content_batch, fill_block_prefixes_with_format, v3_file_id_from_leaves, v3_leaf_hash,
 };
 
 use crate::env::FileHandle;
@@ -272,11 +272,13 @@ pub(crate) struct V3HashResult {
 /// Reusable per-worker verification scratch.
 ///
 /// `block` holds bytes read back from the file (the v2 whole-file read
-/// buffer and the v3 physical block); `expected` holds regenerated
-/// canonical v3 content. A worker keeps one across files, and every use
-/// resizes to the length it needs, so a store of many small files costs
-/// no per-file scratch allocation and capacity stays at the largest
-/// block actually scanned.
+/// buffer, or one batch of up to `MAX_CONTENT_BATCH` v3 physical blocks);
+/// `expected` holds that batch's regenerated canonical v3 content. A
+/// worker keeps one across files, and every use resizes to the length it
+/// needs, so a store of many small files costs no per-file scratch
+/// allocation and capacity stays at the largest batch actually scanned:
+/// up to 8 MiB each with AVX-512, 4 MiB with AVX2, and one block
+/// otherwise.
 pub(crate) struct ScanBuffers {
     pub(crate) block: Vec<u8>,
     pub(crate) expected: Vec<u8>,
@@ -336,6 +338,7 @@ pub(crate) fn hash_v3_file(
 
     let results = V3Results::new(allocate_leaves(leaf_count)?);
     let workers = v3_worker_count(total, width);
+    let batch_size = v3_batch_size(total, workers, content_batch());
     let next_index = AtomicU64::new(0);
     let cancelled = AtomicBool::new(false);
 
@@ -351,6 +354,7 @@ pub(crate) fn hash_v3_file(
                         header,
                         actual_size,
                         total,
+                        batch_size,
                         next_index,
                         cancelled,
                         results,
@@ -376,6 +380,7 @@ pub(crate) fn hash_v3_file(
                 header,
                 actual_size,
                 total,
+                batch_size,
                 &next_index,
                 &cancelled,
                 &results,
@@ -425,15 +430,21 @@ fn hash_v3_serially(
 ) -> io::Result<V3HashResult> {
     let mut leaves = allocate_leaves(leaf_count)?;
     let mut content_matches = true;
-    for index in 0..total {
-        let (leaf, block_content_matches) =
-            read_v3_block(file, header, actual_size, index, scratch)?;
-        if let Some(progress) = progress {
-            report_v3_block(progress, actual_size, index);
+    let batch_size = content_batch();
+    let mut first = 0;
+    while first < total {
+        let count = batch_len(total, first, batch_size);
+        let batch = read_v3_batch(file, header, actual_size, first, count, scratch)?;
+        for (index, &(leaf, block_content_matches)) in (first..).zip(&batch[..count]) {
+            if let Some(progress) = progress {
+                report_v3_block(progress, actual_size, index);
+            }
+            let slot =
+                usize::try_from(index).expect("a block index fits because the leaf count does");
+            leaves[slot] = leaf;
+            content_matches &= block_content_matches;
         }
-        let slot = usize::try_from(index).expect("a block index fits because the leaf count does");
-        leaves[slot] = leaf;
-        content_matches &= block_content_matches;
+        first += count as u64;
     }
     Ok(V3HashResult {
         digest: Digest::from_bytes(v3_file_id_from_leaves(actual_size, leaves).into_inner()),
@@ -444,6 +455,20 @@ fn hash_v3_serially(
 /// Number of v3 block workers used for one file.
 fn v3_worker_count(total: u64, width: usize) -> usize {
     usize::try_from(total).unwrap_or(usize::MAX).min(width)
+}
+
+/// Blocks each of `workers` claims at once from a file of `total`
+/// blocks, given a SIMD batch of `ways` blocks.
+///
+/// Full SIMD batches can leave workers idle: one AVX2 batch covers a
+/// whole 4 MiB file, so a second worker has nothing to read. Claims
+/// instead take as many rounds as full batches would need, with each
+/// round split evenly across the workers, so every worker reads its
+/// share in parallel without an extra SIMD pass.
+fn v3_batch_size(total: u64, workers: usize, ways: usize) -> usize {
+    let workers = workers as u64;
+    let rounds = total.div_ceil(workers * ways as u64);
+    usize::try_from(total.div_ceil(workers * rounds)).expect("a batch is at most `ways` blocks")
 }
 
 /// Fallibly allocates the indexed v3 leaf array.
@@ -529,6 +554,7 @@ fn read_v3_blocks(
     header: &Header,
     actual_size: u64,
     total: u64,
+    batch_size: usize,
     next_index: &AtomicU64,
     cancelled: &AtomicBool,
     results: &V3Results,
@@ -536,20 +562,25 @@ fn read_v3_blocks(
     progress: Option<&FileProgress<'_>>,
 ) {
     while !cancelled.load(Ordering::Relaxed) {
-        let index = next_index.fetch_add(1, Ordering::Relaxed);
-        if index >= total {
+        let first = next_index.fetch_add(batch_size as u64, Ordering::Relaxed);
+        if first >= total {
             return;
         }
-        match read_v3_block(file, header, actual_size, index, scratch) {
-            Ok((leaf, block_content_matches)) => {
-                if let Some(progress) = progress {
-                    report_v3_block(progress, actual_size, index);
+        let count = batch_len(total, first, batch_size);
+        match read_v3_batch(file, header, actual_size, first, count, scratch) {
+            Ok(batch) => {
+                for (index, &(leaf, block_content_matches)) in (first..).zip(&batch[..count]) {
+                    if let Some(progress) = progress {
+                        report_v3_block(progress, actual_size, index);
+                    }
+                    results.store(index, leaf, block_content_matches);
                 }
-                results.store(index, leaf, block_content_matches);
             }
             Err(source) => {
                 cancelled.store(true, Ordering::Relaxed);
-                results.record_error(index, source);
+                // Batches are disjoint and ascending, so the batch start
+                // still orders failures by offset.
+                results.record_error(first, source);
                 return;
             }
         }
@@ -565,40 +596,91 @@ fn report_v3_block(progress: &FileProgress<'_>, actual_size: u64, index: u64) {
     progress.add_bytes(block_len.saturating_sub(already_counted));
 }
 
-fn read_v3_block(
+/// Number of blocks in the batch of up to `batch_size` starting at `first`.
+fn batch_len(total: u64, first: u64, batch_size: usize) -> usize {
+    usize::try_from((total - first).min(batch_size as u64))
+        .expect("a batch is at most MAX_CONTENT_BATCH blocks")
+}
+
+/// Reads the `count` physical blocks starting at `first` and checks their
+/// canonical v3 content against one batched SHAKE generation.
+///
+/// Returns each block's leaf and content match in the first `count`
+/// slots. Every physical block but a file's last is [`BLOCK_SIZE`] long,
+/// so block `i` of the batch sits at `i * BLOCK_SIZE` in `scratch.block`.
+fn read_v3_batch(
     file: &FileHandle,
     header: &Header,
     actual_size: u64,
-    index: u64,
+    first: u64,
+    count: usize,
     scratch: &mut ScanBuffers,
-) -> io::Result<(MerkleHash, bool)> {
-    let offset = index * BLOCK_SIZE as u64;
-    let len = usize::try_from((actual_size - offset).min(BLOCK_SIZE as u64))
-        .expect("a physical block is at most BLOCK_SIZE bytes");
-    let block = &mut scratch.block;
-    block.resize(len, 0);
-    let got = file.read_full_at(block, offset)?;
-    if got != len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "v3 file changed while it was being read",
-        ));
+) -> io::Result<[(MerkleHash, bool); MAX_CONTENT_BATCH]> {
+    debug_assert!((1..=MAX_CONTENT_BATCH).contains(&count));
+    // (physical length, first content byte, bytes compared) per block.
+    let mut spans = [(0_usize, 0_usize, 0_usize); MAX_CONTENT_BATCH];
+    for (index, span) in (first..).zip(&mut spans[..count]) {
+        let offset = index * BLOCK_SIZE as u64;
+        let len = usize::try_from((actual_size - offset).min(BLOCK_SIZE as u64))
+            .expect("a physical block is at most BLOCK_SIZE bytes");
+        let content_start = if index == 0 { HEADER_SIZE } else { 0 };
+        let expected_file_end = header.file_length().min(offset + len as u64);
+        let compare_len =
+            usize::try_from(expected_file_end.saturating_sub(offset + content_start as u64))
+                .expect("the comparison is within one physical block");
+        *span = (len, content_start, compare_len);
     }
 
-    let content_start = if index == 0 { HEADER_SIZE } else { 0 };
-    let expected_file_end = header.file_length().min(offset + len as u64);
-    let compare_len =
-        usize::try_from(expected_file_end.saturating_sub(offset + content_start as u64))
-            .expect("the comparison is within one physical block");
-    let content_matches = if compare_len == 0 {
-        true
-    } else {
-        let expected = &mut scratch.expected;
-        expected.resize(compare_len, 0);
-        fill_block_prefix_with_format(Format::V3, header.content_seed(), index, expected);
-        block[content_start..content_start + compare_len] == expected[..compare_len]
-    };
-    Ok((v3_leaf_hash(index, block), content_matches))
+    let block = &mut scratch.block;
+    block.resize((count - 1) * BLOCK_SIZE + spans[count - 1].0, 0);
+    for (i, &(len, _, _)) in spans[..count].iter().enumerate() {
+        let start = i * BLOCK_SIZE;
+        let got = file.read_full_at(
+            &mut block[start..start + len],
+            first * BLOCK_SIZE as u64 + start as u64,
+        )?;
+        if got != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "v3 file changed while it was being read",
+            ));
+        }
+    }
+
+    let expected = &mut scratch.expected;
+    expected.resize(
+        spans.iter().map(|&(_, _, compare_len)| compare_len).sum(),
+        0,
+    );
+    let mut prefixes: [&mut [u8]; MAX_CONTENT_BATCH] = Default::default();
+    let mut rest = expected.as_mut_slice();
+    for (prefix, &(_, _, compare_len)) in prefixes.iter_mut().zip(&spans[..count]) {
+        let (head, tail) = rest.split_at_mut(compare_len);
+        *prefix = head;
+        rest = tail;
+    }
+    if spans.iter().any(|&(_, _, compare_len)| compare_len > 0) {
+        fill_block_prefixes_with_format(
+            Format::V3,
+            header.content_seed(),
+            first,
+            &mut prefixes[..count],
+        );
+    }
+
+    let mut checked = [(MerkleHash::from_bytes([0; MerkleHash::SIZE]), true); MAX_CONTENT_BATCH];
+    for (i, (result, (&(len, content_start, compare_len), prefix))) in checked
+        .iter_mut()
+        .zip(spans.iter().zip(&prefixes))
+        .enumerate()
+        .take(count)
+    {
+        let start = i * BLOCK_SIZE;
+        let actual = &block[start..start + len];
+        let content_matches = actual[content_start..content_start + compare_len] == **prefix;
+        *result = (v3_leaf_hash(first + i as u64, actual), content_matches);
+    }
+    Ok(checked)
 }
 
 #[expect(
@@ -744,7 +826,7 @@ impl Pool {
 
 #[cfg(test)]
 mod tests {
-    use super::{allocate_widths, contended_prefix_len, v3_worker_count, width_cap};
+    use super::{allocate_widths, contended_prefix_len, v3_batch_size, v3_worker_count, width_cap};
     use caf_format::BLOCK_SIZE;
 
     #[test]
@@ -777,6 +859,20 @@ mod tests {
         assert_eq!(v3_worker_count(5, 2), 2);
         assert_eq!(v3_worker_count(5, 4), 4);
         assert_eq!(v3_worker_count(5, 8), 5);
+    }
+
+    #[test]
+    fn v3_batches_give_every_worker_an_even_share() {
+        // A 4 MiB file on two workers splits in half instead of
+        // handing one worker a whole AVX2 or AVX-512 batch.
+        assert_eq!(v3_batch_size(4, 2, 4), 2);
+        assert_eq!(v3_batch_size(4, 2, 8), 2);
+        // Two rounds of full batches would leave 8 + 8 blocks on the
+        // first worker; six-block batches split them 12 and 12.
+        assert_eq!(v3_batch_size(24, 2, 8), 6);
+        // Large files keep full SIMD batches.
+        assert_eq!(v3_batch_size(1024, 6, 8), 8);
+        assert_eq!(v3_batch_size(1024, 6, 1), 1);
     }
 
     #[test]

@@ -132,8 +132,9 @@ pub fn content_batch() -> usize {
 ///
 /// # Panics
 ///
-/// Panics if more than [`MAX_CONTENT_BATCH`] prefixes are given, or if a
-/// prefix is longer than its block.
+/// Panics if more than [`MAX_CONTENT_BATCH`] prefixes are given, if the
+/// last block's index does not fit in a `u64`, or if a prefix is longer
+/// than its block.
 pub fn fill_block_prefixes_with_format(
     format: Format,
     seed: ContentSeed,
@@ -144,7 +145,10 @@ pub fn fill_block_prefixes_with_format(
         prefixes.len() <= MAX_CONTENT_BATCH,
         "at most {MAX_CONTENT_BATCH} blocks generate together",
     );
-    for (index, prefix) in (first_index..).zip(prefixes.iter()) {
+    for (offset, prefix) in prefixes.iter().enumerate() {
+        let index = first_index
+            .checked_add(offset as u64)
+            .expect("content block indices end at u64::MAX");
         assert!(
             prefix.len() <= block_len(index),
             "content block {index} is at most {} bytes",
@@ -154,8 +158,8 @@ pub fn fill_block_prefixes_with_format(
     if crate::multi_way::fill(format, seed, first_index, prefixes) {
         return;
     }
-    for (index, prefix) in (first_index..).zip(prefixes.iter_mut()) {
-        fill_block_prefix_with_format(format, seed, index, prefix);
+    for (offset, prefix) in prefixes.iter_mut().enumerate() {
+        fill_block_prefix_with_format(format, seed, first_index + offset as u64, prefix);
     }
 }
 
@@ -542,25 +546,28 @@ mod tests {
     }
 
     /// Batched generation must equal one-block generation for every
-    /// batch size, both formats, starting at block 0 and later, and uneven
-    /// prefixes that end mid-lane and mid-rate-block. On x86-64 this
-    /// covers the AVX2 kernel (2 to 4 blocks) and the AVX-512 kernel (5 to
-    /// 8 blocks) on CPUs that have them.
+    /// batch size, both formats, starting at block 0, later, and so that
+    /// a full batch ends at block `u64::MAX`, and uneven prefixes that end
+    /// mid-lane and mid-rate-block. On x86-64 this covers the AVX2 kernel
+    /// (2 to 4 blocks) and the AVX-512 kernel (5 to 8 blocks) on CPUs that
+    /// have them.
     #[test]
     fn batched_blocks_match_single_block_generation() {
+        let last_batch = u64::MAX - (MAX_CONTENT_BATCH as u64 - 1);
         for format in [Format::V2, Format::V3] {
-            for first in [0_u64, 7] {
+            for first in [0_u64, 7, last_batch] {
                 for count in 1..=MAX_CONTENT_BATCH {
-                    let lens: Vec<usize> = (first..)
-                        .take(count)
+                    let indices: Vec<u64> = (0..count as u64).map(|i| first + i).collect();
+                    let lens: Vec<usize> = indices
+                        .iter()
                         .zip([4099, 17, 1000, 0, 169, 168, 8, 3 * 168 + 5])
-                        .map(|(index, len)| len.min(block_len(index)))
+                        .map(|(&index, len)| len.min(block_len(index)))
                         .collect();
                     let mut buffers: Vec<Vec<u8>> = lens.iter().map(|&len| vec![0; len]).collect();
                     let mut prefixes: Vec<&mut [u8]> =
                         buffers.iter_mut().map(Vec::as_mut_slice).collect();
                     fill_block_prefixes_with_format(format, seed(), first, &mut prefixes);
-                    for (index, actual) in (first..).zip(&buffers) {
+                    for (&index, actual) in indices.iter().zip(&buffers) {
                         let mut expected = vec![0; actual.len()];
                         fill_block_prefix_with_format(format, seed(), index, &mut expected);
                         assert!(

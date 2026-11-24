@@ -338,6 +338,7 @@ pub(crate) fn hash_v3_file(
 
     let results = V3Results::new(allocate_leaves(leaf_count)?);
     let workers = v3_worker_count(total, width);
+    let batch_size = v3_batch_size(total, workers, content_batch());
     let next_index = AtomicU64::new(0);
     let cancelled = AtomicBool::new(false);
 
@@ -353,6 +354,7 @@ pub(crate) fn hash_v3_file(
                         header,
                         actual_size,
                         total,
+                        batch_size,
                         next_index,
                         cancelled,
                         results,
@@ -378,6 +380,7 @@ pub(crate) fn hash_v3_file(
                 header,
                 actual_size,
                 total,
+                batch_size,
                 &next_index,
                 &cancelled,
                 &results,
@@ -452,6 +455,20 @@ fn hash_v3_serially(
 /// Number of v3 block workers used for one file.
 fn v3_worker_count(total: u64, width: usize) -> usize {
     usize::try_from(total).unwrap_or(usize::MAX).min(width)
+}
+
+/// Blocks each of `workers` claims at once from a file of `total`
+/// blocks, given a SIMD batch of `ways` blocks.
+///
+/// Full SIMD batches can leave workers idle: one AVX2 batch covers a
+/// whole 4 MiB file, so a second worker has nothing to read. Claims
+/// instead take as many rounds as full batches would need, with each
+/// round split evenly across the workers, so every worker reads its
+/// share in parallel without an extra SIMD pass.
+fn v3_batch_size(total: u64, workers: usize, ways: usize) -> usize {
+    let workers = workers as u64;
+    let rounds = total.div_ceil(workers * ways as u64);
+    usize::try_from(total.div_ceil(workers * rounds)).expect("a batch is at most `ways` blocks")
 }
 
 /// Fallibly allocates the indexed v3 leaf array.
@@ -537,13 +554,13 @@ fn read_v3_blocks(
     header: &Header,
     actual_size: u64,
     total: u64,
+    batch_size: usize,
     next_index: &AtomicU64,
     cancelled: &AtomicBool,
     results: &V3Results,
     scratch: &mut ScanBuffers,
     progress: Option<&FileProgress<'_>>,
 ) {
-    let batch_size = content_batch();
     while !cancelled.load(Ordering::Relaxed) {
         let first = next_index.fetch_add(batch_size as u64, Ordering::Relaxed);
         if first >= total {
@@ -809,7 +826,7 @@ impl Pool {
 
 #[cfg(test)]
 mod tests {
-    use super::{allocate_widths, contended_prefix_len, v3_worker_count, width_cap};
+    use super::{allocate_widths, contended_prefix_len, v3_batch_size, v3_worker_count, width_cap};
     use caf_format::BLOCK_SIZE;
 
     #[test]
@@ -842,6 +859,20 @@ mod tests {
         assert_eq!(v3_worker_count(5, 2), 2);
         assert_eq!(v3_worker_count(5, 4), 4);
         assert_eq!(v3_worker_count(5, 8), 5);
+    }
+
+    #[test]
+    fn v3_batches_give_every_worker_an_even_share() {
+        // A 4 MiB file on two workers splits in half instead of
+        // handing one worker a whole AVX2 or AVX-512 batch.
+        assert_eq!(v3_batch_size(4, 2, 4), 2);
+        assert_eq!(v3_batch_size(4, 2, 8), 2);
+        // Two rounds of full batches would leave 8 + 8 blocks on the
+        // first worker; six-block batches split them 12 and 12.
+        assert_eq!(v3_batch_size(24, 2, 8), 6);
+        // Large files keep full SIMD batches.
+        assert_eq!(v3_batch_size(1024, 6, 8), 8);
+        assert_eq!(v3_batch_size(1024, 6, 1), 1);
     }
 
     #[test]
